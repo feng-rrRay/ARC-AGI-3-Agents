@@ -148,6 +148,7 @@ class Agent(ABC):
             state=raw.state,
             levels_completed=raw.levels_completed,
             win_levels=raw.win_levels,
+            action_input=raw.action_input,
             guid=raw.guid,
             full_reset=raw.full_reset,
             available_actions=raw.available_actions,

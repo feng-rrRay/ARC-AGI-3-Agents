@@ -11,7 +11,9 @@ import os
 import signal
 import sys
 import threading
+from datetime import datetime
 from functools import partial
+from pathlib import Path
 from types import FrameType
 from typing import Optional
 
@@ -77,12 +79,6 @@ def main() -> None:
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(log_level)
     stdout_handler.setFormatter(formatter)
-
-    file_handler = logging.FileHandler("logs.log", mode="w")
-    file_handler.setLevel(log_level)
-    file_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
     logger.addHandler(stdout_handler)
 
     # logging.getLogger("requests").setLevel(logging.CRITICAL)
@@ -109,6 +105,20 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # Per-run log file: logs/<agent>-<YYYYMMDD-HHMMSS>.log
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    agent_slug = (args.agent or "no-agent").replace("/", "-").replace(":", "-")
+    run_id = f"{agent_slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    log_path = log_dir / f"{run_id}.log"
+    # Exported so agents (e.g. ContinualHarness) can derive a sibling trace path.
+    os.environ["RUN_LOG_PATH"] = str(log_path)
+    file_handler = logging.FileHandler(log_path, mode="w")
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.info(f"Logging this run to {log_path}")
 
     if not args.agent:
         logger.error("An Agent must be specified")
