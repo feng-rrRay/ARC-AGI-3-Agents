@@ -12,6 +12,7 @@ from agents.recording_render import (
     expand_recording_frames,
     export_gif,
     find_actions_log,
+    find_trace_log,
     grid_to_image,
     load_recording_frames,
     parse_action_log,
@@ -223,3 +224,26 @@ def test_find_actions_log_matches_recording_name(tmp_path: Path) -> None:
     )
 
     assert find_actions_log(recording, logs_dir=logs_dir) == log
+
+
+@pytest.mark.unit
+def test_find_actions_log_uses_run_dir_layout(tmp_path: Path) -> None:
+    run_dir = tmp_path / "logs" / "run-1"
+    recording = run_dir / "recordings" / "test.agent.guid.recording.jsonl"
+    log = run_dir / "run.log"
+    recording.parent.mkdir(parents=True)
+    log.write_text("run log\n", encoding="utf-8")
+
+    assert find_actions_log(recording, logs_dir=tmp_path / "logs") == log
+
+
+@pytest.mark.unit
+def test_find_trace_log_uses_run_dir_layout(tmp_path: Path) -> None:
+    run_dir = tmp_path / "logs" / "run-1"
+    recording = run_dir / "recordings" / "test.agent.guid.recording.jsonl"
+    trace = run_dir / "artifacts" / "test.agent.guid.trace.jsonl"
+    recording.parent.mkdir(parents=True)
+    trace.parent.mkdir()
+    trace.write_text("{}\n", encoding="utf-8")
+
+    assert find_trace_log(recording, logs_dir=tmp_path / "logs") == trace

@@ -11,7 +11,6 @@ import os
 import signal
 import sys
 import threading
-from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import FrameType
@@ -20,6 +19,14 @@ from typing import Optional
 import requests
 
 from agents import AVAILABLE_AGENTS, Swarm
+from agents.run_artifacts import (
+    RunArtifacts,
+    create_run_artifacts,
+    export_run_env,
+    snapshot_memory,
+    write_manifest,
+    write_scorecard,
+)
 from agents.tracing import initialize as init_agentops
 
 logger = logging.getLogger()
@@ -41,13 +48,63 @@ HEADERS = {
 }
 
 
-def run_agent(swarm: Swarm) -> None:
-    swarm.main()
+def run_agent(
+    swarm: Swarm,
+    run_artifacts: RunArtifacts,
+    bootstrap_memory: Path | None,
+) -> None:
+    scorecard = swarm.main()
+    finalize_run_artifacts(
+        run_artifacts,
+        swarm=swarm,
+        scorecard=scorecard,
+        bootstrap_memory=bootstrap_memory,
+        status="completed",
+    )
     os.kill(os.getpid(), signal.SIGINT)
+
+
+def finalize_run_artifacts(
+    run_artifacts: RunArtifacts,
+    *,
+    swarm: Swarm,
+    scorecard: object | None,
+    bootstrap_memory: Path | None,
+    status: str,
+) -> None:
+    card_id = _scorecard_id(scorecard)
+    if scorecard is not None:
+        write_scorecard(run_artifacts, scorecard)
+    if bootstrap_memory is not None:
+        snapshot_memory(bootstrap_memory, run_artifacts.memory_final_path)
+    write_manifest(
+        run_artifacts,
+        agent=swarm.agent_name,
+        games=swarm.GAMES,
+        tags=swarm.tags,
+        card_id=card_id,
+        status=status,
+        bootstrap_memory=bootstrap_memory,
+    )
+
+
+def _scorecard_id(scorecard: object | None) -> str | None:
+    if scorecard is None:
+        return None
+    dump = getattr(scorecard, "model_dump", None)
+    payload = dump() if callable(dump) else scorecard
+    if isinstance(payload, dict):
+        for key in ("card_id", "scorecard_id", "id"):
+            value = payload.get(key)
+            if value is not None:
+                return str(value)
+    return None
 
 
 def cleanup(
     swarm: Swarm,
+    run_artifacts: RunArtifacts,
+    bootstrap_memory: Path | None,
     signum: Optional[int],
     frame: Optional[FrameType],
 ) -> None:
@@ -59,6 +116,13 @@ def cleanup(
             logger.info("--- EXISTING SCORECARD REPORT ---")
             logger.info(json.dumps(scorecard.model_dump(), indent=2))
             swarm.cleanup(scorecard)
+        finalize_run_artifacts(
+            run_artifacts,
+            swarm=swarm,
+            scorecard=scorecard,
+            bootstrap_memory=bootstrap_memory,
+            status="interrupted",
+        )
 
         # Provide web link to scorecard
         if card_id:
@@ -103,26 +167,56 @@ def main() -> None:
         help="Comma-separated list of tags for the scorecard (e.g., 'experiment,v1.0')",
         default=None,
     )
+    parser.add_argument(
+        "--bootstrap-memory",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON file backing ContinualHarness long-term memory. "
+            "When provided, the agent loads it on start and writes mutations "
+            "atomically on every change. When omitted, memory is disabled "
+            "(no process_memory tool, no LONG-TERM MEMORY block)."
+        ),
+    )
 
     args = parser.parse_args()
 
-    # Per-run log file: logs/<agent>-<YYYYMMDD-HHMMSS>.log
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    agent_slug = (args.agent or "no-agent").replace("/", "-").replace(":", "-")
-    run_id = f"{agent_slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    log_path = log_dir / f"{run_id}.log"
-    # Exported so agents (e.g. ContinualHarness) can derive a sibling trace path.
-    os.environ["RUN_LOG_PATH"] = str(log_path)
-    file_handler = logging.FileHandler(log_path, mode="w")
+    run_artifacts = create_run_artifacts(args.agent or "no-agent")
+    export_run_env(run_artifacts)
+
+    bootstrap_memory = (
+        Path(args.bootstrap_memory).resolve() if args.bootstrap_memory else None
+    )
+    # Memory persistence is opt-in: agents read this env var when constructing their store.
+    if bootstrap_memory is not None:
+        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_MEMORY"] = str(bootstrap_memory)
+        snapshot_memory(bootstrap_memory, run_artifacts.memory_initial_path)
+
+    file_handler = logging.FileHandler(run_artifacts.log_path, mode="w")
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    logger.info(f"Logging this run to {log_path}")
+    logger.info(f"Logging this run to {run_artifacts.log_path}")
 
     if not args.agent:
         logger.error("An Agent must be specified")
+        write_manifest(
+            run_artifacts,
+            agent=None,
+            games=[],
+            tags=[],
+            status="error",
+            bootstrap_memory=bootstrap_memory,
+        )
         return
+
+    # Start with Empty tags, "agent" and agent name will be added by the Swarm later
+    tags: list[str] = []
+
+    # Append user-provided tags if any
+    if args.tags:
+        user_tags = [tag.strip() for tag in args.tags.split(",")]
+        tags.extend(user_tags)
 
     print(f"{ROOT_URL}/api/games")
 
@@ -176,15 +270,15 @@ def main() -> None:
             logger.error(
                 "No games available to play. Check API connection or recording file."
             )
+        write_manifest(
+            run_artifacts,
+            agent=args.agent,
+            games=games,
+            tags=tags,
+            status="error",
+            bootstrap_memory=bootstrap_memory,
+        )
         return
-
-    # Start with Empty tags, "agent" and agent name will be added by the Swarm later
-    tags: list[str] = []
-
-    # Append user-provided tags if any
-    if args.tags:
-        user_tags = [tag.strip() for tag in args.tags.split(",")]
-        tags.extend(user_tags)
 
     # Initialize AgentOps client
     init_agentops(api_key=os.getenv("AGENTOPS_API_KEY"), log_level=log_level)
@@ -195,11 +289,23 @@ def main() -> None:
         games,
         tags=tags,  # Pass tags as keyword argument
     )
-    agent_thread = threading.Thread(target=partial(run_agent, swarm))
+    write_manifest(
+        run_artifacts,
+        agent=args.agent,
+        games=games,
+        tags=swarm.tags,
+        status="running",
+        bootstrap_memory=bootstrap_memory,
+    )
+    agent_thread = threading.Thread(
+        target=partial(run_agent, swarm, run_artifacts, bootstrap_memory)
+    )
     agent_thread.daemon = True  # die when the main thread dies
+    signal.signal(
+        signal.SIGINT,
+        partial(cleanup, swarm, run_artifacts, bootstrap_memory),
+    )  # handler for Ctrl+C
     agent_thread.start()
-
-    signal.signal(signal.SIGINT, partial(cleanup, swarm))  # handler for Ctrl+C
 
     try:
         # Wait for the agent thread to complete
@@ -207,10 +313,10 @@ def main() -> None:
             agent_thread.join(timeout=5)  # Check every 5 second
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received in main thread")
-        cleanup(swarm, signal.SIGINT, None)
+        cleanup(swarm, run_artifacts, bootstrap_memory, signal.SIGINT, None)
     except Exception as e:
         logger.error(f"Unexpected error in main thread: {e}")
-        cleanup(swarm, None, None)
+        cleanup(swarm, run_artifacts, bootstrap_memory, None, None)
 
 
 if __name__ == "__main__":

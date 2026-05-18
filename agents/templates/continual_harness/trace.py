@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ...run_artifacts import RUN_ARTIFACTS_DIR_ENV, RUN_LOG_PATH_ENV, safe_slug
+
 
 class TraceWriter:
     """Append-only thread-safe JSONL writer for per-VLM-call records."""
@@ -23,9 +25,15 @@ class TraceWriter:
             f.write(line + "\n")
 
 
-def default_trace_path() -> Path:
-    """Sibling of main.py's text log when RUN_LOG_PATH is set; else logs/trace-<ts>.jsonl."""
-    run_log = os.getenv("RUN_LOG_PATH")
+def default_trace_path(prefix: str | None = None, guid: str | None = None) -> Path:
+    """Trace path for a VLM call stream."""
+    artifacts_dir = os.getenv(RUN_ARTIFACTS_DIR_ENV)
+    if artifacts_dir and prefix and guid:
+        return (
+            Path(artifacts_dir) / f"{safe_slug(prefix)}.{safe_slug(guid)}.trace.jsonl"
+        )
+
+    run_log = os.getenv(RUN_LOG_PATH_ENV)
     if run_log:
         return Path(run_log).with_suffix(".trace.jsonl")
     log_dir = Path("logs")

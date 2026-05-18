@@ -3,11 +3,13 @@ import os
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from agents.recorder import RECORDING_SUFFIX, Recorder
+from agents.run_artifacts import RUN_RECORDINGS_DIR_ENV
 
 
 @pytest.mark.unit
@@ -55,6 +57,20 @@ class TestRecorderInitialization:
 
             assert recorder.prefix == "test"
             assert recorder.guid is not None
+
+    def test_recorder_uses_run_recordings_dir_for_new_recordings(self, tmp_path: Path):
+        run_recordings = tmp_path / "logs" / "run" / "recordings"
+        with patch.dict(
+            "os.environ",
+            {
+                "RECORDINGS_DIR": "recordings",
+                RUN_RECORDINGS_DIR_ENV: str(run_recordings),
+            },
+        ):
+            recorder = Recorder(prefix="test")
+
+        assert Path(recorder.filename).parent == run_recordings
+        assert Path(recorder.filename).name.startswith("test.")
 
 
 @pytest.mark.unit
@@ -199,6 +215,35 @@ class TestRecorderClassMethods:
         with patch.dict("os.environ", {"RECORDINGS_DIR": temp_recordings_dir}):
             recordings = Recorder.list()
         assert recordings == []
+
+    def test_list_recordings_includes_new_run_directories(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        legacy = tmp_path / "recordings"
+        nested = tmp_path / "logs" / "run-1" / "recordings"
+        legacy.mkdir()
+        nested.mkdir(parents=True)
+        (legacy / "old.agent.guid.recording.jsonl").write_text("{}\n")
+        (nested / "new.agent.guid.recording.jsonl").write_text("{}\n")
+
+        with patch.dict("os.environ", {"RECORDINGS_DIR": str(legacy)}):
+            recordings = Recorder.list()
+
+        assert "old.agent.guid.recording.jsonl" in recordings
+        assert "logs/run-1/recordings/new.agent.guid.recording.jsonl" in recordings
+
+    def test_playback_filename_can_be_nested_path(self, tmp_path: Path) -> None:
+        nested = tmp_path / "logs" / "run-1" / "recordings"
+        nested.mkdir(parents=True)
+        recording = nested / "game.agent.guid.recording.jsonl"
+        recording.write_text('{"data": {"action_input": {"id": 1}}}\n')
+
+        recorder = Recorder(prefix="ignored", filename=str(recording))
+
+        assert recorder.filename == str(recording)
+        assert recorder.guid == "guid"
+        assert recorder.get()[0]["data"]["action_input"]["id"] == 1
 
     @pytest.mark.parametrize(
         "filename,expected_prefix,expected_prefix_one,expected_guid",

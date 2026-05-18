@@ -36,12 +36,14 @@ def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
 
 
 def build_action_prompt(latest_frame: FrameData) -> str:
-    return USER_PROMPT.format(
-        state=latest_frame.state.name,
-        score=latest_frame.levels_completed,
-        latest_frame=pretty_print_3d(latest_frame.frame),
-        previous_action=latest_frame.action_input.id.name,
-        previous_action_data=latest_frame.action_input.data,
+    return str(
+        USER_PROMPT.format(
+            state=latest_frame.state.name,
+            score=latest_frame.levels_completed,
+            latest_frame=pretty_print_3d(latest_frame.frame),
+            previous_action=latest_frame.action_input.id.name,
+            previous_action_data=latest_frame.action_input.data,
+        )
     )
 
 
@@ -68,8 +70,10 @@ class VLMSimple(Agent):
             backend="gemini",
             system_instruction=SYSTEM_INSTRUCTION,
         )
-        # One JSONL record per VLM call lands here (paired with main.py's text log).
-        self.trace = TraceWriter(default_trace_path())
+        recorder = getattr(self, "recorder", None)
+        guid = getattr(recorder, "guid", None)
+        # One JSONL record per VLM call lands here (paired with the recording stem).
+        self.trace = TraceWriter(default_trace_path(prefix=self.name, guid=guid))
         # Cumulative token usage; logged once on cleanup().
         self.total_calls = 0
         self.total_prompt_tokens = 0

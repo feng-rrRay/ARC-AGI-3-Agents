@@ -178,7 +178,9 @@ class TestContinualHarnessPrompts:
         assert "# Previous Action Data:\n{'x': 12, 'y': 34}" in prompt
 
     def test_extra_context_is_injected_above_turn_line(self) -> None:
-        frame = FrameData(game_id="ec-test", frame=[[[0]]], state=GameState.NOT_FINISHED)
+        frame = FrameData(
+            game_id="ec-test", frame=[[[0]]], state=GameState.NOT_FINISHED
+        )
         prompt = build_action_prompt(
             frame, extra_context="## SHORT-TERM HISTORY\n[1] action=ACTION1"
         )
@@ -338,6 +340,17 @@ class TestTraceWriter:
         monkeypatch.setenv("RUN_LOG_PATH", str(run_log))
         path = default_trace_path()
         assert path == run_log.with_suffix(".trace.jsonl")
+
+    def test_default_path_uses_run_artifacts_dir_with_stem(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        artifacts_dir = tmp_path / "logs" / "run" / "artifacts"
+        monkeypatch.setenv("RUN_ARTIFACTS_DIR", str(artifacts_dir))
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "logs" / "run" / "run.log"))
+
+        path = default_trace_path(prefix="game.agent/model", guid="guid:1")
+
+        assert path == artifacts_dir / "game.agent-model.guid-1.trace.jsonl"
 
     def test_serialize_response_extracts_function_calls_and_text(self) -> None:
         # Single-candidate response with one function_call and one text part.

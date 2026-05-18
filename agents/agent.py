@@ -11,6 +11,7 @@ from arcengine import ActionInput, FrameData, FrameDataRaw, GameAction, GameStat
 from pydantic import ValidationError
 
 from .recorder import Recorder
+from .run_artifacts import RUN_RECORDINGS_DIR_ENV
 from .tracing import trace_agent_session
 
 logger = logging.getLogger()
@@ -118,7 +119,10 @@ class Agent(ABC):
 
     def start_recording(self) -> None:
         filename = self.agent_name if self.is_playback else None
-        self.recorder = Recorder(prefix=self.name, filename=filename)
+        directory = None if self.is_playback else os.environ.get(RUN_RECORDINGS_DIR_ENV)
+        self.recorder = Recorder(
+            prefix=self.name, filename=filename, directory=directory
+        )
         logger.info(
             f"created new recording for {self.name} into {self.recorder.filename}"
         )
@@ -238,7 +242,7 @@ class Playback(Agent):
         super().__init__(*args, **kwargs)
         self.recorder = Recorder(
             prefix=Recorder.get_prefix(self.agent_name),
-            guid=Recorder.get_guid(self.agent_name),
+            filename=self.agent_name,
         )
         self.recorded_actions = []
         if self.agent_name in Recorder.list():

@@ -15,9 +15,15 @@ from .continual_harness.helpers import (
     build_action_tools,
     frame_to_images,
 )
+from .continual_harness.memory import (
+    MemoryStore,
+    bootstrap_memory_path,
+    format_memory_overview,
+)
 from .continual_harness.models import StepRecord, ToolCallRecord
 from .continual_harness.prompts import SYSTEM_INSTRUCTION
 from .continual_harness.tools import (
+    PROCESS_MEMORY_TOOL,
     ContinualToolRouter,
     build_analysis_tools,
     extract_function_calls,
@@ -79,10 +85,13 @@ class ContinualHarness(Agent):
             backend="gemini",
             system_instruction=SYSTEM_INSTRUCTION,
         )
-        # One JSONL record per VLM call lands here (paired with main.py's text log).
-        self.trace = TraceWriter(default_trace_path())
-        # One JSONL record per choose_action() outcome lands here.
-        self.trajectory = TrajectoryStore(default_trajectory_path())
+        recorder = getattr(self, "recorder", None)
+        guid = getattr(recorder, "guid", None)
+        # JSONL artifacts share the recording stem when run-dir wiring is active.
+        self.trace = TraceWriter(default_trace_path(prefix=self.name, guid=guid))
+        self.trajectory = TrajectoryStore(
+            default_trajectory_path(prefix=self.name, guid=guid)
+        )
 
         def _handle_get_recent_trajectory(args: dict[str, Any]) -> dict[str, Any]:
             try:
@@ -98,9 +107,110 @@ class ContinualHarness(Agent):
                 "history": format_full_history(records),
             }
 
-        self.tool_router = ContinualToolRouter(
-            {"get_recent_trajectory": _handle_get_recent_trajectory}
+        # Long-term memory is opt-in via --bootstrap-memory (see main.py).
+        bootstrap = bootstrap_memory_path()
+        self.memory: MemoryStore | None = (
+            MemoryStore(bootstrap, game_id=self.game_id)
+            if bootstrap is not None
+            else None
         )
+
+        def _handle_process_memory(args: dict[str, Any]) -> dict[str, Any]:
+            # Defensive: tool only registered when self.memory is not None, but be
+            # explicit so a stale registration can't crash a step.
+            if self.memory is None:
+                return {
+                    "success": False,
+                    "error": "memory is disabled; pass --bootstrap-memory to enable",
+                }
+            op = (args.get("operation") or "").strip().lower()
+            try:
+                if op == "add":
+                    title = args.get("title") or ""
+                    body = args.get("body") or ""
+                    tags = list(args.get("tags") or [])
+                    entry = self.memory.add(title=title, body=body, tags=tags)
+                    return {
+                        "success": True,
+                        "operation": "add",
+                        "id": entry.id,
+                        "title": entry.title,
+                        "tags": entry.tags,
+                    }
+                if op == "delete":
+                    entry_id = args.get("id") or ""
+                    if not entry_id:
+                        return {
+                            "success": False,
+                            "operation": "delete",
+                            "error": "delete requires an id",
+                        }
+                    deleted = self.memory.delete(entry_id)
+                    result: dict[str, Any] = {
+                        "success": deleted,
+                        "operation": "delete",
+                        "id": entry_id,
+                        "deleted": deleted,
+                    }
+                    if not deleted:
+                        result["error"] = f"no entry with id={entry_id}"
+                    return result
+                if op == "edit":
+                    entry_id = args.get("id") or ""
+                    if not entry_id:
+                        return {
+                            "success": False,
+                            "operation": "edit",
+                            "error": "edit requires an id",
+                        }
+                    edited = self.memory.edit(
+                        entry_id,
+                        title=args.get("title"),
+                        body=args.get("body"),
+                        tags=list(args["tags"]) if "tags" in args else None,
+                    )
+                    if edited is None:
+                        return {
+                            "success": False,
+                            "operation": "edit",
+                            "id": entry_id,
+                            "error": f"no entry with id={entry_id}",
+                        }
+                    return {
+                        "success": True,
+                        "operation": "edit",
+                        "id": entry_id,
+                        "updated_at": edited.updated_at,
+                    }
+                if op == "search":
+                    query = args.get("query") or ""
+                    top, total = self.memory.search(query)
+                    return {
+                        "success": True,
+                        "operation": "search",
+                        "query": query,
+                        "matches_returned": len(top),
+                        "total_matches": total,
+                        "entries": [asdict(e) for e in top],
+                    }
+                return {"success": False, "error": f"unknown operation: {op!r}"}
+            except ValueError as exc:
+                return {"success": False, "operation": op, "error": str(exc)}
+
+        handlers: dict[str, Any] = {
+            "get_recent_trajectory": _handle_get_recent_trajectory,
+        }
+        if self.memory is not None:
+            handlers["process_memory"] = _handle_process_memory
+        self.tool_router = ContinualToolRouter(handlers)
+
+        if self.memory is not None:
+            logger.info(
+                "[%s] Long-term memory enabled: %s (%d existing entries)",
+                self.name,
+                self.memory.path,
+                len(self.memory.all_entries()),
+            )
 
         # Cumulative token usage; logged once on cleanup().
         self.total_calls = 0
@@ -125,7 +235,10 @@ class ContinualHarness(Agent):
 
         available = available_game_actions(latest_frame.available_actions)
         action_tools = build_action_tools(available)
-        full_tools = action_tools + build_analysis_tools()
+        analysis_tools = list(build_analysis_tools())
+        if self.memory is not None:
+            analysis_tools.append(PROCESS_MEMORY_TOOL)
+        full_tools = action_tools + analysis_tools
         self.vlm.set_tools(full_tools)
         current_tools = full_tools
 
@@ -143,14 +256,17 @@ class ContinualHarness(Agent):
             + history
         )
         # Tool results accumulate across rounds; each round rebuilds the prompt so the
-        # `# TURN:` line stays the LAST thing the model reads.
+        # `# TURN:` line stays the LAST thing the model reads. Memory overview is
+        # re-read each round so add/edit/delete made by a previous round show up.
         tool_results_blocks: list[str] = []
 
         def _build_working_prompt() -> str:
-            extras = [history_block, *tool_results_blocks]
-            return build_action_prompt(
-                latest_frame, extra_context="\n\n".join(extras)
-            )
+            extras: list[str] = []
+            if self.memory is not None:
+                extras.append(format_memory_overview(self.memory.all_entries()))
+            extras.append(history_block)
+            extras.extend(tool_results_blocks)
+            return build_action_prompt(latest_frame, extra_context="\n\n".join(extras))
 
         working_prompt = _build_working_prompt()
 
@@ -227,16 +343,18 @@ class ContinualHarness(Agent):
                         "round": round_idx,
                         "analysis_budget_remaining": analysis_budget,
                         "tools_exposed": (
-                            "action_only"
-                            if current_tools is action_tools
-                            else "full"
+                            "action_only" if current_tools is action_tools else "full"
                         ),
                         "input": {
                             "system_instruction": SYSTEM_INSTRUCTION,
                             "user_prompt": working_prompt,
                             "tools": current_tools,
                             "images": [
-                                {"width": img.width, "height": img.height, "mode": img.mode}
+                                {
+                                    "width": img.width,
+                                    "height": img.height,
+                                    "mode": img.mode,
+                                }
                                 for img in images
                             ],
                         },

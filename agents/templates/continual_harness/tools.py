@@ -47,8 +47,58 @@ GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
 }
 
 
+PROCESS_MEMORY_TOOL: dict[str, Any] = {
+    "name": "process_memory",
+    "description": (
+        "Manage long-term memory for this game. Memory persists across runs and the "
+        "current index is auto-injected into every prompt under ## LONG-TERM MEMORY "
+        "(id + title + tags); you only need this tool to mutate or to read full "
+        "bodies. Operations: add (title, body, tags?), edit (id, plus any of "
+        "title/body/tags), delete (id), search (query — substring over "
+        "title/body/tags; returns full bodies). Each call consumes one of your "
+        "MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call budget."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "Why this memory operation is worth a turn. Required.",
+            },
+            "operation": {
+                "type": "string",
+                "enum": ["add", "delete", "edit", "search"],
+                "description": "Which memory operation to perform. Required.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Short label shown in the auto-injected overview. Required for add; optional for edit. Max 200 chars.",
+            },
+            "body": {
+                "type": "string",
+                "description": "Full memory content (returned by search). Required for add; optional for edit. Max 4000 chars.",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional labels for grouping/search (e.g. ['player_identity', 'action6']).",
+            },
+            "id": {
+                "type": "string",
+                "description": "Existing entry id (e.g. 'mem_003'). Required for delete and edit.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Substring matched case-insensitively against title + body + tags. Required for search; empty string returns all.",
+            },
+        },
+        "required": ["reasoning", "operation"],
+    },
+}
+
+
 def build_analysis_tools() -> list[dict[str, Any]]:
-    """Stage 3 ships exactly one analysis tool; later stages append memory/skill tools here."""
+    """Always-on analysis tools. PROCESS_MEMORY_TOOL is appended conditionally by the agent."""
     return [GET_RECENT_TRAJECTORY_TOOL]
 
 

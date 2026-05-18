@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from ...run_artifacts import RUN_ARTIFACTS_DIR_ENV, RUN_LOG_PATH_ENV, safe_slug
 from .models import StepRecord
 
 
@@ -37,9 +38,16 @@ class TrajectoryStore:
         return [json.loads(line) for line in lines[-n:] if line.strip()]
 
 
-def default_trajectory_path() -> Path:
-    """Sibling of main.py's text log when RUN_LOG_PATH is set; else logs/trajectory-<ts>.jsonl."""
-    run_log = os.getenv("RUN_LOG_PATH")
+def default_trajectory_path(prefix: str | None = None, guid: str | None = None) -> Path:
+    """Trajectory path for per-step action records."""
+    artifacts_dir = os.getenv(RUN_ARTIFACTS_DIR_ENV)
+    if artifacts_dir and prefix and guid:
+        return (
+            Path(artifacts_dir)
+            / f"{safe_slug(prefix)}.{safe_slug(guid)}.trajectory.jsonl"
+        )
+
+    run_log = os.getenv(RUN_LOG_PATH_ENV)
     if run_log:
         return Path(run_log).with_suffix(".trajectory.jsonl")
     log_dir = Path("logs")

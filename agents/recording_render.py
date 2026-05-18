@@ -126,6 +126,10 @@ def find_actions_log(
 ) -> Path | None:
     """Find a run log that mentions the given recording file."""
     recording = Path(recording_path)
+    run_log = _run_log_for_recording(recording)
+    if run_log is not None:
+        return run_log
+
     logs_root = Path(logs_dir)
     if not logs_root.exists():
         return None
@@ -155,6 +159,11 @@ def find_trace_log(
     logs_dir: str | Path = "logs",
 ) -> Path | None:
     """Find a VLM trace JSONL file matching the given recording."""
+    recording = Path(recording_path)
+    artifact_trace = _artifact_trace_for_recording(recording)
+    if artifact_trace is not None:
+        return artifact_trace
+
     if actions_log is not None:
         sibling_trace = Path(actions_log).with_suffix(TRACE_SUFFIX)
         if sibling_trace.exists():
@@ -164,7 +173,7 @@ def find_trace_log(
     if not logs_root.exists():
         return None
 
-    agent_hint = _recording_agent_hint(Path(recording_path))
+    agent_hint = _recording_agent_hint(recording)
     if agent_hint is None:
         return None
 
@@ -527,6 +536,34 @@ def _recording_agent_hint(recording_path: Path) -> str | None:
     if separator and _UUID_RE.fullmatch(suffix):
         stem = prefix
     return stem or None
+
+
+def _run_log_for_recording(recording_path: Path) -> Path | None:
+    run_dir = _run_dir_for_recording(recording_path)
+    if run_dir is None:
+        return None
+    run_log = run_dir / "run.log"
+    return run_log if run_log.exists() else None
+
+
+def _artifact_trace_for_recording(recording_path: Path) -> Path | None:
+    run_dir = _run_dir_for_recording(recording_path)
+    if run_dir is None:
+        return None
+    stem = recording_path.name
+    if stem.endswith(RECORDING_SUFFIX):
+        stem = stem[: -len(RECORDING_SUFFIX)]
+    trace_path = run_dir / "artifacts" / f"{stem}{TRACE_SUFFIX}"
+    return trace_path if trace_path.exists() else None
+
+
+def _run_dir_for_recording(recording_path: Path) -> Path | None:
+    if recording_path.parent.name != "recordings":
+        return None
+    run_dir = recording_path.parent.parent
+    if run_dir == recording_path.parent or run_dir.parent.name != "logs":
+        return None
+    return run_dir
 
 
 def _trace_mentions_agent(trace_path: Path, agent_hint: str) -> bool:

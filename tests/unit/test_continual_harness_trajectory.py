@@ -110,9 +110,7 @@ class TestFormatCompactHistory:
         assert format_compact_history([]) == "No previous actions recorded."
 
     def test_one_line_per_step(self) -> None:
-        records = [
-            _rec(i, f"ACTION{i}", reasoning=f"step {i}") for i in (1, 2, 3)
-        ]
+        records = [_rec(i, f"ACTION{i}", reasoning=f"step {i}") for i in (1, 2, 3)]
         out = format_compact_history(records)
         lines = out.splitlines()
         assert len(lines) == 3
@@ -209,9 +207,7 @@ class TestEffectTags:
 
     def test_unknown_when_frame_index_out_of_range(self) -> None:
         # Only one frame supplied — no post-action frame for action_counter=0.
-        out = format_compact_history(
-            [_rec(0, "ACTION1")], frames=[_fake_frame([[0]])]
-        )
+        out = format_compact_history([_rec(0, "ACTION1")], frames=[_fake_frame([[0]])])
         assert "UNKNOWN" in out
 
 
@@ -269,6 +265,17 @@ class TestDefaultTrajectoryPath:
         run_log = tmp_path / "logs" / "continualharness-x.log"
         monkeypatch.setenv("RUN_LOG_PATH", str(run_log))
         assert default_trajectory_path() == run_log.with_suffix(".trajectory.jsonl")
+
+    def test_uses_run_artifacts_dir_with_stem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        artifacts_dir = tmp_path / "logs" / "run" / "artifacts"
+        monkeypatch.setenv("RUN_ARTIFACTS_DIR", str(artifacts_dir))
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "logs" / "run" / "run.log"))
+
+        path = default_trajectory_path(prefix="game.agent/model", guid="guid:1")
+
+        assert path == artifacts_dir / "game.agent-model.guid-1.trajectory.jsonl"
 
     def test_fallback_uses_logs_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -381,3 +381,338 @@ class TestOrchestrator:
         # call shed the analysis tool. The LAST set_tools call must be action-only.
         names = [t["name"] for t in scripted.set_tools_calls[-1] or []]
         assert "get_recent_trajectory" not in names
+
+
+# --- memory-related orchestrator tests ---------------------------------------
+
+
+def _make_agent_with_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    seed_entries: list[dict[str, Any]] | None = None,
+) -> tuple[ContinualHarness, Path]:
+    """Same as _make_agent but with --bootstrap-memory simulated via env var.
+
+    Optionally pre-seeds the memory file before the agent loads it (mirrors a
+    user passing a previously-written file as bootstrap).
+    """
+    memory_path = tmp_path / "memory.json"
+    if seed_entries is not None:
+        memory_path.write_text(
+            json.dumps({"next_id": len(seed_entries) + 1, "entries": seed_entries})
+        )
+    monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", str(memory_path))
+    return _make_agent(tmp_path, monkeypatch), memory_path
+
+
+@pytest.mark.unit
+class TestMemoryOff:
+    def test_no_overview_in_prompt_when_memory_off(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        assert agent.memory is None
+        assert "## LONG-TERM MEMORY" not in scripted.calls[0][1]
+
+    def test_process_memory_tool_absent_when_memory_off(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        tool_names = [t["name"] for t in scripted.set_tools_calls[0] or []]
+        assert "process_memory" not in tool_names
+
+
+@pytest.mark.unit
+class TestMemoryOn:
+    def test_empty_overview_present_in_first_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = _make_agent_with_memory(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        prompt = scripted.calls[0][1]
+        assert "## LONG-TERM MEMORY (0 entries)" in prompt
+        assert prompt.index("## LONG-TERM MEMORY") < prompt.index("# TURN:")
+
+    def test_process_memory_tool_present(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = _make_agent_with_memory(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        tool_names = [t["name"] for t in scripted.set_tools_calls[0] or []]
+        assert "process_memory" in tool_names
+
+    def test_add_returns_id_and_overview_updates_next_round(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, memory_path = _make_agent_with_memory(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_memory",
+                        {
+                            "reasoning": "save",
+                            "operation": "add",
+                            "title": "Orange block is the player",
+                            "body": "After ACTION1 we observed the orange block move up; "
+                            "the white cross is just a target.",
+                            "tags": ["player_identity"],
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "go"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        chosen = agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        assert chosen is GameAction.ACTION1
+        # Round 2's prompt overview reflects the just-added entry.
+        round2_prompt = scripted.calls[1][1]
+        assert "## LONG-TERM MEMORY (1 entries)" in round2_prompt
+        assert "[mem_001] Orange block is the player (player_identity)" in round2_prompt
+        # Body stays out of the auto-injected overview block (it only renders
+        # title + tags). The tool-result echo below carries the body since the
+        # model just supplied it as an arg — that's expected, not a leak.
+        overview_start = round2_prompt.index("## LONG-TERM MEMORY")
+        overview_end = round2_prompt.index("##", overview_start + 1)
+        assert "white cross is just a target" not in round2_prompt[overview_start:overview_end]
+        # Persistence: file on disk has the entry.
+        stored = json.loads(memory_path.read_text())
+        assert stored["entries"][0]["title"] == "Orange block is the player"
+
+    def test_delete_round_trip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = _make_agent_with_memory(
+            tmp_path,
+            monkeypatch,
+            seed_entries=[
+                {
+                    "id": "mem_001",
+                    "game_id": "g",
+                    "title": "seed",
+                    "body": "seed body",
+                    "tags": [],
+                    "created_at": "",
+                    "updated_at": "",
+                }
+            ],
+        )
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_memory",
+                        {
+                            "reasoning": "wrong fact",
+                            "operation": "delete",
+                            "id": "mem_001",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        assert "## LONG-TERM MEMORY (0 entries)" in round2_prompt
+
+    def test_edit_round_trip_changes_overview_title(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = _make_agent_with_memory(
+            tmp_path,
+            monkeypatch,
+            seed_entries=[
+                {
+                    "id": "mem_001",
+                    "game_id": "g",
+                    "title": "old title",
+                    "body": "old body",
+                    "tags": [],
+                    "created_at": "",
+                    "updated_at": "",
+                }
+            ],
+        )
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_memory",
+                        {
+                            "reasoning": "refine",
+                            "operation": "edit",
+                            "id": "mem_001",
+                            "title": "new title",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        assert "[mem_001] new title" in round2_prompt
+        assert "[mem_001] old title" not in round2_prompt
+
+    def test_search_returns_full_body(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = _make_agent_with_memory(
+            tmp_path,
+            monkeypatch,
+            seed_entries=[
+                {
+                    "id": "mem_001",
+                    "game_id": "g",
+                    "title": "wall mechanics",
+                    "body": "Walls of color 3 block movement",
+                    "tags": ["mechanics"],
+                    "created_at": "",
+                    "updated_at": "",
+                }
+            ],
+        )
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_memory",
+                        {
+                            "reasoning": "recall",
+                            "operation": "search",
+                            "query": "wall",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        # The tool-result block (above # TURN:) carries the full body text.
+        assert "Walls of color 3 block movement" in round2_prompt
+
+    def test_unknown_operation_is_error_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = _make_agent_with_memory(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_memory",
+                        {"reasoning": "oops", "operation": "purge"},
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        assert "unknown operation" in round2_prompt
+
+    def test_bootstrap_file_is_loaded_at_init(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _ = _make_agent_with_memory(
+            tmp_path,
+            monkeypatch,
+            seed_entries=[
+                {
+                    "id": "mem_001",
+                    "game_id": "g",
+                    "title": "first preloaded",
+                    "body": "b",
+                    "tags": [],
+                    "created_at": "",
+                    "updated_at": "",
+                },
+                {
+                    "id": "mem_002",
+                    "game_id": "g",
+                    "title": "second preloaded",
+                    "body": "b",
+                    "tags": [],
+                    "created_at": "",
+                    "updated_at": "",
+                },
+            ],
+        )
+        scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        prompt = scripted.calls[0][1]
+        assert "## LONG-TERM MEMORY (2 entries)" in prompt
+        assert "[mem_001] first preloaded" in prompt
+        assert "[mem_002] second preloaded" in prompt
+
+    def test_bootstrap_file_is_written_back_on_mutation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, memory_path = _make_agent_with_memory(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_memory",
+                        {
+                            "reasoning": "save",
+                            "operation": "add",
+                            "title": "persisted",
+                            "body": "persisted body",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "go"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        # Open a SECOND store on the same path; entry must be visible.
+        from agents.templates.continual_harness.memory import MemoryStore
+
+        reopened = MemoryStore(memory_path, game_id="orch-test")
+        entries = reopened.all_entries()
+        assert len(entries) == 1
+        assert entries[0].title == "persisted"
