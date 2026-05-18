@@ -28,5 +28,6 @@ memory.db
 
 environment_files/
 agents/templates/utils/vlm_backends_ref.py
+agents/templates/PokeAgent_ref.py
 
 run.sh

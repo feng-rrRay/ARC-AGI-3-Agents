@@ -10,6 +10,7 @@ from typing import Any, Sequence, cast
 from PIL import Image, ImageDraw, ImageFont
 
 RECORDING_SUFFIX = ".recording.jsonl"
+TRACE_SUFFIX = ".trace.jsonl"
 
 # ARC-AGI 16-colour palette indexed by grid values 0..15.
 ARC_PALETTE: tuple[tuple[int, int, int, int], ...] = (
@@ -45,6 +46,10 @@ _ACTION_LOG_RE = re.compile(
     r"\|\s+INFO\s+\|\s+.+?\s+-\s+(?P<action>RESET|ACTION[1-7]): "
     r"count (?P<count>\d+),"
 )
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 JsonObject = dict[str, Any]
@@ -57,6 +62,7 @@ class RecordingFrame:
     timestamp: str | None
     data: JsonObject
     action_label: str | None = None
+    reasoning_trace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +148,65 @@ def find_actions_log(
     return None
 
 
+def find_trace_log(
+    recording_path: str | Path,
+    *,
+    actions_log: str | Path | None = None,
+    logs_dir: str | Path = "logs",
+) -> Path | None:
+    """Find a VLM trace JSONL file matching the given recording."""
+    if actions_log is not None:
+        sibling_trace = Path(actions_log).with_suffix(TRACE_SUFFIX)
+        if sibling_trace.exists():
+            return sibling_trace
+
+    logs_root = Path(logs_dir)
+    if not logs_root.exists():
+        return None
+
+    agent_hint = _recording_agent_hint(Path(recording_path))
+    if agent_hint is None:
+        return None
+
+    for trace_path in sorted(
+        logs_root.glob(f"*{TRACE_SUFFIX}"), key=_path_mtime, reverse=True
+    ):
+        if _trace_mentions_agent(trace_path, agent_hint):
+            return trace_path
+
+    return None
+
+
+def parse_trace_log(path: str | Path) -> dict[int, str]:
+    """Parse per-action VLM reasoning from a continual-harness trace JSONL file."""
+    trace_path = Path(path)
+    accumulators: dict[int, JsonObject] = {}
+
+    with trace_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            event = _load_json_object(stripped, trace_path, line_number)
+            action_counter = _int_or_none(event.get("action_counter"))
+            if action_counter is None:
+                continue
+
+            accumulator = accumulators.setdefault(
+                action_counter,
+                {"analysis_calls": [], "errors": []},
+            )
+            _merge_trace_event(accumulator, event)
+
+    traces: dict[int, str] = {}
+    for action_counter, accumulator in sorted(accumulators.items()):
+        trace_text = _format_trace_text(action_counter, accumulator)
+        if trace_text is not None:
+            traces[action_counter] = trace_text
+    return traces
+
+
 def apply_action_labels(
     frames: Sequence[RecordingFrame],
     action_labels: dict[int, str],
@@ -151,6 +216,23 @@ def apply_action_labels(
         return list(frames)
     return [
         replace(frame, action_label=action_labels.get(frame.index)) for frame in frames
+    ]
+
+
+def apply_reasoning_traces(
+    frames: Sequence[RecordingFrame],
+    reasoning_traces: dict[int, str],
+) -> list[RecordingFrame]:
+    """Attach parsed VLM reasoning traces to recording frames by action count."""
+    if not reasoning_traces:
+        return list(frames)
+    return [
+        replace(
+            frame,
+            reasoning_trace=reasoning_traces.get(frame.index)
+            or _action_input_reasoning(frame.data),
+        )
+        for frame in frames
     ]
 
 
@@ -182,10 +264,16 @@ def render_recording_frame(
     *,
     scale: int = 8,
     overlay: bool = True,
+    reasoning_panel: bool = False,
 ) -> Image.Image:
     """Render the first grid from one recording event."""
     grid_frame = expand_recording_frames([frame])[0]
-    return render_recording_grid_frame(grid_frame, scale=scale, overlay=overlay)
+    return render_recording_grid_frame(
+        grid_frame,
+        scale=scale,
+        overlay=overlay,
+        reasoning_panel=reasoning_panel,
+    )
 
 
 def render_recording_grid_frame(
@@ -193,11 +281,14 @@ def render_recording_grid_frame(
     *,
     scale: int = 8,
     overlay: bool = True,
+    reasoning_panel: bool = False,
 ) -> Image.Image:
     """Render one grid. Multi-grid recording events become sequential GIF frames."""
     image = grid_to_image(grid_frame.grid, scale=scale)
     if overlay:
-        return _add_overlay(image, grid_frame)
+        image = _add_overlay(image, grid_frame)
+    if reasoning_panel:
+        image = _add_reasoning_panel(image, grid_frame)
     return image
 
 
@@ -227,6 +318,7 @@ def export_gif(
     fps: int = 5,
     scale: int = 8,
     overlay: bool = True,
+    reasoning: bool = True,
 ) -> Path:
     """Export recording frames to an animated GIF."""
     if fps < 1:
@@ -237,9 +329,18 @@ def export_gif(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    grid_frames = expand_recording_frames(frames)
+    include_reasoning_panel = reasoning and any(
+        grid_frame.event.reasoning_trace for grid_frame in grid_frames
+    )
     images = [
-        render_recording_grid_frame(grid_frame, scale=scale, overlay=overlay)
-        for grid_frame in expand_recording_frames(frames)
+        render_recording_grid_frame(
+            grid_frame,
+            scale=scale,
+            overlay=overlay,
+            reasoning_panel=include_reasoning_panel,
+        )
+        for grid_frame in grid_frames
     ]
     images = _pad_to_common_size(images)
     gif_frames = [
@@ -297,6 +398,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Defaults to auto-discovery in logs/."
         ),
     )
+    parser.add_argument(
+        "--trace-log",
+        type=Path,
+        default=None,
+        help=(
+            "Optional .trace.jsonl file to render as a right-side reasoning panel. "
+            "Defaults to auto-discovery in logs/."
+        ),
+    )
+    parser.add_argument(
+        "--no-reasoning",
+        action="store_true",
+        help="Disable the right-side VLM reasoning panel.",
+    )
     return parser
 
 
@@ -313,6 +428,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     scale = cast(int, args.scale)
     overlay = not cast(bool, args.no_overlay)
     actions_log_arg = cast(Path | None, args.actions_log)
+    trace_log_arg = cast(Path | None, args.trace_log)
+    reasoning = not cast(bool, args.no_reasoning)
 
     frames = load_recording_frames(recording_path)
     actions_log = actions_log_arg or find_actions_log(recording_path)
@@ -322,6 +439,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         action_labels = {}
 
+    trace_log: Path | None = None
+    if reasoning:
+        trace_log = trace_log_arg or find_trace_log(
+            recording_path,
+            actions_log=actions_log,
+        )
+        if trace_log is not None:
+            reasoning_traces = parse_trace_log(trace_log)
+            frames = apply_reasoning_traces(frames, reasoning_traces)
+        else:
+            reasoning_traces = {}
+    else:
+        reasoning_traces = {}
+
+    attached_reasoning_count = sum(1 for frame in frames if frame.reasoning_trace)
     grid_frame_count = len(expand_recording_frames(frames))
     output = export_gif(
         frames,
@@ -329,6 +461,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fps=fps,
         scale=scale,
         overlay=overlay,
+        reasoning=reasoning,
     )
     print(
         f"Wrote {output} from {len(frames)} frame events "
@@ -336,6 +469,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if actions_log is not None and action_labels:
         print(f"Loaded {len(action_labels)} action labels from {actions_log}")
+    if trace_log is not None and reasoning_traces:
+        print(
+            f"Loaded {len(reasoning_traces)} reasoning traces from {trace_log} "
+            f"({attached_reasoning_count} attached to recording frames)"
+        )
     return 0
 
 
@@ -376,6 +514,343 @@ def _frame_layers(data: JsonObject) -> list[Grid]:
             raise ValueError(f"Frame layer {layer_index} must contain row lists")
         layers.append(cast(Grid, layer))
     return layers
+
+
+def _recording_agent_hint(recording_path: Path) -> str | None:
+    name = recording_path.name
+    if name.endswith(RECORDING_SUFFIX):
+        stem = name[: -len(RECORDING_SUFFIX)]
+    else:
+        stem = recording_path.stem
+
+    prefix, separator, suffix = stem.rpartition(".")
+    if separator and _UUID_RE.fullmatch(suffix):
+        stem = prefix
+    return stem or None
+
+
+def _trace_mentions_agent(trace_path: Path, agent_hint: str) -> bool:
+    try:
+        with trace_path.open("r", encoding="utf-8") as file:
+            for line_index, line in enumerate(file):
+                if agent_hint in line:
+                    return True
+                if line_index >= 20:
+                    break
+    except OSError:
+        return False
+    return False
+
+
+def _merge_trace_event(accumulator: JsonObject, event: JsonObject) -> None:
+    chosen_action = _clean_string(event.get("chosen_action"))
+    round_value = _int_or_none(event.get("round"))
+    reasoning = _clean_string(event.get("reasoning"))
+
+    if chosen_action is not None:
+        accumulator["chosen_action"] = chosen_action
+        if round_value is not None:
+            accumulator["round"] = round_value
+        if reasoning is None:
+            reasoning = _reasoning_from_output_action(event, chosen_action)
+        if reasoning is not None:
+            accumulator["reasoning"] = reasoning
+    elif reasoning is not None and accumulator.get("reasoning") is None:
+        accumulator["reasoning"] = reasoning
+
+    for summary in _analysis_call_summaries(event):
+        _append_unique(accumulator, "analysis_calls", summary)
+
+    error = _clean_string(event.get("error"))
+    if error is not None:
+        _append_unique(
+            accumulator, "errors", _truncate(_compact_whitespace(error), 220)
+        )
+
+
+def _analysis_call_summaries(event: JsonObject) -> list[str]:
+    summaries: list[str] = []
+    for call in _output_function_calls(event):
+        name = _clean_string(call.get("name"))
+        if name is None or _is_action_name(name):
+            continue
+
+        args = call.get("args")
+        reasoning = args.get("reasoning") if isinstance(args, dict) else None
+        reason_text = _clean_string(reasoning)
+        if reason_text is None:
+            summaries.append(name)
+        else:
+            summaries.append(f"{name}: {_compact_whitespace(reason_text)}")
+
+    tool_calls = event.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            name = _clean_string(
+                call.get("name") or call.get("tool") or call.get("function")
+            )
+            if name is None or _is_action_name(name):
+                continue
+
+            result = _clean_string(
+                call.get("result") or call.get("output") or call.get("content")
+            )
+            if result is None:
+                summaries.append(name)
+            else:
+                summaries.append(f"{name} -> {_compact_whitespace(result)}")
+    return [_truncate(summary, 260) for summary in summaries]
+
+
+def _format_trace_text(action_counter: int, accumulator: JsonObject) -> str | None:
+    action = _clean_string(accumulator.get("chosen_action"))
+    round_value = _int_or_none(accumulator.get("round"))
+    reasoning = _clean_string(accumulator.get("reasoning"))
+    analysis_calls = _string_list(accumulator.get("analysis_calls"))
+    errors = _string_list(accumulator.get("errors"))
+
+    if action is None and reasoning is None and not analysis_calls and not errors:
+        return None
+
+    details = [f"step={action_counter:03d}"]
+    if action is not None:
+        details.append(f"action={action}")
+    if round_value is not None:
+        details.append(f"round={round_value}")
+
+    lines = ["VLM reasoning", " ".join(details)]
+    if reasoning is not None:
+        lines.extend(("", reasoning))
+    if analysis_calls:
+        lines.extend(("", "Analysis tools:"))
+        lines.extend(f"- {call}" for call in analysis_calls)
+    if errors:
+        lines.extend(("", "Errors:"))
+        lines.extend(f"- {error}" for error in errors)
+    return "\n".join(lines)
+
+
+def _reasoning_from_output_action(event: JsonObject, action_name: str) -> str | None:
+    for call in _output_function_calls(event):
+        if _clean_string(call.get("name")) != action_name:
+            continue
+        args = call.get("args")
+        if isinstance(args, dict):
+            return _clean_string(args.get("reasoning"))
+    return None
+
+
+def _output_function_calls(event: JsonObject) -> list[JsonObject]:
+    output = event.get("output")
+    if not isinstance(output, dict):
+        return []
+    function_calls = output.get("function_calls")
+    if not isinstance(function_calls, list):
+        return []
+    return [cast(JsonObject, call) for call in function_calls if isinstance(call, dict)]
+
+
+def _action_input_reasoning(data: JsonObject) -> str | None:
+    action_input = data.get("action_input")
+    if not isinstance(action_input, dict):
+        return None
+
+    reasoning = _clean_string(action_input.get("reasoning"))
+    if reasoning is not None:
+        return reasoning
+
+    action_data = action_input.get("data")
+    if isinstance(action_data, dict):
+        return _clean_string(action_data.get("reasoning"))
+    return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def _append_unique(accumulator: JsonObject, key: str, value: str) -> None:
+    values = accumulator.setdefault(key, [])
+    if not isinstance(values, list):
+        return
+    if value not in values:
+        values.append(value)
+
+
+def _is_action_name(name: str) -> bool:
+    return name in _ACTION_NAMES.values()
+
+
+def _add_reasoning_panel(
+    image: Image.Image,
+    grid_frame: RecordingGridFrame,
+) -> Image.Image:
+    panel_width = image.width
+    output = Image.new(
+        "RGBA",
+        (image.width + panel_width, image.height),
+        (15, 18, 22, 255),
+    )
+    output.paste(image, (0, 0))
+
+    panel_left = image.width
+    draw = ImageDraw.Draw(output)
+    draw.rectangle(
+        (panel_left, 0, output.width, output.height),
+        fill=(15, 18, 22, 255),
+    )
+    draw.line(
+        (panel_left, 0, panel_left, output.height),
+        fill=(72, 78, 88, 255),
+        width=1,
+    )
+
+    text = (
+        grid_frame.event.reasoning_trace
+        or f"VLM reasoning\nstep={grid_frame.event.index:03d}\n\nNo trace for this step."
+    )
+    _draw_panel_text(
+        draw,
+        text,
+        x=panel_left + 8,
+        y=8,
+        width=panel_width - 16,
+        height=image.height - 16,
+    )
+    return output
+
+
+def _draw_panel_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> None:
+    font = ImageFont.load_default()
+    line_height = _font_line_height(font)
+    lines = _wrap_text_to_width(text, font, width)
+    max_lines = max(1, height // line_height)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = _fit_text_to_width(lines[-1], font, width, suffix="...")
+
+    for line_index, line in enumerate(lines):
+        if line_index == 0 and line == "VLM reasoning":
+            fill = (255, 255, 255, 255)
+        elif line.startswith("step=") or line in {"Analysis tools:", "Errors:"}:
+            fill = (188, 207, 255, 255)
+        else:
+            fill = (226, 232, 240, 255)
+        draw.text((x, y + line_index * line_height), line, fill=fill, font=font)
+
+
+def _wrap_text_to_width(text: str, font: Any, max_width: int) -> list[str]:
+    wrapped: list[str] = []
+    for raw_line in text.splitlines():
+        if not raw_line:
+            wrapped.append("")
+            continue
+
+        current = ""
+        for word in raw_line.split():
+            candidate = word if not current else f"{current} {word}"
+            if _text_width(candidate, font) <= max_width:
+                current = candidate
+                continue
+
+            if current:
+                wrapped.append(current)
+            if _text_width(word, font) <= max_width:
+                current = word
+            else:
+                pieces = _break_word_to_width(word, font, max_width)
+                wrapped.extend(pieces[:-1])
+                current = pieces[-1] if pieces else ""
+
+        if current:
+            wrapped.append(current)
+    return wrapped
+
+
+def _break_word_to_width(
+    word: str,
+    font: Any,
+    max_width: int,
+) -> list[str]:
+    pieces: list[str] = []
+    current = ""
+    for character in word:
+        candidate = f"{current}{character}"
+        if not current or _text_width(candidate, font) <= max_width:
+            current = candidate
+            continue
+        pieces.append(current)
+        current = character
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _fit_text_to_width(
+    text: str,
+    font: Any,
+    max_width: int,
+    *,
+    suffix: str,
+) -> str:
+    suffix_width = _text_width(suffix, font)
+    if _text_width(text, font) + suffix_width <= max_width:
+        return f"{text}{suffix}"
+    if suffix_width >= max_width:
+        return suffix
+
+    output = text
+    while output and _text_width(f"{output}{suffix}", font) > max_width:
+        output = output[:-1].rstrip()
+    return f"{output}{suffix}" if output else suffix
+
+
+def _font_line_height(font: Any) -> int:
+    try:
+        bbox = font.getbbox("Ag")
+    except AttributeError:
+        return 14
+    return int(max(12, bbox[3] - bbox[1] + 4))
+
+
+def _text_width(text: str, font: Any) -> int:
+    try:
+        return int(round(font.getlength(text)))
+    except AttributeError:
+        bbox = font.getbbox(text)
+        return int(bbox[2] - bbox[0])
+
+
+def _compact_whitespace(text: str) -> str:
+    return " ".join(text.split())
 
 
 def _add_overlay(image: Image.Image, grid_frame: RecordingGridFrame) -> Image.Image:

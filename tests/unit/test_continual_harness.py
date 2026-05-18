@@ -10,6 +10,7 @@ import pytest
 from arcengine import ActionInput, FrameData, FrameDataRaw, GameAction, GameState
 
 from agents.agent import Agent
+from agents.templates.continual_harness.context import build_action_prompt
 from agents.templates.continual_harness.helpers import (
     available_game_actions,
     build_action_tools,
@@ -21,7 +22,6 @@ from agents.templates.continual_harness.trace import (
     default_trace_path,
     serialize_response,
 )
-from agents.templates.continual_harness_agent import build_action_prompt
 from agents.templates.utils.vlm_backend import (
     VLM,
     AnthropicBackend,
@@ -176,6 +176,15 @@ class TestContinualHarnessPrompts:
 
         assert "# Previous Action:\nACTION6" in prompt
         assert "# Previous Action Data:\n{'x': 12, 'y': 34}" in prompt
+
+    def test_extra_context_is_injected_above_turn_line(self) -> None:
+        frame = FrameData(game_id="ec-test", frame=[[[0]]], state=GameState.NOT_FINISHED)
+        prompt = build_action_prompt(
+            frame, extra_context="## SHORT-TERM HISTORY\n[1] action=ACTION1"
+        )
+        assert "## SHORT-TERM HISTORY" in prompt
+        assert prompt.index("## SHORT-TERM HISTORY") < prompt.index("# TURN:")
+        assert "# TURN:\nCall exactly one action." in prompt
 
 
 class _ActionStampEnv:
