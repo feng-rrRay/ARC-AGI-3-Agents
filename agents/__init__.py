@@ -13,6 +13,7 @@ from .templates.llm_agents import LLM, FastLLM, GuidedLLM, ReasoningLLM
 from .templates.multimodal import MultiModalLLM
 from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
+from .templates.simple_vlm_agent import VLMSimple
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
 
 load_dotenv()
@@ -50,4 +51,5 @@ __all__ = [
     "AVAILABLE_AGENTS",
     "MultiModalLLM",
     "ContinualHarness",
+    "VLMSimple",
 ]

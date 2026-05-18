@@ -37,6 +37,15 @@ class VLMBackend(ABC):
         """Default: ignore. Backends that support function calling override this."""
         return None
 
+    def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+        """Return canonical token usage {prompt, output, total, thoughts, cached, tool_use}.
+
+        Default: provider doesn't report usage → return None. Backends with a
+        usage payload override this and normalise into the canonical shape so
+        agent/trace code never sees provider-specific field names.
+        """
+        return None
+
 
 class _PlaceholderBackend(VLMBackend):
     """Base for not-yet-implemented backends. Raises on use; accepts set_tools as a no-op."""
@@ -194,6 +203,20 @@ class GeminiBackend(VLMBackend):
                 time.sleep(delay)
         raise RuntimeError("Gemini retry budget exhausted")  # unreachable
 
+    def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+        # Normalise Gemini's usage_metadata into the backend-agnostic canonical dict.
+        um = getattr(response, "usage_metadata", None)
+        if um is None:
+            return None
+        return {
+            "prompt": getattr(um, "prompt_token_count", None),
+            "output": getattr(um, "candidates_token_count", None),
+            "total": getattr(um, "total_token_count", None),
+            "thoughts": getattr(um, "thoughts_token_count", None),
+            "cached": getattr(um, "cached_content_token_count", None),
+            "tool_use": getattr(um, "tool_use_prompt_token_count", None),
+        }
+
     @staticmethod
     def _is_safety_filtered(response: Any) -> bool:
         cands = getattr(response, "candidates", None) or []
@@ -235,6 +258,7 @@ class GeminiBackend(VLMBackend):
         logger.debug(
             "[%s] Gemini query completed in %.2fs", module_name, time.time() - start
         )
+        self._log_usage(response, module_name)
         # When tools are active, callers need the structured response; otherwise return plain text.
         return response if self._tools_payload else self._extract_text(response)
 
@@ -248,7 +272,23 @@ class GeminiBackend(VLMBackend):
             module_name,
             time.time() - start,
         )
+        self._log_usage(response, module_name)
         return response if self._tools_payload else self._extract_text(response)
+
+    def _log_usage(self, response: Any, module_name: str) -> None:
+        # Generic wording ("LLM usage") so any future backend can reuse the line shape.
+        usage = self.extract_usage(response)
+        if usage is None:
+            return
+        logger.info(
+            "[%s] LLM usage: prompt=%s output=%s total=%s (thoughts=%s, cached=%s)",
+            module_name,
+            usage.get("prompt"),
+            usage.get("output"),
+            usage.get("total"),
+            usage.get("thoughts"),
+            usage.get("cached"),
+        )
 
 
 class VLM:
@@ -309,6 +349,9 @@ class VLM:
 
     def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
         self.backend.set_tools(tools)
+
+    def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+        return self.backend.extract_usage(response)
 
     def get_query(
         self,

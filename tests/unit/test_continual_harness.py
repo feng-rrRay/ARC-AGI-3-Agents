@@ -5,9 +5,11 @@ import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
-from arcengine import FrameData, GameAction, GameState
+from arcengine import ActionInput, FrameData, FrameDataRaw, GameAction, GameState
 
+from agents.agent import Agent
 from agents.templates.continual_harness.helpers import (
     available_game_actions,
     build_action_tools,
@@ -158,6 +160,91 @@ class TestContinualHarnessPrompts:
         # Final TURN line copied verbatim from LLM.build_user_prompt.
         assert "# TURN:\nCall exactly one action." in prompt
 
+    def test_user_prompt_uses_frame_action_input(self) -> None:
+        frame = FrameData(
+            game_id="prompt-test",
+            frame=[[[1]]],
+            state=GameState.NOT_FINISHED,
+            action_input=ActionInput(
+                id=GameAction.ACTION6,
+                data={"x": 12, "y": 34},
+                reasoning="clicking the target",
+            ),
+        )
+
+        prompt = build_action_prompt(frame)
+
+        assert "# Previous Action:\nACTION6" in prompt
+        assert "# Previous Action Data:\n{'x': 12, 'y': 34}" in prompt
+
+
+class _ActionStampEnv:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def step(
+        self,
+        action: GameAction,
+        data: dict[str, Any] | None = None,
+        reasoning: dict[str, Any] | None = None,
+    ) -> FrameDataRaw:
+        self.calls.append(
+            {"action": action, "data": data or {}, "reasoning": reasoning or {}}
+        )
+        raw = FrameDataRaw(
+            game_id="stamp-test",
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            win_levels=1,
+            action_input=ActionInput(),
+            available_actions=[1, 2, 3, 4, 6],
+        )
+        raw.frame = [np.array([[1, 2], [3, 4]], dtype=np.int8)]
+        return raw
+
+
+class _ActionStampAgent(Agent):
+    def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
+        return False
+
+    def choose_action(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
+        return GameAction.ACTION1
+
+
+@pytest.mark.unit
+class TestAgentActionInputStamping:
+    def test_do_action_request_stamps_submitted_action_on_returned_frame(
+        self,
+    ) -> None:
+        env = _ActionStampEnv()
+        agent = _ActionStampAgent(
+            card_id="card",
+            game_id="stamp-test",
+            agent_name="agent",
+            ROOT_URL="https://example.com",
+            record=False,
+            arc_env=env,  # type: ignore[arg-type]
+        )
+        action = GameAction.ACTION6
+        action.set_data({"x": 12, "y": 34})
+        action.reasoning = "click the visible target"
+
+        frame = agent.do_action_request(action)
+        action.reasoning = None
+
+        assert frame.action_input.id is GameAction.ACTION6
+        assert frame.action_input.data == {"x": 12, "y": 34}
+        assert frame.action_input.reasoning == "click the visible target"
+        assert env.calls == [
+            {
+                "action": GameAction.ACTION6,
+                "data": {"game_id": "", "x": 12, "y": 34},
+                "reasoning": {"reasoning": "click the visible target"},
+            }
+        ]
+
 
 class _FakeClient:
     """Stand-in for google.genai.Client used by GeminiBackend tests."""
@@ -269,3 +356,78 @@ class TestTraceWriter:
             {"name": "ACTION1", "args": {"reasoning": "go up"}}
         ]
         assert out["finish_reason"] == 1
+
+
+@pytest.mark.unit
+class TestTokenUsage:
+    def _make_backend(self, monkeypatch: pytest.MonkeyPatch) -> GeminiBackend:
+        _install_fake_gemini(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        return GeminiBackend("gemini-2.5-pro")
+
+    def test_gemini_extract_usage_returns_canonical_dict(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = self._make_backend(monkeypatch)
+        response = SimpleNamespace(
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=1842,
+                candidates_token_count=28,
+                total_token_count=1870,
+                thoughts_token_count=612,
+                cached_content_token_count=1024,
+                tool_use_prompt_token_count=None,
+            )
+        )
+
+        usage = backend.extract_usage(response)
+
+        assert usage == {
+            "prompt": 1842,
+            "output": 28,
+            "total": 1870,
+            "thoughts": 612,
+            "cached": 1024,
+            "tool_use": None,
+        }
+
+    def test_gemini_extract_usage_returns_none_when_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = self._make_backend(monkeypatch)
+        # Response with no usage_metadata at all.
+        assert backend.extract_usage(SimpleNamespace()) is None
+
+    def test_vlm_extract_usage_delegates_to_backend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_fake_gemini(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        vlm = VLM("gemini-2.5-pro", backend="auto")
+
+        calls: list[Any] = []
+
+        def fake_extract(resp: Any) -> dict[str, int | None] | None:
+            calls.append(resp)
+            return {
+                "prompt": 1,
+                "output": 2,
+                "total": 3,
+                "thoughts": None,
+                "cached": None,
+                "tool_use": None,
+            }
+
+        monkeypatch.setattr(vlm.backend, "extract_usage", fake_extract)
+        marker = SimpleNamespace(usage_metadata=None)
+        out = vlm.extract_usage(marker)
+
+        assert calls == [marker]
+        assert out == {
+            "prompt": 1,
+            "output": 2,
+            "total": 3,
+            "thoughts": None,
+            "cached": None,
+            "tool_use": None,
+        }

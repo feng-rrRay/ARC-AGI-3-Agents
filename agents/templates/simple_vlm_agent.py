@@ -45,7 +45,7 @@ def build_action_prompt(latest_frame: FrameData) -> str:
     )
 
 
-class ContinualHarness(Agent):
+class VLMSimple(Agent):
     """Single-game VLM agent: each step queries the VLM with the rendered frame.
 
     On every step we (1) advertise the currently available actions as tools,
@@ -161,7 +161,7 @@ class ContinualHarness(Agent):
                 return chosen
 
         raise RuntimeError(
-            f"ContinualHarness could not select an action after "
+            f"VLMSimple could not select an action after "
             f"{self.MAX_PARSE_RETRIES} attempts"
         ) from last_exc
 

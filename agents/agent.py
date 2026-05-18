@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from arc_agi import EnvironmentWrapper
 from arc_agi.scorecard import EnvironmentScorecard
-from arcengine import FrameData, FrameDataRaw, GameAction, GameState
+from arcengine import ActionInput, FrameData, FrameDataRaw, GameAction, GameState
 from pydantic import ValidationError
 
 from .recorder import Recorder
@@ -132,12 +132,41 @@ class Agent(ABC):
 
     def do_action_request(self, action: GameAction) -> FrameData:
         data = action.action_data.model_dump()
+        reasoning = self._action_reasoning(action, data)
+        step_reasoning = (
+            reasoning
+            if isinstance(reasoning, dict)
+            else {"reasoning": reasoning}
+            if reasoning is not None
+            else {}
+        )
         raw = self.arc_env.step(
             action,
             data=data,
-            reasoning=data["reasoning"] if "reasoning" in data else {},
+            reasoning=step_reasoning,
         )
+        if raw is not None:
+            raw.action_input = ActionInput(
+                id=action,
+                data=self._action_input_data(data),
+                reasoning=reasoning,
+            )
         return self._convert_raw_frame_data(raw)
+
+    @staticmethod
+    def _action_reasoning(action: GameAction, data: dict[str, Any]) -> Any | None:
+        reasoning = getattr(action, "reasoning", None)
+        if reasoning is not None:
+            return reasoning
+        return data.get("reasoning")
+
+    @staticmethod
+    def _action_input_data(data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in data.items()
+            if key != "reasoning" and not (key == "game_id" and value in ("", None))
+        }
 
     def _convert_raw_frame_data(self, raw: FrameDataRaw | None) -> FrameData:
         if raw is None:
