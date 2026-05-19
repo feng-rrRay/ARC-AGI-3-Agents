@@ -9,6 +9,7 @@ from agents.templates.continual_harness.memory import (
     MAX_ENTRIES,
     SEARCH_MAX_MATCHES,
     MemoryStore,
+    active_memory_path,
     bootstrap_memory_path,
     format_memory_overview,
 )
@@ -20,9 +21,7 @@ def _store(tmp_path: Path, game_id: str = "ls20") -> MemoryStore:
 
 @pytest.mark.unit
 class TestBootstrapMemoryPath:
-    def test_returns_none_when_env_unset(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
         assert bootstrap_memory_path() is None
 
@@ -32,6 +31,38 @@ class TestBootstrapMemoryPath:
         target = tmp_path / "mem.json"
         monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", str(target))
         assert bootstrap_memory_path() == target
+
+
+@pytest.mark.unit
+class TestActiveMemoryPath:
+    def test_prefers_bootstrap_memory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        bootstrap = tmp_path / "bootstrap.json"
+        run_memory = tmp_path / "run" / "memory.json"
+        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", str(bootstrap))
+        monkeypatch.setenv("RUN_MEMORY_PATH", str(run_memory))
+
+        assert active_memory_path() == bootstrap
+
+    def test_uses_run_memory_path_without_bootstrap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "run" / "memory.json"
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
+        monkeypatch.setenv("RUN_MEMORY_PATH", str(target))
+
+        assert active_memory_path() == target
+
+    def test_derives_from_run_dir_without_explicit_run_memory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = tmp_path / "logs" / "run-id"
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
+        monkeypatch.delenv("RUN_MEMORY_PATH", raising=False)
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
+
+        assert active_memory_path() == run_dir / "memory.json"
 
 
 @pytest.mark.unit

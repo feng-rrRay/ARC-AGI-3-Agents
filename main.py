@@ -24,6 +24,8 @@ from agents.run_artifacts import (
     create_run_artifacts,
     export_run_env,
     snapshot_memory,
+    snapshot_skills,
+    snapshot_subagents,
     write_manifest,
     write_scorecard,
 )
@@ -52,6 +54,8 @@ def run_agent(
     swarm: Swarm,
     run_artifacts: RunArtifacts,
     bootstrap_memory: Path | None,
+    bootstrap_skills: Path | None,
+    bootstrap_subagents: Path | None,
 ) -> None:
     scorecard = swarm.main()
     finalize_run_artifacts(
@@ -59,6 +63,8 @@ def run_agent(
         swarm=swarm,
         scorecard=scorecard,
         bootstrap_memory=bootstrap_memory,
+        bootstrap_skills=bootstrap_skills,
+        bootstrap_subagents=bootstrap_subagents,
         status="completed",
     )
     os.kill(os.getpid(), signal.SIGINT)
@@ -70,13 +76,19 @@ def finalize_run_artifacts(
     swarm: Swarm,
     scorecard: object | None,
     bootstrap_memory: Path | None,
+    bootstrap_skills: Path | None,
+    bootstrap_subagents: Path | None,
     status: str,
 ) -> None:
     card_id = _scorecard_id(scorecard)
     if scorecard is not None:
         write_scorecard(run_artifacts, scorecard)
-    if bootstrap_memory is not None:
-        snapshot_memory(bootstrap_memory, run_artifacts.memory_final_path)
+    memory_source = bootstrap_memory or run_artifacts.memory_path
+    snapshot_memory(memory_source, run_artifacts.memory_final_path)
+    skills_source = bootstrap_skills or run_artifacts.skills_path
+    snapshot_skills(skills_source, run_artifacts.skills_final_path)
+    subagents_source = bootstrap_subagents or run_artifacts.subagents_path
+    snapshot_subagents(subagents_source, run_artifacts.subagents_final_path)
     write_manifest(
         run_artifacts,
         agent=swarm.agent_name,
@@ -85,6 +97,8 @@ def finalize_run_artifacts(
         card_id=card_id,
         status=status,
         bootstrap_memory=bootstrap_memory,
+        bootstrap_skills=bootstrap_skills,
+        bootstrap_subagents=bootstrap_subagents,
     )
 
 
@@ -105,6 +119,8 @@ def cleanup(
     swarm: Swarm,
     run_artifacts: RunArtifacts,
     bootstrap_memory: Path | None,
+    bootstrap_skills: Path | None,
+    bootstrap_subagents: Path | None,
     signum: Optional[int],
     frame: Optional[FrameType],
 ) -> None:
@@ -121,6 +137,8 @@ def cleanup(
             swarm=swarm,
             scorecard=scorecard,
             bootstrap_memory=bootstrap_memory,
+            bootstrap_skills=bootstrap_skills,
+            bootstrap_subagents=bootstrap_subagents,
             status="interrupted",
         )
 
@@ -174,8 +192,33 @@ def main() -> None:
         help=(
             "Optional JSON file backing ContinualHarness long-term memory. "
             "When provided, the agent loads it on start and writes mutations "
-            "atomically on every change. When omitted, memory is disabled "
-            "(no process_memory tool, no LONG-TERM MEMORY block)."
+            "atomically on every change. When omitted, memory still runs with "
+            "run-local backing at logs/<run_id>/memory.json."
+        ),
+    )
+    parser.add_argument(
+        "--bootstrap-skills",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON file backing the ContinualHarness skill registry. "
+            "When provided, skills load from and write back to this file "
+            "(cross-run persistence). When omitted, skills live in "
+            "logs/<run_id>/skills.json. process_skill, run_skill, and run_code "
+            "are ALWAYS available; this flag only changes the backing file."
+        ),
+    )
+    parser.add_argument(
+        "--bootstrap-subagents",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON file backing the ContinualHarness subagent "
+            "registry. When provided, subagents load from and write back to "
+            "this file (cross-run persistence). When omitted, subagents live "
+            "in logs/<run_id>/subagents.json. process_subagent and "
+            "run_subagent are ALWAYS available; this flag only changes the "
+            "backing file."
         ),
     )
 
@@ -184,13 +227,38 @@ def main() -> None:
     run_artifacts = create_run_artifacts(args.agent or "no-agent")
     export_run_env(run_artifacts)
 
-    bootstrap_memory = (
-        Path(args.bootstrap_memory).resolve() if args.bootstrap_memory else None
+    bootstrap_memory_raw = args.bootstrap_memory or os.getenv(
+        "CONTINUAL_HARNESS_BOOTSTRAP_MEMORY"
     )
-    # Memory persistence is opt-in: agents read this env var when constructing their store.
+    bootstrap_memory = (
+        Path(bootstrap_memory_raw).resolve() if bootstrap_memory_raw else None
+    )
     if bootstrap_memory is not None:
         os.environ["CONTINUAL_HARNESS_BOOTSTRAP_MEMORY"] = str(bootstrap_memory)
-        snapshot_memory(bootstrap_memory, run_artifacts.memory_initial_path)
+    memory_source = bootstrap_memory or run_artifacts.memory_path
+    snapshot_memory(memory_source, run_artifacts.memory_initial_path)
+
+    bootstrap_skills_raw = args.bootstrap_skills or os.getenv(
+        "CONTINUAL_HARNESS_BOOTSTRAP_SKILLS"
+    )
+    bootstrap_skills = (
+        Path(bootstrap_skills_raw).resolve() if bootstrap_skills_raw else None
+    )
+    if bootstrap_skills is not None:
+        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_SKILLS"] = str(bootstrap_skills)
+    skills_source = bootstrap_skills or run_artifacts.skills_path
+    snapshot_skills(skills_source, run_artifacts.skills_initial_path)
+
+    bootstrap_subagents_raw = args.bootstrap_subagents or os.getenv(
+        "CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS"
+    )
+    bootstrap_subagents = (
+        Path(bootstrap_subagents_raw).resolve() if bootstrap_subagents_raw else None
+    )
+    if bootstrap_subagents is not None:
+        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS"] = str(bootstrap_subagents)
+    subagents_source = bootstrap_subagents or run_artifacts.subagents_path
+    snapshot_subagents(subagents_source, run_artifacts.subagents_initial_path)
 
     file_handler = logging.FileHandler(run_artifacts.log_path, mode="w")
     file_handler.setLevel(log_level)
@@ -207,6 +275,8 @@ def main() -> None:
             tags=[],
             status="error",
             bootstrap_memory=bootstrap_memory,
+            bootstrap_skills=bootstrap_skills,
+            bootstrap_subagents=bootstrap_subagents,
         )
         return
 
@@ -277,6 +347,8 @@ def main() -> None:
             tags=tags,
             status="error",
             bootstrap_memory=bootstrap_memory,
+            bootstrap_skills=bootstrap_skills,
+            bootstrap_subagents=bootstrap_subagents,
         )
         return
 
@@ -296,14 +368,30 @@ def main() -> None:
         tags=swarm.tags,
         status="running",
         bootstrap_memory=bootstrap_memory,
+        bootstrap_skills=bootstrap_skills,
+        bootstrap_subagents=bootstrap_subagents,
     )
     agent_thread = threading.Thread(
-        target=partial(run_agent, swarm, run_artifacts, bootstrap_memory)
+        target=partial(
+            run_agent,
+            swarm,
+            run_artifacts,
+            bootstrap_memory,
+            bootstrap_skills,
+            bootstrap_subagents,
+        )
     )
     agent_thread.daemon = True  # die when the main thread dies
     signal.signal(
         signal.SIGINT,
-        partial(cleanup, swarm, run_artifacts, bootstrap_memory),
+        partial(
+            cleanup,
+            swarm,
+            run_artifacts,
+            bootstrap_memory,
+            bootstrap_skills,
+            bootstrap_subagents,
+        ),
     )  # handler for Ctrl+C
     agent_thread.start()
 
@@ -313,10 +401,26 @@ def main() -> None:
             agent_thread.join(timeout=5)  # Check every 5 second
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received in main thread")
-        cleanup(swarm, run_artifacts, bootstrap_memory, signal.SIGINT, None)
+        cleanup(
+            swarm,
+            run_artifacts,
+            bootstrap_memory,
+            bootstrap_skills,
+            bootstrap_subagents,
+            signal.SIGINT,
+            None,
+        )
     except Exception as e:
         logger.error(f"Unexpected error in main thread: {e}")
-        cleanup(swarm, run_artifacts, bootstrap_memory, None, None)
+        cleanup(
+            swarm,
+            run_artifacts,
+            bootstrap_memory,
+            bootstrap_skills,
+            bootstrap_subagents,
+            None,
+            None,
+        )
 
 
 if __name__ == "__main__":

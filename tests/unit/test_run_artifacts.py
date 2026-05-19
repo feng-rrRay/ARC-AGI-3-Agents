@@ -9,6 +9,7 @@ from agents.run_artifacts import (
     RUN_DIR_ENV,
     RUN_ID_ENV,
     RUN_LOG_PATH_ENV,
+    RUN_MEMORY_PATH_ENV,
     RUN_RECORDINGS_DIR_ENV,
     create_run_artifacts,
     export_run_env,
@@ -42,6 +43,7 @@ def test_export_run_env_sets_internal_run_paths(tmp_path: Path) -> None:
         RUN_LOG_PATH_ENV,
         RUN_RECORDINGS_DIR_ENV,
         RUN_ARTIFACTS_DIR_ENV,
+        RUN_MEMORY_PATH_ENV,
     ]
     original = {key: os.environ.get(key) for key in keys}
 
@@ -53,6 +55,7 @@ def test_export_run_env_sets_internal_run_paths(tmp_path: Path) -> None:
         assert os.environ[RUN_LOG_PATH_ENV] == str(artifacts.log_path)
         assert os.environ[RUN_RECORDINGS_DIR_ENV] == str(artifacts.recordings_dir)
         assert os.environ[RUN_ARTIFACTS_DIR_ENV] == str(artifacts.artifacts_dir)
+        assert os.environ[RUN_MEMORY_PATH_ENV] == str(artifacts.memory_path)
     finally:
         for key, value in original.items():
             if value is None:
@@ -81,6 +84,9 @@ def test_manifest_and_scorecard_are_written(tmp_path: Path) -> None:
     assert manifest["run_id"] == artifacts.run_id
     assert manifest["status"] == "running"
     assert manifest["paths"]["recordings"] == str(artifacts.recordings_dir)
+    assert manifest["paths"]["memory"] == str(tmp_path / "memory.json")
+    assert manifest["paths"]["memory_initial"] == str(artifacts.memory_initial_path)
+    assert manifest["paths"]["memory_final"] == str(artifacts.memory_final_path)
     assert scorecard == {"score": 1}
 
 

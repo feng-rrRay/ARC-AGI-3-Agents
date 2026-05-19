@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from ._locks import lock_for_path
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +30,41 @@ class MemoryEntry:
     updated_at: str = ""
 
 
-def bootstrap_memory_path() -> Path | None:
-    """File backing long-term memory, or None when --bootstrap-memory was not passed.
+BOOTSTRAP_MEMORY_ENV = "CONTINUAL_HARNESS_BOOTSTRAP_MEMORY"
+RUN_MEMORY_PATH_ENV = "RUN_MEMORY_PATH"
+RUN_DIR_ENV = "RUN_DIR"
+RUN_LOG_PATH_ENV = "RUN_LOG_PATH"
 
-    None means "memory is OFF": no tool, no overview, no disk I/O.
-    """
-    raw = os.getenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY")
+
+def bootstrap_memory_path() -> Path | None:
+    """Explicit cross-run memory file passed via --bootstrap-memory, if any."""
+    raw = os.getenv(BOOTSTRAP_MEMORY_ENV)
     return Path(raw) if raw else None
+
+
+def active_memory_path() -> Path:
+    """Return the backing memory file for this agent.
+
+    --bootstrap-memory is the durable cross-run source. When omitted, memory is
+    still enabled and stored inside the current run directory.
+    """
+    bootstrap = bootstrap_memory_path()
+    if bootstrap is not None:
+        return bootstrap
+
+    raw = os.getenv(RUN_MEMORY_PATH_ENV)
+    if raw:
+        return Path(raw)
+
+    run_dir = os.getenv(RUN_DIR_ENV)
+    if run_dir:
+        return Path(run_dir) / "memory.json"
+
+    run_log = os.getenv(RUN_LOG_PATH_ENV)
+    if run_log:
+        return Path(run_log).with_name("memory.json")
+
+    return Path("logs") / "continual_harness.memory.json"
 
 
 class MemoryStore:
@@ -49,7 +78,7 @@ class MemoryStore:
         self.path = path
         self.game_id = game_id
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = lock_for_path(path)
 
     # ---- internal ----------------------------------------------------------
 
@@ -109,9 +138,7 @@ class MemoryStore:
             state = self._load()
         return [MemoryEntry(**e) for e in state["entries"]]
 
-    def add(
-        self, title: str, body: str, tags: list[str] | None = None
-    ) -> MemoryEntry:
+    def add(self, title: str, body: str, tags: list[str] | None = None) -> MemoryEntry:
         title = self._truncate(title, TITLE_MAX_CHARS)
         body = self._truncate(body, BODY_MAX_CHARS)
         if not title or not body:
@@ -142,9 +169,7 @@ class MemoryStore:
         with self._lock:
             state = self._load()
             before = len(state["entries"])
-            state["entries"] = [
-                e for e in state["entries"] if e.get("id") != entry_id
-            ]
+            state["entries"] = [e for e in state["entries"] if e.get("id") != entry_id]
             if len(state["entries"]) == before:
                 return False
             self._save(state)
@@ -204,9 +229,9 @@ def format_memory_overview(entries: list[MemoryEntry]) -> str:
         return (
             "## LONG-TERM MEMORY (0 entries)\n"
             'No memories saved yet. Use process_memory(operation="add", '
-            "title=..., body=..., tags=[...]) to record durable observations "
+            "title=..., body=..., tags=[...]) to record observations "
             "(player identity, action effects, level mechanics) that will help "
-            "future runs."
+            "future steps. With --bootstrap-memory, they also persist across runs."
         )
     rows = [f"## LONG-TERM MEMORY ({len(entries)} entries)"]
     for e in entries:

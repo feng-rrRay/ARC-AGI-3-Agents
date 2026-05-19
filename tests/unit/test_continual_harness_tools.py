@@ -10,7 +10,9 @@ import numpy as np
 import pytest
 from arcengine import ActionInput, FrameData, FrameDataRaw, GameAction, GameState
 
+import agents.templates.continual_harness_agent as harness_module
 from agents.templates.continual_harness.models import ToolCallRecord
+from agents.templates.continual_harness.subagents import DEFAULT_SUBAGENT_ALLOWED_TOOLS
 from agents.templates.continual_harness.tools import (
     ContinualToolRouter,
     FunctionCall,
@@ -213,6 +215,11 @@ def _make_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ContinualHar
     _install_fake_gemini(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "run.log"))
+    monkeypatch.setenv("RUN_MEMORY_PATH", str(tmp_path / "memory.json"))
+    monkeypatch.setenv("RUN_SKILLS_PATH", str(tmp_path / "skills.json"))
+    # Bootstrap env vars are intentionally NOT deleted here so tests can opt in
+    # by setting them before calling _make_agent. monkeypatch isolates env per
+    # test, so leakage across tests is impossible.
     env = _NoopEnv()
     return ContinualHarness(
         card_id="card",
@@ -407,8 +414,8 @@ def _make_agent_with_memory(
 
 
 @pytest.mark.unit
-class TestMemoryOff:
-    def test_no_overview_in_prompt_when_memory_off(
+class TestRunLocalMemory:
+    def test_empty_overview_in_prompt_without_bootstrap(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
@@ -418,10 +425,10 @@ class TestMemoryOff:
 
         agent.choose_action([_make_frame([1])], _make_frame([1]))
 
-        assert agent.memory is None
-        assert "## LONG-TERM MEMORY" not in scripted.calls[0][1]
+        assert agent.memory.path == tmp_path / "memory.json"
+        assert "## LONG-TERM MEMORY (0 entries)" in scripted.calls[0][1]
 
-    def test_process_memory_tool_absent_when_memory_off(
+    def test_process_memory_tool_present_without_bootstrap(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
@@ -432,7 +439,35 @@ class TestMemoryOff:
         agent.choose_action([_make_frame([1])], _make_frame([1]))
 
         tool_names = [t["name"] for t in scripted.set_tools_calls[0] or []]
-        assert "process_memory" not in tool_names
+        assert "process_memory" in tool_names
+
+    def test_run_local_memory_is_written_on_mutation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_MEMORY", raising=False)
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_memory",
+                        {
+                            "reasoning": "save",
+                            "operation": "add",
+                            "title": "run local",
+                            "body": "available without bootstrap",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        stored = json.loads((tmp_path / "memory.json").read_text())
+        assert stored["entries"][0]["title"] == "run local"
 
 
 @pytest.mark.unit
@@ -498,7 +533,10 @@ class TestMemoryOn:
         # model just supplied it as an arg — that's expected, not a leak.
         overview_start = round2_prompt.index("## LONG-TERM MEMORY")
         overview_end = round2_prompt.index("##", overview_start + 1)
-        assert "white cross is just a target" not in round2_prompt[overview_start:overview_end]
+        assert (
+            "white cross is just a target"
+            not in round2_prompt[overview_start:overview_end]
+        )
         # Persistence: file on disk has the entry.
         stored = json.loads(memory_path.read_text())
         assert stored["entries"][0]["title"] == "Orange block is the player"
@@ -716,3 +754,455 @@ class TestMemoryOn:
         entries = reopened.all_entries()
         assert len(entries) == 1
         assert entries[0].title == "persisted"
+
+
+# --- skill / sandbox orchestrator tests --------------------------------------
+
+
+@pytest.mark.unit
+class TestSkillsAlwaysOn:
+    def test_three_tools_always_present_in_set_tools(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        tool_names = [t["name"] for t in scripted.set_tools_calls[0] or []]
+        assert "process_skill" in tool_names
+        assert "run_skill" in tool_names
+        assert "run_code" in tool_names
+
+    def test_skills_overview_in_first_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        prompt = scripted.calls[0][1]
+        assert "## SKILLS (0 saved)" in prompt
+        assert prompt.index("## SKILLS") < prompt.index("# TURN:")
+
+    def test_run_local_skills_written_on_mutation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_skill",
+                        {
+                            "reasoning": "save",
+                            "operation": "add",
+                            "name": "find_player",
+                            "description": "Locate player.",
+                            "code": "result = (0, 0)",
+                            "tags": ["geo"],
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        stored = json.loads((tmp_path / "skills.json").read_text())
+        assert stored["entries"][0]["name"] == "find_player"
+
+    def test_bootstrap_skills_takes_precedence_over_run_skills_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bootstrap_path = tmp_path / "bootstrap.skills.json"
+        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_SKILLS", str(bootstrap_path))
+        agent = _make_agent(tmp_path, monkeypatch)
+        assert agent.skills.path == bootstrap_path
+        # The run-local path is NOT used when bootstrap is set.
+        assert not (tmp_path / "skills.json").exists()
+
+
+@pytest.mark.unit
+class TestSkillsHandlers:
+    def test_add_updates_overview_next_round(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_skill",
+                        {
+                            "reasoning": "save",
+                            "operation": "add",
+                            "name": "find_player",
+                            "description": "Locate the player cell.",
+                            "code": "result = (0, 0)",
+                            "tags": ["geo"],
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "go"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        assert "## SKILLS (1 saved)" in round2_prompt
+        assert "[skill_001] find_player (geo)" in round2_prompt
+
+    def test_run_skill_executes_and_returns_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pre-seed a skill that doubles its `x` arg.
+        skills_path = tmp_path / "skills.json"
+        skills_path.write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "skill_001",
+                            "game_id": "g",
+                            "name": "doubler",
+                            "description": "Doubles args['x'].",
+                            "code": "result = args['x'] * 2",
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "run_skill",
+                        {
+                            "reasoning": "compute",
+                            "id": "skill_001",
+                            "args": {"x": 7},
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        # The tool-result block above # TURN: carries the sandbox result.
+        assert '"result": 14' in round2_prompt
+
+    def test_run_code_one_off_snippet_returns_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "run_code",
+                        {
+                            "reasoning": "compute",
+                            "code": "result = sum(range(10))",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        assert '"result": 45' in round2_prompt
+
+    def test_run_skill_unknown_id_returns_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "run_skill",
+                        {"reasoning": "try", "id": "skill_999"},
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        round2_prompt = scripted.calls[1][1]
+        assert "no skill with id=skill_999" in round2_prompt
+
+    def test_skill_call_counts_against_analysis_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        monkeypatch.setattr(agent, "MAX_ANALYSIS_CALLS_PER_STEP", 2)
+        # Round 1: 3 parallel run_code calls (budget 2 → 2 succeed, 1 refused).
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part("run_code", {"reasoning": "a", "code": "result = 1"}),
+                    _fc_part("run_code", {"reasoning": "b", "code": "result = 2"}),
+                    _fc_part("run_code", {"reasoning": "c", "code": "result = 3"}),
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        rows = _read_trajectory(agent)
+        tcs = rows[0]["tool_calls"]
+        assert len(tcs) == 3
+        errored = [tc for tc in tcs if tc.get("error")]
+        assert len(errored) == 1
+        assert "budget exhausted" in errored[0]["error"]
+
+
+@pytest.mark.unit
+class TestSubagentHandlers:
+    def test_process_subagent_defaults_allowed_tools_when_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "process_subagent",
+                        {
+                            "reasoning": "make helper",
+                            "operation": "add",
+                            "name": "summarizer",
+                            "description": "Summarize current state.",
+                            "instructions": "Return a concise summary.",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        stored = json.loads((tmp_path / "subagents.json").read_text())
+        assert stored["entries"][0]["allowed_tools"] == list(
+            DEFAULT_SUBAGENT_ALLOWED_TOOLS
+        )
+
+    def test_run_subagent_return_includes_per_round_steps(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "instructions": "Return the answer.",
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _ReturningSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                self.tools: list[dict[str, Any]] = []
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                self.tools = list(tools or [])
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                return _response(
+                    _fc_part(
+                        "subagent_return",
+                        {
+                            "reasoning": "done",
+                            "answer": "summary",
+                            "status": "success",
+                        },
+                    )
+                )
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _ReturningSubVLM)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "run_subagent",
+                        {
+                            "reasoning": "ask helper",
+                            "id": "subagent_001",
+                            "task": "summarize",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        rows = _read_trajectory(agent)
+        result = rows[0]["tool_calls"][0]["result"]
+        assert result["success"] is True
+        assert result["result"]["answer"] == "summary"
+        assert result["steps"][0]["inner_round"] == 1
+        assert result["steps"][0]["subagent_return"]["answer"] == "summary"
+        assert result["steps"][0]["tool_calls"] == []
+
+    def test_run_subagent_forces_failure_return_on_max_rounds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "looper",
+                            "description": "Loops.",
+                            "instructions": "Keep using tools.",
+                            "allowed_tools": ["get_recent_trajectory"],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+        monkeypatch.setattr(agent, "MAX_SUBAGENT_ROUNDS_PER_CALL", 2)
+
+        class _LoopingSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                self.responses = [
+                    _response(
+                        _fc_part(
+                            "get_recent_trajectory",
+                            {"reasoning": "read 1", "limit": 1},
+                        )
+                    ),
+                    _response(
+                        _fc_part(
+                            "get_recent_trajectory",
+                            {"reasoning": "read 2", "limit": 2},
+                        )
+                    ),
+                ]
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                return self.responses.pop(0)
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _LoopingSubVLM)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part(
+                        "run_subagent",
+                        {
+                            "reasoning": "ask helper",
+                            "id": "subagent_001",
+                            "task": "loop until forced",
+                        },
+                    )
+                ),
+                _response(_fc_part("ACTION1", {"reasoning": "commit"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1])], _make_frame([1]))
+
+        rows = _read_trajectory(agent)
+        result = rows[0]["tool_calls"][0]["result"]
+        assert result["success"] is False
+        assert result["forced_return"] is True
+        assert "exhausted max inner rounds" in result["warning"]
+        assert result["result"]["status"] == "failure"
+        assert len(result["steps"]) == 2
+        assert result["steps"][0]["tool_calls"][0]["name"] == "get_recent_trajectory"
+        assert result["steps"][0]["tool_calls"][0]["args"]["limit"] == 1
+        assert result["steps"][1]["tool_calls"][0]["args"]["limit"] == 2
+
+
+@pytest.mark.unit
+class TestFinalRoundStripsSkillsToo:
+    def test_round_max_strips_all_analysis_tools(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        monkeypatch.setattr(agent, "MAX_TOOL_ROUNDS", 2)
+        scripted = _ScriptedVLM(
+            [
+                _response(
+                    _fc_part("run_code", {"reasoning": "peek", "code": "result = 1"})
+                ),
+                _response(_fc_part("ACTION3", {"reasoning": "go"})),
+            ]
+        )
+        agent.vlm = scripted  # type: ignore[assignment]
+
+        agent.choose_action([_make_frame([1, 2, 3])], _make_frame([1, 2, 3]))
+
+        final_names = [t["name"] for t in scripted.set_tools_calls[-1] or []]
+        assert "process_skill" not in final_names
+        assert "run_skill" not in final_names
+        assert "run_code" not in final_names
+        assert "process_memory" not in final_names
+        assert "get_recent_trajectory" not in final_names
