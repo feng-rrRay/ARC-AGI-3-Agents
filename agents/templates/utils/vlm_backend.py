@@ -37,6 +37,18 @@ class VLMBackend(ABC):
         """Default: ignore. Backends that support function calling override this."""
         return None
 
+    def set_system_instruction(self, text: str | None) -> None:
+        """Swap the system instruction in place.
+
+        Default impl assigns to `self.system_instruction`; backends that need
+        to rebuild a client object override. The Gemini backend re-reads
+        `system_instruction` on every call via `_config()`, so the default is
+        sufficient.
+        """
+        # Subclasses are expected to declare `system_instruction: str | None`
+        # in their __init__; this base just provides the swap semantics.
+        self.system_instruction = text
+
     def extract_usage(self, response: Any) -> dict[str, int | None] | None:
         """Return canonical token usage {prompt, output, total, thoughts, cached, tool_use}.
 
@@ -80,6 +92,9 @@ class _PlaceholderBackend(VLMBackend):
 
     def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
         self.tools = tools or []
+
+    def set_system_instruction(self, text: str | None) -> None:
+        self.system_instruction = text
 
 
 class OpenAIBackend(_PlaceholderBackend):
@@ -145,6 +160,10 @@ class GeminiBackend(VLMBackend):
         self._tools_payload = (
             [{"function_declarations": canonical}] if canonical else []
         )
+
+    def set_system_instruction(self, text: str | None) -> None:
+        """Swap the system instruction in place; picked up on the next generate call."""
+        self.system_instruction = text
 
     def _config(self) -> Any:
         # A fresh GenerateContentConfig per call — cheap; carries system + tools.
@@ -349,6 +368,9 @@ class VLM:
 
     def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
         self.backend.set_tools(tools)
+
+    def set_system_instruction(self, text: str | None) -> None:
+        self.backend.set_system_instruction(text)
 
     def extract_usage(self, response: Any) -> dict[str, int | None] | None:
         return self.backend.extract_usage(response)

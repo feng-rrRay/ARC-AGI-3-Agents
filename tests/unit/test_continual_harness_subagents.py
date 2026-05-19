@@ -199,9 +199,9 @@ class TestSubagentStoreCRUD:
     def test_edit_can_change_allowed_tools(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         entry = _add_basic(store, allowed_tools=["get_recent_trajectory"])
-        edited = store.edit(entry.id, allowed_tools=["process_memory", "run_code"])
+        edited = store.edit(entry.id, allowed_tools=["process_memory", "run_skill"])
         assert edited is not None
-        assert edited.allowed_tools == ["process_memory", "run_code"]
+        assert edited.allowed_tools == ["process_memory", "run_skill"]
 
     def test_edit_returns_none_for_unknown_id(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -246,7 +246,6 @@ class TestAllowedToolsValidation:
                 "process_memory",
                 "process_skill",
                 "run_skill",
-                "run_code",
             ],
         )
         assert set(entry.allowed_tools) == {
@@ -254,8 +253,13 @@ class TestAllowedToolsValidation:
             "process_memory",
             "process_skill",
             "run_skill",
-            "run_code",
         }
+
+    def test_rejects_run_code_now_disabled(self, tmp_path: Path) -> None:
+        # run_code is intentionally not in SUBAGENT_TOOL_ENUM right now.
+        store = _store(tmp_path)
+        with pytest.raises(ValueError, match="not in"):
+            _add_basic(store, allowed_tools=["run_code"])
 
     def test_rejects_unknown_tool_name(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -275,9 +279,9 @@ class TestAllowedToolsValidation:
     def test_deduplicates(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         entry = _add_basic(
-            store, allowed_tools=["run_code", "run_code", "process_memory"]
+            store, allowed_tools=["run_skill", "run_skill", "process_memory"]
         )
-        assert entry.allowed_tools == ["run_code", "process_memory"]
+        assert entry.allowed_tools == ["run_skill", "process_memory"]
 
     def test_edit_rejects_unknown_tool(self, tmp_path: Path) -> None:
         store = _store(tmp_path)

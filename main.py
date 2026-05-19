@@ -24,11 +24,13 @@ from agents.run_artifacts import (
     create_run_artifacts,
     export_run_env,
     snapshot_memory,
+    snapshot_prompt,
     snapshot_skills,
     snapshot_subagents,
     write_manifest,
     write_scorecard,
 )
+from agents.templates.continual_harness.prompts import HARNESS_SYSTEM_INSTRUCTION
 from agents.tracing import initialize as init_agentops
 
 logger = logging.getLogger()
@@ -48,6 +50,18 @@ HEADERS = {
     "X-API-Key": os.getenv("ARC_API_KEY", ""),
     "Accept": "application/json",
 }
+PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
+DEFAULT_PROMPT_EVOLVE_FREQUENCY = 25
+
+
+def _parse_prompt_evolve_frequency(value: str | int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer >= 0") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
 
 
 def run_agent(
@@ -56,6 +70,8 @@ def run_agent(
     bootstrap_memory: Path | None,
     bootstrap_skills: Path | None,
     bootstrap_subagents: Path | None,
+    bootstrap_prompt: Path | None,
+    prompt_evolve_frequency: int,
 ) -> None:
     scorecard = swarm.main()
     finalize_run_artifacts(
@@ -65,6 +81,8 @@ def run_agent(
         bootstrap_memory=bootstrap_memory,
         bootstrap_skills=bootstrap_skills,
         bootstrap_subagents=bootstrap_subagents,
+        bootstrap_prompt=bootstrap_prompt,
+        prompt_evolve_frequency=prompt_evolve_frequency,
         status="completed",
     )
     os.kill(os.getpid(), signal.SIGINT)
@@ -78,6 +96,8 @@ def finalize_run_artifacts(
     bootstrap_memory: Path | None,
     bootstrap_skills: Path | None,
     bootstrap_subagents: Path | None,
+    bootstrap_prompt: Path | None,
+    prompt_evolve_frequency: int,
     status: str,
 ) -> None:
     card_id = _scorecard_id(scorecard)
@@ -89,6 +109,12 @@ def finalize_run_artifacts(
     snapshot_skills(skills_source, run_artifacts.skills_final_path)
     subagents_source = bootstrap_subagents or run_artifacts.subagents_path
     snapshot_subagents(subagents_source, run_artifacts.subagents_final_path)
+    prompt_source = bootstrap_prompt or run_artifacts.prompt_path
+    snapshot_prompt(
+        prompt_source,
+        run_artifacts.prompt_final_path,
+        baseline=HARNESS_SYSTEM_INSTRUCTION,
+    )
     write_manifest(
         run_artifacts,
         agent=swarm.agent_name,
@@ -99,6 +125,8 @@ def finalize_run_artifacts(
         bootstrap_memory=bootstrap_memory,
         bootstrap_skills=bootstrap_skills,
         bootstrap_subagents=bootstrap_subagents,
+        bootstrap_prompt=bootstrap_prompt,
+        prompt_evolve_frequency=prompt_evolve_frequency,
     )
 
 
@@ -121,6 +149,8 @@ def cleanup(
     bootstrap_memory: Path | None,
     bootstrap_skills: Path | None,
     bootstrap_subagents: Path | None,
+    bootstrap_prompt: Path | None,
+    prompt_evolve_frequency: int,
     signum: Optional[int],
     frame: Optional[FrameType],
 ) -> None:
@@ -139,6 +169,8 @@ def cleanup(
             bootstrap_memory=bootstrap_memory,
             bootstrap_skills=bootstrap_skills,
             bootstrap_subagents=bootstrap_subagents,
+            bootstrap_prompt=bootstrap_prompt,
+            prompt_evolve_frequency=prompt_evolve_frequency,
             status="interrupted",
         )
 
@@ -221,8 +253,43 @@ def main() -> None:
             "backing file."
         ),
     )
+    parser.add_argument(
+        "--bootstrap-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Optional markdown file backing the ContinualHarness system "
+            "instruction. When provided, the agent loads it on start and "
+            "rewrites it on every successful prompt-evolution step (cross-run "
+            "persistence). When omitted, the prompt lives in "
+            "logs/<run-id>/prompt.current.md."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-evolve-frequency",
+        type=_parse_prompt_evolve_frequency,
+        default=None,
+        help=(
+            "How many steps between prompt-evolution meta-calls. Default 25; "
+            f"also configurable via {PROMPT_EVOLVE_FREQUENCY_ENV}; "
+            "0 disables. With MAX_ACTIONS=80 the default gives up to 3 "
+            "evolutions per run."
+        ),
+    )
 
     args = parser.parse_args()
+    if args.prompt_evolve_frequency is None:
+        try:
+            prompt_evolve_frequency = _parse_prompt_evolve_frequency(
+                os.getenv(
+                    PROMPT_EVOLVE_FREQUENCY_ENV,
+                    str(DEFAULT_PROMPT_EVOLVE_FREQUENCY),
+                )
+            )
+        except argparse.ArgumentTypeError as exc:
+            parser.error(f"{PROMPT_EVOLVE_FREQUENCY_ENV}: {exc}")
+    else:
+        prompt_evolve_frequency = args.prompt_evolve_frequency
 
     run_artifacts = create_run_artifacts(args.agent or "no-agent")
     export_run_env(run_artifacts)
@@ -260,6 +327,22 @@ def main() -> None:
     subagents_source = bootstrap_subagents or run_artifacts.subagents_path
     snapshot_subagents(subagents_source, run_artifacts.subagents_initial_path)
 
+    bootstrap_prompt_raw = args.bootstrap_prompt or os.getenv(
+        "CONTINUAL_HARNESS_BOOTSTRAP_PROMPT"
+    )
+    bootstrap_prompt = (
+        Path(bootstrap_prompt_raw).resolve() if bootstrap_prompt_raw else None
+    )
+    if bootstrap_prompt is not None:
+        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_PROMPT"] = str(bootstrap_prompt)
+    os.environ[PROMPT_EVOLVE_FREQUENCY_ENV] = str(prompt_evolve_frequency)
+    prompt_source = bootstrap_prompt or run_artifacts.prompt_path
+    snapshot_prompt(
+        prompt_source,
+        run_artifacts.prompt_initial_path,
+        baseline=HARNESS_SYSTEM_INSTRUCTION,
+    )
+
     file_handler = logging.FileHandler(run_artifacts.log_path, mode="w")
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
@@ -277,6 +360,8 @@ def main() -> None:
             bootstrap_memory=bootstrap_memory,
             bootstrap_skills=bootstrap_skills,
             bootstrap_subagents=bootstrap_subagents,
+            bootstrap_prompt=bootstrap_prompt,
+            prompt_evolve_frequency=prompt_evolve_frequency,
         )
         return
 
@@ -349,6 +434,8 @@ def main() -> None:
             bootstrap_memory=bootstrap_memory,
             bootstrap_skills=bootstrap_skills,
             bootstrap_subagents=bootstrap_subagents,
+            bootstrap_prompt=bootstrap_prompt,
+            prompt_evolve_frequency=prompt_evolve_frequency,
         )
         return
 
@@ -370,6 +457,8 @@ def main() -> None:
         bootstrap_memory=bootstrap_memory,
         bootstrap_skills=bootstrap_skills,
         bootstrap_subagents=bootstrap_subagents,
+        bootstrap_prompt=bootstrap_prompt,
+        prompt_evolve_frequency=prompt_evolve_frequency,
     )
     agent_thread = threading.Thread(
         target=partial(
@@ -379,6 +468,8 @@ def main() -> None:
             bootstrap_memory,
             bootstrap_skills,
             bootstrap_subagents,
+            bootstrap_prompt,
+            prompt_evolve_frequency,
         )
     )
     agent_thread.daemon = True  # die when the main thread dies
@@ -391,6 +482,8 @@ def main() -> None:
             bootstrap_memory,
             bootstrap_skills,
             bootstrap_subagents,
+            bootstrap_prompt,
+            prompt_evolve_frequency,
         ),
     )  # handler for Ctrl+C
     agent_thread.start()
@@ -407,6 +500,8 @@ def main() -> None:
             bootstrap_memory,
             bootstrap_skills,
             bootstrap_subagents,
+            bootstrap_prompt,
+            prompt_evolve_frequency,
             signal.SIGINT,
             None,
         )
@@ -418,6 +513,8 @@ def main() -> None:
             bootstrap_memory,
             bootstrap_skills,
             bootstrap_subagents,
+            bootstrap_prompt,
+            prompt_evolve_frequency,
             None,
             None,
         )

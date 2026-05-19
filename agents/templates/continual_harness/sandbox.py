@@ -467,7 +467,10 @@ def _install_audit_hook(*, allow_exec_events: int = 0) -> None:
             module_name = args[0] if args else ""
             if isinstance(module_name, str):
                 root = module_name.split(".", 1)[0]
-                if module_name in _BANNED_IMPORT_MODULES or root in _BANNED_IMPORT_MODULES:
+                if (
+                    module_name in _BANNED_IMPORT_MODULES
+                    or root in _BANNED_IMPORT_MODULES
+                ):
                     raise RuntimeError(
                         f"sandbox policy blocked import of {module_name!r}"
                     )

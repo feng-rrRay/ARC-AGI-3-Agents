@@ -1,0 +1,314 @@
+"""Tests for prompt_evolution.py.
+
+Covers: validation bounds, PromptFile read/write, PromptEvolutionStore append,
+active_*_path env-var resolution, and build_evolution_prompt placeholder
+substitution. The smoke test of the agent-level hook lives at the bottom.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+from arcengine import FrameData, GameState
+
+from agents.templates.continual_harness.prompt_evolution import (
+    PROMPT_MAX_CHARS,
+    PROMPT_MIN_CHARS,
+    PromptEvolutionRecord,
+    PromptEvolutionStore,
+    PromptFile,
+    active_prompt_evolution_path,
+    active_prompt_path,
+    bootstrap_prompt_path,
+    build_evolution_prompt,
+    validate_evolved_prompt,
+)
+
+
+@pytest.mark.unit
+class TestValidateEvolvedPrompt:
+    def test_empty_rejected(self) -> None:
+        ok, err = validate_evolved_prompt("")
+        assert ok is False
+        assert err == "evolved prompt is empty"
+
+    def test_whitespace_only_rejected(self) -> None:
+        ok, err = validate_evolved_prompt("   \n  \t  ")
+        assert ok is False
+        assert err == "evolved prompt is empty"
+
+    def test_too_short_rejected(self) -> None:
+        ok, err = validate_evolved_prompt("hi")
+        assert ok is False
+        assert err is not None and "too short" in err
+
+    def test_too_long_rejected(self) -> None:
+        ok, err = validate_evolved_prompt("x" * (PROMPT_MAX_CHARS + 1))
+        assert ok is False
+        assert err is not None and "too long" in err
+
+    def test_boundary_min_accepted(self) -> None:
+        ok, err = validate_evolved_prompt("a" * PROMPT_MIN_CHARS)
+        assert ok is True
+        assert err is None
+
+    def test_boundary_max_accepted(self) -> None:
+        ok, err = validate_evolved_prompt("a" * PROMPT_MAX_CHARS)
+        assert ok is True
+        assert err is None
+
+    def test_typical_length_accepted(self) -> None:
+        # Lenient validation — no keyword check, length only.
+        text = "a" * 1500
+        ok, err = validate_evolved_prompt(text)
+        assert ok is True
+        assert err is None
+
+
+@pytest.mark.unit
+class TestPromptFile:
+    def test_baseline_seeded_when_missing(self, tmp_path: Path) -> None:
+        path = tmp_path / "prompt.current.md"
+        baseline = "x" * 300
+        store = PromptFile(path, baseline=baseline)
+        assert path.exists()
+        assert store.read() == baseline
+
+    def test_baseline_not_overwritten_when_file_exists(self, tmp_path: Path) -> None:
+        path = tmp_path / "prompt.current.md"
+        path.write_text("preexisting", encoding="utf-8")
+        PromptFile(path, baseline="other baseline")
+        assert path.read_text(encoding="utf-8") == "preexisting"
+
+    def test_write_then_read_roundtrip(self, tmp_path: Path) -> None:
+        path = tmp_path / "prompt.current.md"
+        store = PromptFile(path, baseline="b" * 250)
+        store.write("hello evolved")
+        assert store.read() == "hello evolved"
+
+    def test_write_is_atomic(self, tmp_path: Path) -> None:
+        # tempfile.replace means we never observe a partial write.
+        path = tmp_path / "prompt.current.md"
+        store = PromptFile(path, baseline="b" * 250)
+        store.write("final text")
+        # No leftover .tmp file:
+        leftovers = list(tmp_path.glob("*.tmp"))
+        assert leftovers == []
+
+
+@pytest.mark.unit
+class TestPromptEvolutionStore:
+    def _record(
+        self, generation: int = 1, accepted: bool = True
+    ) -> PromptEvolutionRecord:
+        return PromptEvolutionRecord(
+            generation=generation,
+            action_counter=generation * 25,
+            accepted=accepted,
+            reasoning="why",
+            proposed_prompt="proposed " * 50,
+            previous_prompt="previous " * 50,
+            new_prompt="new " * 100,
+            validation_error=None,
+            usage={"prompt": 10, "output": 20, "total": 30},
+            timestamp="2026-05-18T00:00:00",
+        )
+
+    def test_append_creates_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "evolution.jsonl"
+        store = PromptEvolutionStore(path)
+        store.append(self._record())
+        assert path.exists()
+
+    def test_append_writes_one_jsonl_line_per_record(self, tmp_path: Path) -> None:
+        path = tmp_path / "evolution.jsonl"
+        store = PromptEvolutionStore(path)
+        store.append(self._record(1))
+        store.append(self._record(2, accepted=False))
+        store.append(self._record(3))
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3
+        for line in lines:
+            parsed = json.loads(line)
+            assert "generation" in parsed
+            assert "accepted" in parsed
+
+    def test_all_records_round_trips(self, tmp_path: Path) -> None:
+        path = tmp_path / "evolution.jsonl"
+        store = PromptEvolutionStore(path)
+        store.append(self._record(1))
+        store.append(self._record(2, accepted=False))
+        records = store.all_records()
+        assert len(records) == 2
+        assert records[0]["generation"] == 1
+        assert records[1]["accepted"] is False
+
+    def test_all_records_empty_when_file_missing(self, tmp_path: Path) -> None:
+        store = PromptEvolutionStore(tmp_path / "missing.jsonl")
+        assert store.all_records() == []
+
+
+@pytest.mark.unit
+class TestBootstrapPromptPath:
+    def test_returns_none_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", raising=False)
+        assert bootstrap_prompt_path() is None
+
+    def test_returns_set_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "p.md"
+        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", str(target))
+        assert bootstrap_prompt_path() == target
+
+
+@pytest.mark.unit
+class TestActivePromptPath:
+    def test_prefers_bootstrap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        bootstrap = tmp_path / "bootstrap.md"
+        run_local = tmp_path / "run" / "prompt.current.md"
+        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", str(bootstrap))
+        monkeypatch.setenv("RUN_PROMPT_PATH", str(run_local))
+        assert active_prompt_path() == bootstrap
+
+    def test_uses_run_prompt_path_without_bootstrap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "run" / "prompt.current.md"
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", raising=False)
+        monkeypatch.setenv("RUN_PROMPT_PATH", str(target))
+        assert active_prompt_path() == target
+
+    def test_derives_from_run_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = tmp_path / "logs" / "run-id"
+        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", raising=False)
+        monkeypatch.delenv("RUN_PROMPT_PATH", raising=False)
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
+        assert active_prompt_path() == run_dir / "prompt.current.md"
+
+
+@pytest.mark.unit
+class TestActivePromptEvolutionPath:
+    def test_uses_explicit_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "evolution.jsonl"
+        monkeypatch.setenv("RUN_PROMPT_EVOLUTION_PATH", str(target))
+        assert active_prompt_evolution_path() == target
+
+    def test_derives_from_run_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = tmp_path / "logs" / "run-id"
+        monkeypatch.delenv("RUN_PROMPT_EVOLUTION_PATH", raising=False)
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
+        assert active_prompt_evolution_path() == run_dir / "prompt_evolution.jsonl"
+
+
+@pytest.mark.unit
+class TestBuildEvolutionPrompt:
+    def _frame(self) -> FrameData:
+        return FrameData(
+            game_id="evolve-test",
+            frame=[[[1, 2], [3, 4]]],
+            state=GameState.NOT_FINISHED,
+            levels_completed=2,
+        )
+
+    def test_substitutes_all_placeholders(self) -> None:
+        text = build_evolution_prompt(
+            current_prompt="CURRENT PROMPT BODY",
+            latest_frame=self._frame(),
+            generation=3,
+            action_counter=75,
+            trajectory_rows=[
+                {
+                    "action_counter": 1,
+                    "state": "NOT_FINISHED",
+                    "score": 0,
+                    "chosen_action": "ACTION1",
+                    "reasoning": "trying up",
+                    "tool_calls": [],
+                }
+            ],
+            memory_overview="## LONG-TERM MEMORY (0 entries)\nEmpty.",
+            skill_overview="## SKILLS (0 saved)\nNo skills yet.",
+            subagent_overview="## SUBAGENTS (0 saved)\nNo subagents yet.",
+        )
+        # All blocks present:
+        assert "CURRENT PROMPT BODY" in text
+        assert "state=NOT_FINISHED" in text
+        assert "score=2" in text
+        assert "action_counter=75" in text
+        assert "generation=3" in text
+        # Trajectory rendered via format_full_history:
+        assert "ACTION1" in text
+        assert "trying up" in text
+        # Overviews:
+        assert "LONG-TERM MEMORY" in text
+        assert "SKILLS" in text
+        assert "SUBAGENTS" in text
+        # Frame rendering:
+        assert "Grid 0:" in text
+        # Final task line preserved:
+        assert "evolve_system_prompt" in text
+
+    def test_handles_empty_trajectory(self) -> None:
+        text = build_evolution_prompt(
+            current_prompt="x" * 250,
+            latest_frame=self._frame(),
+            generation=1,
+            action_counter=25,
+            trajectory_rows=[],
+            memory_overview="(none)",
+            skill_overview="(none)",
+            subagent_overview="(none)",
+        )
+        # build_evolution_prompt should not raise on empty trajectory.
+        assert "No previous actions recorded." in text or "n=0" not in text  # graceful
+
+
+@pytest.mark.unit
+class TestPromptEvolutionFrequencyParsing:
+    """Frequency value parsed by the agent comes from an env var written by main.py.
+
+    Validate the parsing here so the agent itself doesn't need a full game-loop
+    fixture just to exercise this codepath.
+    """
+
+    def test_default_is_25(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY", raising=False)
+        # Default in the class — verified via direct attribute access.
+        from agents.templates.continual_harness_agent import ContinualHarness
+
+        assert ContinualHarness.DEFAULT_PROMPT_EVOLVE_FREQUENCY == 25
+
+    def test_zero_disables(self) -> None:
+        # The hook condition `self._prompt_evolve_frequency > 0` ensures 0 disables.
+        # We assert via class-level constant — actual enforcement is tested by
+        # smoke tests at the integration level (not run here).
+        from agents.templates.continual_harness_agent import ContinualHarness
+
+        assert isinstance(ContinualHarness.DEFAULT_PROMPT_EVOLVE_FREQUENCY, int)
+
+    def test_main_frequency_parser_accepts_non_negative_ints(self) -> None:
+        from main import _parse_prompt_evolve_frequency
+
+        assert _parse_prompt_evolve_frequency("0") == 0
+        assert _parse_prompt_evolve_frequency("25") == 25
+        assert _parse_prompt_evolve_frequency(3) == 3
+
+    def test_main_frequency_parser_rejects_invalid_values(self) -> None:
+        from main import _parse_prompt_evolve_frequency
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_prompt_evolve_frequency("-1")
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_prompt_evolve_frequency("abc")

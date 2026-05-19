@@ -16,7 +16,7 @@ from agents.templates.continual_harness.helpers import (
     build_action_tools,
     parse_action_response,
 )
-from agents.templates.continual_harness.prompts import SYSTEM_INSTRUCTION
+from agents.templates.continual_harness.prompts import HARNESS_SYSTEM_INSTRUCTION
 from agents.templates.continual_harness.trace import (
     TraceWriter,
     default_trace_path,
@@ -128,10 +128,12 @@ class TestContinualHarnessParsing:
 @pytest.mark.unit
 class TestContinualHarnessPrompts:
     def test_system_prompt_holds_context_block(self) -> None:
-        # CONTEXT moved out of the per-turn user prompt and into SYSTEM_INSTRUCTION.
-        assert "# CONTEXT:" in SYSTEM_INSTRUCTION
-        assert "WIN and avoid GAME_OVER" in SYSTEM_INSTRUCTION
-        assert "INT<0,63>" in SYSTEM_INSTRUCTION
+        # CONTEXT moved out of the per-turn user prompt and into the system
+        # instruction; the harness flavour preserves the original WIN/INT<0,63>
+        # framing while adding tool-model + strategy sections.
+        assert "# CONTEXT" in HARNESS_SYSTEM_INSTRUCTION
+        assert "WIN and avoid GAME_OVER" in HARNESS_SYSTEM_INSTRUCTION
+        assert "INT<0,63>" in HARNESS_SYSTEM_INSTRUCTION
 
     def test_user_prompt_matches_llm_shape_and_includes_digit_frame(self) -> None:
         frame = FrameData(

@@ -5,7 +5,7 @@ from typing import Any
 
 from arcengine import FrameData
 
-from .prompts import USER_PROMPT
+from .prompts import HARNESS_USER_PROMPT
 
 
 def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
@@ -20,7 +20,7 @@ def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
 
 
 def build_action_prompt(latest_frame: FrameData, extra_context: str = "") -> str:
-    prompt = USER_PROMPT.format(
+    prompt = HARNESS_USER_PROMPT.format(
         state=latest_frame.state.name,
         score=latest_frame.levels_completed,
         latest_frame=pretty_print_3d(latest_frame.frame),

@@ -193,9 +193,7 @@ class SkillStore:
         with self._lock:
             state = self._load()
             before = len(state["entries"])
-            state["entries"] = [
-                e for e in state["entries"] if e.get("id") != skill_id
-            ]
+            state["entries"] = [e for e in state["entries"] if e.get("id") != skill_id]
             if len(state["entries"]) == before:
                 return False
             self._save(state)
@@ -211,9 +209,7 @@ class SkillStore:
         tags: list[str] | None = None,
     ) -> SkillEntry | None:
         if all(v is None for v in (name, description, code, tags)):
-            raise ValueError(
-                "edit requires at least one of name/description/code/tags"
-            )
+            raise ValueError("edit requires at least one of name/description/code/tags")
         if name is not None:
             stripped = name.strip()
             if not _VALID_NAME.match(stripped):
@@ -285,13 +281,15 @@ def format_skill_overview(entries: list[SkillEntry]) -> str:
         return (
             "## SKILLS (0 saved)\n"
             'No skills saved yet. Use process_skill(operation="add", name=..., '
-            "description=..., code=...) to save reusable analysis snippets. "
-            "Call run_skill(id) to execute one, or run_code(code) for an ad-hoc snippet."
+            "description=..., code=...) to save reusable analysis snippets, "
+            "then run_skill(id) to execute one."
         )
     rows = [f"## SKILLS ({len(entries)} saved)"]
     for e in entries:
         tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
-        first_line = (e.description or "").splitlines()[0][:120] if e.description else ""
+        first_line = (
+            (e.description or "").splitlines()[0][:120] if e.description else ""
+        )
         sep = " — " if first_line else ""
         rows.append(f"[{e.id}] {e.name}{tag_str}{sep}{first_line}")
     return "\n".join(rows)

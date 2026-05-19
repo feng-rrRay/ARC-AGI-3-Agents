@@ -17,6 +17,8 @@ RUN_ARTIFACTS_DIR_ENV = "RUN_ARTIFACTS_DIR"
 RUN_MEMORY_PATH_ENV = "RUN_MEMORY_PATH"
 RUN_SKILLS_PATH_ENV = "RUN_SKILLS_PATH"
 RUN_SUBAGENTS_PATH_ENV = "RUN_SUBAGENTS_PATH"
+RUN_PROMPT_PATH_ENV = "RUN_PROMPT_PATH"
+RUN_PROMPT_EVOLUTION_PATH_ENV = "RUN_PROMPT_EVOLUTION_PATH"
 
 EMPTY_MEMORY_STATE: dict[str, Any] = {"next_id": 1, "entries": []}
 EMPTY_SKILLS_STATE: dict[str, Any] = {"next_id": 1, "entries": []}
@@ -73,6 +75,22 @@ class RunArtifacts:
     def subagents_path(self) -> Path:
         return self.run_dir / "subagents.json"
 
+    @property
+    def prompt_initial_path(self) -> Path:
+        return self.run_dir / "prompt.initial.md"
+
+    @property
+    def prompt_final_path(self) -> Path:
+        return self.run_dir / "prompt.final.md"
+
+    @property
+    def prompt_path(self) -> Path:
+        return self.run_dir / "prompt.current.md"
+
+    @property
+    def prompt_evolution_path(self) -> Path:
+        return self.run_dir / "prompt_evolution.jsonl"
+
 
 def safe_slug(value: str) -> str:
     """Return a filesystem-friendly slug while preserving useful dots."""
@@ -116,6 +134,8 @@ def export_run_env(artifacts: RunArtifacts) -> None:
     os.environ[RUN_MEMORY_PATH_ENV] = str(artifacts.memory_path)
     os.environ[RUN_SKILLS_PATH_ENV] = str(artifacts.skills_path)
     os.environ[RUN_SUBAGENTS_PATH_ENV] = str(artifacts.subagents_path)
+    os.environ[RUN_PROMPT_PATH_ENV] = str(artifacts.prompt_path)
+    os.environ[RUN_PROMPT_EVOLUTION_PATH_ENV] = str(artifacts.prompt_evolution_path)
 
 
 def write_manifest(
@@ -129,6 +149,8 @@ def write_manifest(
     bootstrap_memory: str | Path | None = None,
     bootstrap_skills: str | Path | None = None,
     bootstrap_subagents: str | Path | None = None,
+    bootstrap_prompt: str | Path | None = None,
+    prompt_evolve_frequency: int | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Path:
     """Write the current run manifest atomically."""
@@ -144,6 +166,8 @@ def write_manifest(
         "bootstrap_subagents": (
             str(bootstrap_subagents) if bootstrap_subagents else None
         ),
+        "bootstrap_prompt": str(bootstrap_prompt) if bootstrap_prompt else None,
+        "prompt_evolve_frequency": prompt_evolve_frequency,
         "paths": {
             "run_dir": str(artifacts.run_dir),
             "log": str(artifacts.log_path),
@@ -158,6 +182,10 @@ def write_manifest(
             "subagents": str(bootstrap_subagents or artifacts.subagents_path),
             "subagents_initial": str(artifacts.subagents_initial_path),
             "subagents_final": str(artifacts.subagents_final_path),
+            "prompt": str(bootstrap_prompt or artifacts.prompt_path),
+            "prompt_initial": str(artifacts.prompt_initial_path),
+            "prompt_final": str(artifacts.prompt_final_path),
+            "prompt_evolution": str(artifacts.prompt_evolution_path),
         },
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -201,6 +229,21 @@ def snapshot_skills(source: str | Path, destination: Path) -> Path:
 def snapshot_subagents(source: str | Path, destination: Path) -> Path:
     """Thin wrapper around snapshot_json_file with the subagents empty state."""
     return snapshot_json_file(source, destination, empty_state=EMPTY_SUBAGENTS_STATE)
+
+
+def snapshot_prompt(source: str | Path, destination: Path, *, baseline: str) -> Path:
+    """Copy the source prompt markdown to a run snapshot, or write `baseline`.
+
+    Mirrors snapshot_memory/skills/subagents but for plain markdown — the
+    prompt file is not JSON.
+    """
+    source_path = Path(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.exists():
+        shutil.copyfile(source_path, destination)
+        return destination
+    destination.write_text(baseline, encoding="utf-8")
+    return destination
 
 
 def write_json_atomic(path: Path, payload: Any) -> Path:

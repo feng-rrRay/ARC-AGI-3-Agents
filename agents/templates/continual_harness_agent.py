@@ -21,7 +21,20 @@ from .continual_harness.memory import (
     format_memory_overview,
 )
 from .continual_harness.models import StepRecord, ToolCallRecord
-from .continual_harness.prompts import SYSTEM_INSTRUCTION
+from .continual_harness.prompt_evolution import (
+    PromptEvolutionRecord,
+    PromptEvolutionStore,
+    PromptFile,
+    active_prompt_evolution_path,
+    active_prompt_path,
+    build_evolution_prompt,
+    now_iso,
+    validate_evolved_prompt,
+)
+from .continual_harness.prompts import (
+    EVOLUTION_SYSTEM_INSTRUCTION,
+    HARNESS_SYSTEM_INSTRUCTION,
+)
 from .continual_harness.sandbox import SandboxState, run_python_snippet
 from .continual_harness.skills import (
     SkillStore,
@@ -34,10 +47,10 @@ from .continual_harness.subagents import (
     format_subagent_overview,
 )
 from .continual_harness.tools import (
+    EVOLVE_SYSTEM_PROMPT_TOOL,
     PROCESS_MEMORY_TOOL,
     PROCESS_SKILL_TOOL,
     PROCESS_SUBAGENT_TOOL,
-    RUN_CODE_TOOL,
     RUN_SKILL_TOOL,
     RUN_SUBAGENT_TOOL,
     ContinualToolRouter,
@@ -45,6 +58,7 @@ from .continual_harness.tools import (
     build_subagent_tools,
     extract_function_calls,
     is_action_tool,
+    is_evolve_prompt_call,
     is_subagent_return_call,
     render_tool_results,
 )
@@ -106,16 +120,43 @@ class ContinualHarness(Agent):
     MAX_SUBAGENT_CALLS_PER_STEP = 1  # distinct run_subagent invocations per outer step
     MAX_SUBAGENT_ROUNDS_PER_CALL = 20  # inner VLM rounds per invocation
     SUBAGENT_HISTORY_WINDOW = 10  # rows of compact history fed into a subagent's prompt
+    # Prompt-evolution defaults; the actual frequency is read from
+    # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
+    # --prompt-evolve-frequency). 0 disables; positive N means every N steps.
+    DEFAULT_PROMPT_EVOLVE_FREQUENCY = 25
+    PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
+    EVOLUTION_TRAJECTORY_WINDOW = 25  # how many recent steps the meta-call sees
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Must resolve model_name BEFORE super().__init__(): Agent.__init__
         # calls start_recording() which reads self.name → self.model_name.
         self.model_name = os.getenv("GEMINI_MODEL", self.MODEL)
         super().__init__(*args, **kwargs)
+
+        # Prompt-evolution wiring: the active system instruction lives in a
+        # single .md file (run-local by default; --bootstrap-prompt opts into
+        # cross-run persistence). On first use the baseline is seeded into the
+        # file; every successful evolution rewrites it.
+        freq_raw = os.getenv(
+            self.PROMPT_EVOLVE_FREQUENCY_ENV,
+            str(self.DEFAULT_PROMPT_EVOLVE_FREQUENCY),
+        )
+        try:
+            self._prompt_evolve_frequency = max(0, int(freq_raw))
+        except ValueError:
+            self._prompt_evolve_frequency = self.DEFAULT_PROMPT_EVOLVE_FREQUENCY
+        self._prompt_file = PromptFile(
+            active_prompt_path(), baseline=HARNESS_SYSTEM_INSTRUCTION
+        )
+        self._current_system_instruction: str = self._prompt_file.read()
+        self._prompt_generation: int = 0
+        self._last_evolution_step: int = -1
+        self.prompt_evolution = PromptEvolutionStore(active_prompt_evolution_path())
+
         self.vlm = VLM(
             self.model_name,
             backend="gemini",
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=self._current_system_instruction,
         )
         recorder = getattr(self, "recorder", None)
         guid = getattr(recorder, "guid", None)
@@ -225,7 +266,7 @@ class ContinualHarness(Agent):
         self.skills = SkillStore(active_skill_path(), game_id=self.game_id)
 
         # _current_sandbox_state is set at the top of each choose_action() so all
-        # handlers (process_skill/run_skill/run_code) within that step share one
+        # handlers (process_skill/run_skill) within that step share one
         # consistent JSON-only view of the world.
         self._current_sandbox_state: SandboxState | None = None
 
@@ -331,14 +372,13 @@ class ContinualHarness(Agent):
             out["version"] = skill.version
             return out
 
-        def _handle_run_code(args: dict[str, Any]) -> dict[str, Any]:
-            code = args.get("code") or ""
-            state = self._current_sandbox_state or SandboxState()
-            return run_python_snippet(
-                code,
-                state=state,
-                args=dict(args.get("args") or {}),
-            )
+        # NOTE: run_code is intentionally NOT registered as a handler. It was
+        # disabled after observation that the model wasted analysis rounds on
+        # sandbox-policy violations (import statements) and wrong-schema
+        # accesses on state.latest_frame. To re-enable, restore the closure,
+        # add `"run_code": _handle_run_code` to `handlers`, add `RUN_CODE_TOOL`
+        # back to `analysis_tools`, and put `"run_code"` back into
+        # `SUBAGENT_TOOL_ENUM` in tools.py.
 
         # Subagents are always available too. --bootstrap-subagents selects a
         # cross-run backing file; otherwise active_subagent_path() falls back
@@ -675,7 +715,6 @@ class ContinualHarness(Agent):
             "process_memory": _handle_process_memory,
             "process_skill": _handle_process_skill,
             "run_skill": _handle_run_skill,
-            "run_code": _handle_run_code,
             "process_subagent": _handle_process_subagent,
             "run_subagent": _handle_run_subagent,
         }
@@ -699,6 +738,13 @@ class ContinualHarness(Agent):
             self.subagents.path,
             len(self.subagents.all_entries()),
         )
+        logger.info(
+            "[%s] Prompt evolution: frequency=%d, baseline at %s, log at %s",
+            self.name,
+            self._prompt_evolve_frequency,
+            self._prompt_file.path,
+            self.prompt_evolution.path,
+        )
 
         # Cumulative token usage; logged once on cleanup().
         self.total_calls = 0
@@ -714,6 +760,142 @@ class ContinualHarness(Agent):
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return latest_frame.state is GameState.WIN
 
+    def _evolve_system_prompt(self, latest_frame: FrameData) -> None:
+        """One meta-VLM call that may rewrite the agent's system instruction.
+
+        Spawns a fresh VLM with EVOLUTION_SYSTEM_INSTRUCTION + a single tool
+        (evolve_system_prompt). Single round, no retry. The proposal is
+        accepted only if `validate_evolved_prompt` returns ok=True; on accept,
+        the new text is written through `self._prompt_file` and `self.vlm`
+        picks it up on the next get_query call. Every attempt (accepted or
+        rejected) is appended to `self.prompt_evolution`.
+        """
+        self._prompt_generation += 1
+        gen = self._prompt_generation
+        previous = self._current_system_instruction
+
+        trajectory_rows = self.trajectory.tail(self.EVOLUTION_TRAJECTORY_WINDOW)
+        user_prompt = build_evolution_prompt(
+            current_prompt=previous,
+            latest_frame=latest_frame,
+            generation=gen,
+            action_counter=self.action_counter,
+            trajectory_rows=trajectory_rows,
+            memory_overview=format_memory_overview(self.memory.all_entries()),
+            skill_overview=format_skill_overview(self.skills.all_entries()),
+            subagent_overview=format_subagent_overview(self.subagents.all_entries()),
+        )
+
+        meta_vlm = VLM(
+            self.model_name,
+            backend="gemini",
+            system_instruction=EVOLUTION_SYSTEM_INSTRUCTION,
+        )
+        meta_vlm.set_tools([EVOLVE_SYSTEM_PROMPT_TOOL])
+
+        # This hook runs before choose_action refreshes `_current_images`, so
+        # render from latest_frame directly to avoid using a stale previous-step
+        # image payload.
+        images = list(frame_to_images(latest_frame))
+        payload: Any = images if len(images) > 1 else (images[0] if images else None)
+
+        proposed = ""
+        reasoning = ""
+        accepted = False
+        validation_error: str | None = None
+        usage: dict[str, int | None] | None = None
+        output: dict[str, Any] = {}
+        error: str | None = None
+
+        try:
+            response = meta_vlm.get_query(
+                payload,
+                user_prompt,
+                module_name=f"{self.name}.evolve.{gen}",
+            )
+            output = serialize_response(response)
+            usage = meta_vlm.extract_usage(response)
+            fcs = extract_function_calls(response)
+            call = next((fc for fc in fcs if is_evolve_prompt_call(fc.name)), None)
+            if call is None:
+                validation_error = "model did not call evolve_system_prompt"
+            else:
+                reasoning = str(call.args.get("reasoning") or "")
+                proposed = str(call.args.get("new_prompt") or "")
+                ok, err = validate_evolved_prompt(proposed)
+                accepted = ok
+                validation_error = err
+                if accepted:
+                    self._current_system_instruction = proposed
+                    self.vlm.set_system_instruction(proposed)
+                    self._prompt_file.write(proposed)
+        except Exception as exc:
+            error = repr(exc)
+            logger.warning("Prompt evolution gen=%d failed: %s", gen, exc)
+        finally:
+            if usage is not None:
+                self.total_calls += 1
+                self.total_prompt_tokens += int(usage.get("prompt") or 0)
+                self.total_output_tokens += int(usage.get("output") or 0)
+                self.total_tokens += int(usage.get("total") or 0)
+
+            record = PromptEvolutionRecord(
+                generation=gen,
+                action_counter=self.action_counter,
+                accepted=accepted,
+                reasoning=reasoning,
+                proposed_prompt=proposed,
+                previous_prompt=previous,
+                new_prompt=self._current_system_instruction,
+                validation_error=validation_error or error,
+                usage=usage,
+                timestamp=now_iso(),
+            )
+            self.prompt_evolution.append(record)
+
+            self.trace.write(
+                {
+                    "agent": self.name,
+                    "model": self.model_name,
+                    "game_id": self.game_id,
+                    "action_counter": self.action_counter,
+                    "round": 0,
+                    "tools_exposed": "evolution",
+                    "evolution": {
+                        "generation": gen,
+                        "accepted": accepted,
+                        "validation_error": validation_error,
+                        "previous_len": len(previous),
+                        "new_len": len(self._current_system_instruction),
+                    },
+                    "input": {
+                        "system_instruction": EVOLUTION_SYSTEM_INSTRUCTION,
+                        "user_prompt": user_prompt,
+                        "tools": [EVOLVE_SYSTEM_PROMPT_TOOL],
+                        "images": [
+                            {"width": img.width, "height": img.height, "mode": img.mode}
+                            for img in images
+                        ],
+                    },
+                    "output": output,
+                    "usage": usage,
+                    "chosen_action": None,
+                    "reasoning": reasoning,
+                    "tool_calls": [],
+                    "error": error,
+                }
+            )
+
+            logger.info(
+                "[%s] Prompt evolution gen=%d accepted=%s len=%d (prev=%d) error=%s",
+                self.name,
+                gen,
+                accepted,
+                len(self._current_system_instruction),
+                len(previous),
+                validation_error or error,
+            )
+
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
@@ -721,11 +903,24 @@ class ContinualHarness(Agent):
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
             return GameAction.RESET
 
+        # Prompt-evolution hook: fires BEFORE the normal round loop so any new
+        # system instruction is in effect for this step's VLM calls. Guarded
+        # against re-firing at the same action_counter and against frequency=0.
+        if (
+            self._prompt_evolve_frequency > 0
+            and self.action_counter > 0
+            and self.action_counter % self._prompt_evolve_frequency == 0
+            and self._last_evolution_step != self.action_counter
+        ):
+            self._last_evolution_step = self.action_counter
+            self._evolve_system_prompt(latest_frame)
+
         available = available_game_actions(latest_frame.available_actions)
         action_tools = build_action_tools(available)
         analysis_tools = list(build_analysis_tools())
         analysis_tools.append(PROCESS_MEMORY_TOOL)
-        analysis_tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL, RUN_CODE_TOOL])
+        # run_code intentionally removed — see _handle_run_code note in __init__.
+        analysis_tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL])
         analysis_tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])
         full_tools = action_tools + analysis_tools
         self.vlm.set_tools(full_tools)
@@ -863,7 +1058,7 @@ class ContinualHarness(Agent):
                             "action_only" if current_tools is action_tools else "full"
                         ),
                         "input": {
-                            "system_instruction": SYSTEM_INSTRUCTION,
+                            "system_instruction": self._current_system_instruction,
                             "user_prompt": working_prompt,
                             "tools": current_tools,
                             "images": [

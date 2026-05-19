@@ -13,7 +13,7 @@ from .continual_harness.helpers import (
     frame_to_images,
     parse_action_response,
 )
-from .continual_harness.prompts import SYSTEM_INSTRUCTION, USER_PROMPT
+from .continual_harness.prompts import NAIVE_SYSTEM_INSTRUCTION, NAIVE_USER_PROMPT
 from .continual_harness.trace import (
     TraceWriter,
     default_trace_path,
@@ -37,7 +37,7 @@ def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
 
 def build_action_prompt(latest_frame: FrameData) -> str:
     return str(
-        USER_PROMPT.format(
+        NAIVE_USER_PROMPT.format(
             state=latest_frame.state.name,
             score=latest_frame.levels_completed,
             latest_frame=pretty_print_3d(latest_frame.frame),
@@ -68,7 +68,7 @@ class VLMSimple(Agent):
         self.vlm = VLM(
             self.model_name,
             backend="gemini",
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=NAIVE_SYSTEM_INSTRUCTION,
         )
         recorder = getattr(self, "recorder", None)
         guid = getattr(recorder, "guid", None)
@@ -103,7 +103,7 @@ class VLMSimple(Agent):
         payload: Any = images if len(images) > 1 else images[0]
 
         trace_input = {
-            "system_instruction": SYSTEM_INSTRUCTION,
+            "system_instruction": NAIVE_SYSTEM_INSTRUCTION,
             "user_prompt": prompt,
             "tools": tools,
             "images": [

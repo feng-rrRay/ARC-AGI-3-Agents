@@ -217,6 +217,11 @@ def _make_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ContinualHar
     monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "run.log"))
     monkeypatch.setenv("RUN_MEMORY_PATH", str(tmp_path / "memory.json"))
     monkeypatch.setenv("RUN_SKILLS_PATH", str(tmp_path / "skills.json"))
+    monkeypatch.setenv("RUN_SUBAGENTS_PATH", str(tmp_path / "subagents.json"))
+    monkeypatch.setenv("RUN_PROMPT_PATH", str(tmp_path / "prompt.current.md"))
+    monkeypatch.setenv(
+        "RUN_PROMPT_EVOLUTION_PATH", str(tmp_path / "prompt_evolution.jsonl")
+    )
     # Bootstrap env vars are intentionally NOT deleted here so tests can opt in
     # by setting them before calling _make_agent. monkeypatch isolates env per
     # test, so leakage across tests is impossible.
@@ -761,9 +766,11 @@ class TestMemoryOn:
 
 @pytest.mark.unit
 class TestSkillsAlwaysOn:
-    def test_three_tools_always_present_in_set_tools(
+    def test_skill_tools_present_and_run_code_disabled(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # run_code is intentionally disabled — it must not appear in the
+        # orchestrator's tool set even though RUN_CODE_TOOL still exists.
         agent = _make_agent(tmp_path, monkeypatch)
         scripted = _ScriptedVLM([_response(_fc_part("ACTION1", {"reasoning": "go"}))])
         agent.vlm = scripted  # type: ignore[assignment]
@@ -773,7 +780,7 @@ class TestSkillsAlwaysOn:
         tool_names = [t["name"] for t in scripted.set_tools_calls[0] or []]
         assert "process_skill" in tool_names
         assert "run_skill" in tool_names
-        assert "run_code" in tool_names
+        assert "run_code" not in tool_names
 
     def test_skills_overview_in_first_prompt(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -909,9 +916,11 @@ class TestSkillsHandlers:
         # The tool-result block above # TURN: carries the sandbox result.
         assert '"result": 14' in round2_prompt
 
-    def test_run_code_one_off_snippet_returns_result(
+    def test_run_code_is_rejected_as_unknown_tool(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # run_code is currently disabled — even if the model hallucinates the
+        # name, the router must surface "unknown tool" rather than executing.
         agent = _make_agent(tmp_path, monkeypatch)
         scripted = _ScriptedVLM(
             [
@@ -932,7 +941,7 @@ class TestSkillsHandlers:
         agent.choose_action([_make_frame([1])], _make_frame([1]))
 
         round2_prompt = scripted.calls[1][1]
-        assert '"result": 45' in round2_prompt
+        assert "unknown tool: run_code" in round2_prompt
 
     def test_run_skill_unknown_id_returns_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -961,13 +970,14 @@ class TestSkillsHandlers:
     ) -> None:
         agent = _make_agent(tmp_path, monkeypatch)
         monkeypatch.setattr(agent, "MAX_ANALYSIS_CALLS_PER_STEP", 2)
-        # Round 1: 3 parallel run_code calls (budget 2 → 2 succeed, 1 refused).
+        # Round 1: 3 parallel get_recent_trajectory calls (budget 2 → 2 are
+        # executed, the 3rd is refused with "budget exhausted").
         scripted = _ScriptedVLM(
             [
                 _response(
-                    _fc_part("run_code", {"reasoning": "a", "code": "result = 1"}),
-                    _fc_part("run_code", {"reasoning": "b", "code": "result = 2"}),
-                    _fc_part("run_code", {"reasoning": "c", "code": "result = 3"}),
+                    _fc_part("get_recent_trajectory", {"reasoning": "a"}),
+                    _fc_part("get_recent_trajectory", {"reasoning": "b"}),
+                    _fc_part("get_recent_trajectory", {"reasoning": "c"}),
                 ),
                 _response(_fc_part("ACTION1", {"reasoning": "commit"})),
             ]

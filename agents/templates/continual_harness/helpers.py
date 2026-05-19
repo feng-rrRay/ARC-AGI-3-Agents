@@ -8,7 +8,7 @@ from typing import Any, Mapping, Sequence, TypeAlias
 from arcengine import FrameData, GameAction
 from PIL import Image
 
-from .prompts import ACTION_DESCRIPTIONS
+from .action_descriptions import ACTION_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
 

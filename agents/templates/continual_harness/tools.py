@@ -219,13 +219,14 @@ RUN_CODE_TOOL: dict[str, Any] = {
 # --- Subagent tool surface ---------------------------------------------------
 # The single source of truth for what a subagent's inner loop may call.
 # process_subagent and run_subagent are intentionally excluded: no recursion.
+# run_code is intentionally excluded for now (see continual_harness_agent.py
+# for the rationale: too many wasted rounds on schema/import failures).
 SUBAGENT_TOOL_ENUM: frozenset[str] = frozenset(
     {
         "get_recent_trajectory",
         "process_memory",
         "process_skill",
         "run_skill",
-        "run_code",
     }
 )
 
@@ -243,8 +244,8 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
         "allowed_tools, tags?), edit (id + any of name/description/"
         "instructions/allowed_tools/tags), delete (id), search (substring over "
         "name+description+instructions+tags). If allowed_tools is omitted on "
-        "add, it defaults to get_recent_trajectory + run_code. Each call "
-        "consumes one of your MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call budget."
+        "add, it defaults to get_recent_trajectory. Each call consumes one "
+        "of your MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call budget."
     ),
     "parameters": {
         "type": "object",
@@ -277,10 +278,10 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
                     "enum": sorted(SUBAGENT_TOOL_ENUM),
                 },
                 "description": "Tools the subagent may call (subset of "
-                "get_recent_trajectory/process_memory/process_skill/run_skill/"
-                "run_code). Optional for add/edit; omitted on add defaults to "
-                "get_recent_trajectory + run_code. Empty list = subagent that "
-                "only reasons and returns.",
+                "get_recent_trajectory/process_memory/process_skill/"
+                "run_skill). Optional for add/edit; omitted on add defaults "
+                "to get_recent_trajectory. Empty list = subagent that only "
+                "reasons and returns.",
             },
             "tags": {
                 "type": "array",
@@ -381,6 +382,45 @@ def is_subagent_return_call(name: str) -> bool:
     return name == SUBAGENT_RETURN_NAME
 
 
+# --- Prompt-evolution tool ---------------------------------------------------
+# Exposed ONLY to the meta-VLM call inside ContinualHarness._evolve_system_prompt.
+# Never appears in the orchestrator's tool list, never in any subagent allowlist.
+EVOLVE_PROMPT_NAME = "evolve_system_prompt"
+EVOLVE_SYSTEM_PROMPT_TOOL: dict[str, Any] = {
+    "name": EVOLVE_PROMPT_NAME,
+    "description": (
+        "Replace the agent's system instruction with an improved version. The "
+        "new prompt must be 200-6000 characters; proposals outside that range "
+        "are rejected and the agent keeps using the previous prompt."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": (
+                    "What you saw in the trajectory and what you're changing "
+                    "in the prompt. Required."
+                ),
+            },
+            "new_prompt": {
+                "type": "string",
+                "description": (
+                    "The full replacement system instruction (200-6000 chars). "
+                    "Required."
+                ),
+            },
+        },
+        "required": ["reasoning", "new_prompt"],
+    },
+}
+
+
+def is_evolve_prompt_call(name: str) -> bool:
+    """True iff `name` is the prompt-evolution terminator the meta-call watches for."""
+    return name == EVOLVE_PROMPT_NAME
+
+
 # Maps a SUBAGENT_TOOL_ENUM name to the concrete tool spec the orchestrator
 # already defines. Keeping this lookup in one place avoids drift between the
 # allowlist enum and the actual spec shapes shown to the subagent VLM.
@@ -389,7 +429,7 @@ _SUBAGENT_TOOL_SPECS: dict[str, dict[str, Any]] = {
     "process_memory": PROCESS_MEMORY_TOOL,
     "process_skill": PROCESS_SKILL_TOOL,
     "run_skill": RUN_SKILL_TOOL,
-    "run_code": RUN_CODE_TOOL,
+    # "run_code": RUN_CODE_TOOL — disabled (see SUBAGENT_TOOL_ENUM note).
 }
 
 
