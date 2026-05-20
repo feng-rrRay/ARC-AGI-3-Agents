@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from agents.recording_render import (
     discover_recording_paths,
     expand_recording_frames,
     export_gif,
+    export_mp4,
     find_actions_log,
     find_trace_log,
     grid_to_image,
@@ -180,6 +182,16 @@ def test_default_output_path_removes_recording_suffix() -> None:
 
 
 @pytest.mark.unit
+def test_default_output_path_uses_requested_format() -> None:
+    output = default_output_path(
+        "recordings/test.agent.guid.recording.jsonl",
+        output_format="mp4",
+    )
+
+    assert output == Path("recordings/test.agent.guid.mp4")
+
+
+@pytest.mark.unit
 def test_discover_recording_paths_accepts_single_recording_file(tmp_path: Path) -> None:
     recording = tmp_path / "one.recording.jsonl"
     recording.write_text("", encoding="utf-8")
@@ -211,9 +223,10 @@ def test_output_path_for_recording_uses_output_directory_for_multiple() -> None:
         recording,
         Path("renders"),
         recording_count=2,
+        output_format="mp4",
     )
 
-    assert output == Path("renders/test.agent.guid.gif")
+    assert output == Path("renders/test.agent.guid.mp4")
 
 
 @pytest.mark.unit
@@ -253,6 +266,62 @@ def test_main_renders_all_recordings_in_run_directory(tmp_path: Path) -> None:
     assert result == 0
     assert (output_dir / "a.gif").exists()
     assert (output_dir / "b.gif").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_export_mp4_creates_file(tmp_path: Path) -> None:
+    recording = tmp_path / "test.recording.jsonl"
+    output = tmp_path / "out.mp4"
+    write_jsonl(
+        recording,
+        [
+            frame_event([[[0, 0], [0, 0]]]),
+            frame_event([[[8, 8], [8, 8]]]),
+        ],
+    )
+
+    exported = export_mp4(
+        load_recording_frames(recording),
+        output,
+        fps=2,
+        scale=2,
+        overlay=False,
+        reasoning=False,
+    )
+
+    assert exported == output
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_main_renders_run_directory_as_mp4(tmp_path: Path) -> None:
+    run_dir = tmp_path / "logs" / "run-1"
+    recordings_dir = run_dir / "recordings"
+    recordings_dir.mkdir(parents=True)
+    output_dir = tmp_path / "rendered"
+
+    recording = recordings_dir / "a.recording.jsonl"
+    write_jsonl(recording, [frame_event([[[0, 1], [2, 3]]])])
+
+    result = main(
+        [
+            str(run_dir),
+            "--format",
+            "mp4",
+            "--output",
+            str(output_dir),
+            "--no-overlay",
+            "--no-reasoning",
+            "--scale",
+            "2",
+        ]
+    )
+
+    assert result == 0
+    assert (output_dir / "a.mp4").exists()
 
 
 @pytest.mark.unit

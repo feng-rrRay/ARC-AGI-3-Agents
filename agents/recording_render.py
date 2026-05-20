@@ -3,14 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import Any, Literal, Sequence, cast
 
 from PIL import Image, ImageDraw, ImageFont
 
 RECORDING_SUFFIX = ".recording.jsonl"
 TRACE_SUFFIX = ".trace.jsonl"
+VIDEO_SUFFIXES = {".gif", ".mp4"}
+RenderFormat = Literal["gif", "mp4"]
 
 # ARC-AGI 16-colour palette indexed by grid values 0..15.
 ARC_PALETTE: tuple[tuple[int, int, int, int], ...] = (
@@ -353,23 +357,16 @@ def expand_recording_frames(
     return grid_frames
 
 
-def export_gif(
+def render_recording_images(
     frames: Sequence[RecordingFrame],
-    output_path: str | Path,
     *,
-    fps: int = 5,
     scale: int = 8,
     overlay: bool = True,
     reasoning: bool = True,
-) -> Path:
-    """Export recording frames to an animated GIF."""
-    if fps < 1:
-        raise ValueError("fps must be >= 1")
+) -> list[Image.Image]:
+    """Render recording events to one image per grid frame."""
     if not frames:
         raise ValueError("At least one frame is required")
-
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
 
     grid_frames = expand_recording_frames(frames)
     include_reasoning_panel = reasoning and any(
@@ -384,7 +381,31 @@ def export_gif(
         )
         for grid_frame in grid_frames
     ]
-    images = _pad_to_common_size(images)
+    return _pad_to_common_size(images)
+
+
+def export_gif(
+    frames: Sequence[RecordingFrame],
+    output_path: str | Path,
+    *,
+    fps: int = 5,
+    scale: int = 8,
+    overlay: bool = True,
+    reasoning: bool = True,
+) -> Path:
+    """Export recording frames to an animated GIF."""
+    if fps < 1:
+        raise ValueError("fps must be >= 1")
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    images = render_recording_images(
+        frames,
+        scale=scale,
+        overlay=overlay,
+        reasoning=reasoning,
+    )
     gif_frames = [
         image.convert("P", palette=Image.Palette.ADAPTIVE) for image in images
     ]
@@ -404,12 +425,123 @@ def export_gif(
     return output
 
 
-def default_output_path(path: str | Path) -> Path:
+def export_mp4(
+    frames: Sequence[RecordingFrame],
+    output_path: str | Path,
+    *,
+    fps: int = 5,
+    scale: int = 8,
+    overlay: bool = True,
+    reasoning: bool = True,
+) -> Path:
+    """Export recording frames to an MP4 via ffmpeg."""
+    if fps < 1:
+        raise ValueError("fps must be >= 1")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            "MP4 export requires ffmpeg on PATH. Install ffmpeg or use --format gif."
+        )
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    images = _pad_to_even_size(
+        render_recording_images(
+            frames,
+            scale=scale,
+            overlay=overlay,
+            reasoning=reasoning,
+        )
+    )
+    width, height = images[0].size
+    command = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    try:
+        for image in images:
+            process.stdin.write(image.convert("RGB").tobytes())
+    except BrokenPipeError as exc:
+        _, stderr = process.communicate()
+        raise RuntimeError(_ffmpeg_error(stderr)) from exc
+    else:
+        _, stderr = process.communicate()
+
+    if process.returncode != 0:
+        raise RuntimeError(_ffmpeg_error(stderr))
+    return output
+
+
+def export_recording(
+    frames: Sequence[RecordingFrame],
+    output_path: str | Path,
+    *,
+    output_format: RenderFormat = "gif",
+    fps: int = 5,
+    scale: int = 8,
+    overlay: bool = True,
+    reasoning: bool = True,
+) -> Path:
+    """Export recording frames to the requested video format."""
+    if output_format == "gif":
+        return export_gif(
+            frames,
+            output_path,
+            fps=fps,
+            scale=scale,
+            overlay=overlay,
+            reasoning=reasoning,
+        )
+    if output_format == "mp4":
+        return export_mp4(
+            frames,
+            output_path,
+            fps=fps,
+            scale=scale,
+            overlay=overlay,
+            reasoning=reasoning,
+        )
+    raise ValueError(f"Unsupported output format: {output_format}")
+
+
+def default_output_path(
+    path: str | Path, *, output_format: RenderFormat = "gif"
+) -> Path:
     recording_path = Path(path)
+    suffix = f".{output_format}"
     if recording_path.name.endswith(RECORDING_SUFFIX):
         stem = recording_path.name[: -len(RECORDING_SUFFIX)]
-        return recording_path.with_name(f"{stem}.gif")
-    return recording_path.with_suffix(".gif")
+        return recording_path.with_name(f"{stem}{suffix}")
+    return recording_path.with_suffix(suffix)
 
 
 def output_path_for_recording(
@@ -417,26 +549,28 @@ def output_path_for_recording(
     output_arg: str | Path | None,
     *,
     recording_count: int = 1,
+    output_format: RenderFormat = "gif",
 ) -> Path:
-    """Resolve the GIF path for one recording in file-mode or directory-mode."""
+    """Resolve the video path for one recording in file-mode or directory-mode."""
     recording = Path(recording_path)
     if output_arg is None:
-        return default_output_path(recording)
+        return default_output_path(recording, output_format=output_format)
 
     output = Path(output_arg)
-    if recording_count == 1 and output.suffix.lower() == ".gif":
+    if recording_count == 1 and output.suffix.lower() in VIDEO_SUFFIXES:
         return output
-    if recording_count > 1 and output.suffix.lower() == ".gif":
+    if recording_count > 1 and output.suffix.lower() in VIDEO_SUFFIXES:
         raise ValueError(
             "--output must be a directory when rendering multiple recordings"
         )
-    return output / default_output_path(recording).name
+    return output / default_output_path(recording, output_format=output_format).name
 
 
 def render_recording_file(
     recording_path: str | Path,
     output_path: str | Path,
     *,
+    output_format: RenderFormat = "gif",
     fps: int = 5,
     scale: int = 8,
     overlay: bool = True,
@@ -473,9 +607,10 @@ def render_recording_file(
 
     attached_reasoning_count = sum(1 for frame in frames if frame.reasoning_trace)
     grid_frame_count = len(expand_recording_frames(frames))
-    output = export_gif(
+    output = export_recording(
         frames,
         output_path,
+        output_format=output_format,
         fps=fps,
         scale=scale,
         overlay=overlay,
@@ -497,7 +632,7 @@ def render_recording_file(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Render ARC-AGI recording JSONL files to animated GIFs. "
+            "Render ARC-AGI recording JSONL files to GIF or MP4. "
             "Input may be one .recording.jsonl file or a run directory "
             "containing recordings/."
         )
@@ -513,9 +648,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Output GIF path for one recording, or output directory for a run folder. "
-            "Defaults to writing each GIF beside its recording."
+            "Output file path for one recording, or output directory for a run folder. "
+            "Defaults to writing each video beside its recording."
         ),
+    )
+    parser.add_argument(
+        "--format",
+        choices=("gif", "mp4"),
+        default="gif",
+        help="Output video format. Defaults to gif.",
     )
     parser.add_argument("--fps", type=int, default=5, help="Playback frames per second")
     parser.add_argument("--scale", type=int, default=8, help="Pixel-art scale factor")
@@ -556,6 +697,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     input_path = cast(Path, args.input)
     output_arg = cast(Path | None, args.output)
+    output_format = cast(RenderFormat, args.format)
     fps = cast(int, args.fps)
     scale = cast(int, args.scale)
     overlay = not cast(bool, args.no_overlay)
@@ -570,10 +712,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             recording_path,
             output_arg,
             recording_count=len(recordings),
+            output_format=output_format,
         )
         summary = render_recording_file(
             recording_path,
             output_path,
+            output_format=output_format,
             fps=fps,
             scale=scale,
             overlay=overlay,
@@ -584,7 +728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summaries.append(summary)
         print(
             f"Wrote {summary.output} from {summary.frame_events} frame events "
-            f"({summary.grid_frames} rendered GIF frames)"
+            f"({summary.grid_frames} rendered video frames)"
         )
         if summary.actions_log is not None and summary.action_label_count:
             print(
@@ -1099,6 +1243,33 @@ def _pad_to_common_size(images: Sequence[Image.Image]) -> list[Image.Image]:
         canvas.paste(image, (0, 0))
         padded.append(canvas)
     return padded
+
+
+def _pad_to_even_size(images: Sequence[Image.Image]) -> list[Image.Image]:
+    """Pad video frames to even dimensions required by yuv420p MP4 output."""
+    if not images:
+        return []
+
+    width, height = images[0].size
+    even_width = width if width % 2 == 0 else width + 1
+    even_height = height if height % 2 == 0 else height + 1
+    if (even_width, even_height) == (width, height):
+        return list(images)
+
+    padded: list[Image.Image] = []
+    for image in images:
+        canvas = Image.new("RGBA", (even_width, even_height), (20, 20, 20, 255))
+        canvas.paste(image, (0, 0))
+        padded.append(canvas)
+    return padded
+
+
+def _ffmpeg_error(stderr: bytes) -> str:
+    text = stderr.decode("utf-8", errors="replace").strip()
+    if not text:
+        return "ffmpeg failed while exporting MP4"
+    tail = "\n".join(text.splitlines()[-10:])
+    return f"ffmpeg failed while exporting MP4:\n{tail}"
 
 
 if __name__ == "__main__":
