@@ -9,12 +9,15 @@ from agents.recording_render import (
     RecordingFrame,
     apply_action_labels,
     default_output_path,
+    discover_recording_paths,
     expand_recording_frames,
     export_gif,
     find_actions_log,
     find_trace_log,
     grid_to_image,
     load_recording_frames,
+    main,
+    output_path_for_recording,
     parse_action_log,
     render_recording_frame,
 )
@@ -174,6 +177,82 @@ def test_default_output_path_removes_recording_suffix() -> None:
     output = default_output_path("recordings/test.agent.guid.recording.jsonl")
 
     assert output == Path("recordings/test.agent.guid.gif")
+
+
+@pytest.mark.unit
+def test_discover_recording_paths_accepts_single_recording_file(tmp_path: Path) -> None:
+    recording = tmp_path / "one.recording.jsonl"
+    recording.write_text("", encoding="utf-8")
+
+    assert discover_recording_paths(recording) == [recording]
+
+
+@pytest.mark.unit
+def test_discover_recording_paths_accepts_run_directory(tmp_path: Path) -> None:
+    run_dir = tmp_path / "logs" / "run-1"
+    recordings_dir = run_dir / "recordings"
+    recordings_dir.mkdir(parents=True)
+    first = recordings_dir / "a.recording.jsonl"
+    second = recordings_dir / "b.recording.jsonl"
+    ignored = run_dir / "artifacts" / "c.recording.jsonl"
+    first.write_text("", encoding="utf-8")
+    second.write_text("", encoding="utf-8")
+    ignored.parent.mkdir()
+    ignored.write_text("", encoding="utf-8")
+
+    assert discover_recording_paths(run_dir) == [first, second]
+
+
+@pytest.mark.unit
+def test_output_path_for_recording_uses_output_directory_for_multiple() -> None:
+    recording = Path("recordings/test.agent.guid.recording.jsonl")
+
+    output = output_path_for_recording(
+        recording,
+        Path("renders"),
+        recording_count=2,
+    )
+
+    assert output == Path("renders/test.agent.guid.gif")
+
+
+@pytest.mark.unit
+def test_output_path_for_recording_rejects_file_output_for_multiple() -> None:
+    with pytest.raises(ValueError, match="--output must be a directory"):
+        output_path_for_recording(
+            Path("recordings/test.agent.guid.recording.jsonl"),
+            Path("out.gif"),
+            recording_count=2,
+        )
+
+
+@pytest.mark.unit
+def test_main_renders_all_recordings_in_run_directory(tmp_path: Path) -> None:
+    run_dir = tmp_path / "logs" / "run-1"
+    recordings_dir = run_dir / "recordings"
+    recordings_dir.mkdir(parents=True)
+    output_dir = tmp_path / "rendered"
+
+    first = recordings_dir / "a.recording.jsonl"
+    second = recordings_dir / "b.recording.jsonl"
+    write_jsonl(first, [frame_event([[[0, 1], [2, 3]]])])
+    write_jsonl(second, [frame_event([[[4, 5], [6, 7]]])])
+
+    result = main(
+        [
+            str(run_dir),
+            "--output",
+            str(output_dir),
+            "--no-overlay",
+            "--no-reasoning",
+            "--scale",
+            "1",
+        ]
+    )
+
+    assert result == 0
+    assert (output_dir / "a.gif").exists()
+    assert (output_dir / "b.gif").exists()
 
 
 @pytest.mark.unit

@@ -73,6 +73,39 @@ class RecordingGridFrame:
     grid: Grid
 
 
+@dataclass(frozen=True)
+class RenderSummary:
+    recording: Path
+    output: Path
+    frame_events: int
+    grid_frames: int
+    actions_log: Path | None
+    action_label_count: int
+    trace_log: Path | None
+    reasoning_trace_count: int
+    attached_reasoning_count: int
+
+
+def discover_recording_paths(path: str | Path) -> list[Path]:
+    """Return recording files from a single file or a run/recordings directory."""
+    input_path = Path(path)
+    if input_path.is_file():
+        if not input_path.name.endswith(RECORDING_SUFFIX):
+            raise ValueError(f"Input file must end with {RECORDING_SUFFIX}: {input_path}")
+        return [input_path]
+
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"No such recording file or run directory: {input_path}")
+
+    recordings_dir = input_path / "recordings"
+    search_dir = recordings_dir if recordings_dir.is_dir() else input_path
+    recordings = sorted(search_dir.glob(f"*{RECORDING_SUFFIX}"))
+    if not recordings:
+        detail = f"{recordings_dir} or {input_path}" if search_dir != input_path else input_path
+        raise ValueError(f"No *{RECORDING_SUFFIX} files found in {detail}")
+    return recordings
+
+
 def load_recording_frames(path: str | Path) -> list[RecordingFrame]:
     """Load frame-bearing events from an ARC recording JSONL file."""
     recording_path = Path(path)
@@ -379,17 +412,110 @@ def default_output_path(path: str | Path) -> Path:
     return recording_path.with_suffix(".gif")
 
 
+def output_path_for_recording(
+    recording_path: str | Path,
+    output_arg: str | Path | None,
+    *,
+    recording_count: int = 1,
+) -> Path:
+    """Resolve the GIF path for one recording in file-mode or directory-mode."""
+    recording = Path(recording_path)
+    if output_arg is None:
+        return default_output_path(recording)
+
+    output = Path(output_arg)
+    if recording_count == 1 and output.suffix.lower() == ".gif":
+        return output
+    if recording_count > 1 and output.suffix.lower() == ".gif":
+        raise ValueError(
+            "--output must be a directory when rendering multiple recordings"
+        )
+    return output / default_output_path(recording).name
+
+
+def render_recording_file(
+    recording_path: str | Path,
+    output_path: str | Path,
+    *,
+    fps: int = 5,
+    scale: int = 8,
+    overlay: bool = True,
+    actions_log: str | Path | None = None,
+    trace_log: str | Path | None = None,
+    reasoning: bool = True,
+) -> RenderSummary:
+    """Render one recording file and return metadata for CLI reporting."""
+    recording = Path(recording_path)
+    frames = load_recording_frames(recording)
+
+    resolved_actions_log = Path(actions_log) if actions_log is not None else None
+    resolved_actions_log = resolved_actions_log or find_actions_log(recording)
+    if resolved_actions_log is not None:
+        action_labels = parse_action_log(resolved_actions_log)
+        frames = apply_action_labels(frames, action_labels)
+    else:
+        action_labels = {}
+
+    resolved_trace_log: Path | None = None
+    if reasoning:
+        resolved_trace_log = Path(trace_log) if trace_log is not None else None
+        resolved_trace_log = resolved_trace_log or find_trace_log(
+            recording,
+            actions_log=resolved_actions_log,
+        )
+        if resolved_trace_log is not None:
+            reasoning_traces = parse_trace_log(resolved_trace_log)
+            frames = apply_reasoning_traces(frames, reasoning_traces)
+        else:
+            reasoning_traces = {}
+    else:
+        reasoning_traces = {}
+
+    attached_reasoning_count = sum(1 for frame in frames if frame.reasoning_trace)
+    grid_frame_count = len(expand_recording_frames(frames))
+    output = export_gif(
+        frames,
+        output_path,
+        fps=fps,
+        scale=scale,
+        overlay=overlay,
+        reasoning=reasoning,
+    )
+    return RenderSummary(
+        recording=recording,
+        output=output,
+        frame_events=len(frames),
+        grid_frames=grid_frame_count,
+        actions_log=resolved_actions_log,
+        action_label_count=len(action_labels),
+        trace_log=resolved_trace_log,
+        reasoning_trace_count=len(reasoning_traces),
+        attached_reasoning_count=attached_reasoning_count,
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Render an ARC-AGI recording JSONL file to an animated GIF."
+        description=(
+            "Render ARC-AGI recording JSONL files to animated GIFs. "
+            "Input may be one .recording.jsonl file or a run directory "
+            "containing recordings/."
+        )
     )
-    parser.add_argument("recording", type=Path, help="Path to a .recording.jsonl file")
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="Path to a .recording.jsonl file or run folder such as logs/<run-id>.",
+    )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help="Output GIF path. Defaults to the input name with .gif.",
+        help=(
+            "Output GIF path for one recording, or output directory for a run folder. "
+            "Defaults to writing each GIF beside its recording."
+        ),
     )
     parser.add_argument("--fps", type=int, default=5, help="Playback frames per second")
     parser.add_argument("--scale", type=int, default=8, help="Pixel-art scale factor")
@@ -428,11 +554,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    recording_path = cast(Path, args.recording)
+    input_path = cast(Path, args.input)
     output_arg = cast(Path | None, args.output)
-    output_path = (
-        output_arg if output_arg is not None else default_output_path(recording_path)
-    )
     fps = cast(int, args.fps)
     scale = cast(int, args.scale)
     overlay = not cast(bool, args.no_overlay)
@@ -440,49 +563,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     trace_log_arg = cast(Path | None, args.trace_log)
     reasoning = not cast(bool, args.no_reasoning)
 
-    frames = load_recording_frames(recording_path)
-    actions_log = actions_log_arg or find_actions_log(recording_path)
-    if actions_log is not None:
-        action_labels = parse_action_log(actions_log)
-        frames = apply_action_labels(frames, action_labels)
-    else:
-        action_labels = {}
-
-    trace_log: Path | None = None
-    if reasoning:
-        trace_log = trace_log_arg or find_trace_log(
+    recordings = discover_recording_paths(input_path)
+    summaries: list[RenderSummary] = []
+    for recording_path in recordings:
+        output_path = output_path_for_recording(
             recording_path,
-            actions_log=actions_log,
+            output_arg,
+            recording_count=len(recordings),
         )
-        if trace_log is not None:
-            reasoning_traces = parse_trace_log(trace_log)
-            frames = apply_reasoning_traces(frames, reasoning_traces)
-        else:
-            reasoning_traces = {}
-    else:
-        reasoning_traces = {}
-
-    attached_reasoning_count = sum(1 for frame in frames if frame.reasoning_trace)
-    grid_frame_count = len(expand_recording_frames(frames))
-    output = export_gif(
-        frames,
-        output_path,
-        fps=fps,
-        scale=scale,
-        overlay=overlay,
-        reasoning=reasoning,
-    )
-    print(
-        f"Wrote {output} from {len(frames)} frame events "
-        f"({grid_frame_count} rendered GIF frames)"
-    )
-    if actions_log is not None and action_labels:
-        print(f"Loaded {len(action_labels)} action labels from {actions_log}")
-    if trace_log is not None and reasoning_traces:
+        summary = render_recording_file(
+            recording_path,
+            output_path,
+            fps=fps,
+            scale=scale,
+            overlay=overlay,
+            actions_log=actions_log_arg,
+            trace_log=trace_log_arg,
+            reasoning=reasoning,
+        )
+        summaries.append(summary)
         print(
-            f"Loaded {len(reasoning_traces)} reasoning traces from {trace_log} "
-            f"({attached_reasoning_count} attached to recording frames)"
+            f"Wrote {summary.output} from {summary.frame_events} frame events "
+            f"({summary.grid_frames} rendered GIF frames)"
         )
+        if summary.actions_log is not None and summary.action_label_count:
+            print(
+                f"Loaded {summary.action_label_count} action labels "
+                f"from {summary.actions_log}"
+            )
+        if summary.trace_log is not None and summary.reasoning_trace_count:
+            print(
+                f"Loaded {summary.reasoning_trace_count} reasoning traces "
+                f"from {summary.trace_log} "
+                f"({summary.attached_reasoning_count} attached to recording frames)"
+            )
+    if len(summaries) > 1:
+        print(f"Rendered {len(summaries)} recordings from {input_path}")
     return 0
 
 
