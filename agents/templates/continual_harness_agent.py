@@ -108,18 +108,17 @@ class ContinualHarness(Agent):
     final round guarantee that every step ends with a GameAction or RuntimeError.
     """
 
-    MAX_ACTIONS = 80
+    MAX_ACTIONS = 1000
     MODEL = "gemini-3.1-pro-preview"  # default; override via GEMINI_MODEL
     MAX_TOOL_ROUNDS = 3  # VLM round-trips per step
     MAX_ANALYSIS_CALLS_PER_STEP = 5  # total analysis tool calls per step
     HISTORY_WINDOW = 5  # max trajectory rows fed into the auto-injected tail
     HISTORY_MAX_CHARS = 12000  # ~4k tokens budget for the RECENT STEPS block
-    HISTORY_REASONING_CHARS = 300  # per-row reasoning truncation cap
     FULL_HISTORY_DEFAULT_LIMIT = 40
     FULL_HISTORY_MAX_LIMIT = 80  # = MAX_ACTIONS, so the model can request the whole run
     MAX_SUBAGENT_CALLS_PER_STEP = 1  # distinct run_subagent invocations per outer step
     MAX_SUBAGENT_ROUNDS_PER_CALL = 20  # inner VLM rounds per invocation
-    SUBAGENT_HISTORY_WINDOW = 10  # rows of compact history fed into a subagent's prompt
+    SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
     # Prompt-evolution defaults; the actual frequency is read from
     # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
     # --prompt-evolve-frequency). 0 disables; positive N means every N steps.
@@ -524,7 +523,6 @@ class ContinualHarness(Agent):
             history = format_compact_history(
                 self.trajectory.tail(self.SUBAGENT_HISTORY_WINDOW),
                 max_chars=self.HISTORY_MAX_CHARS,
-                reasoning_chars=self.HISTORY_REASONING_CHARS,
             )
             base_prompt = build_subagent_prompt(
                 task=task,
@@ -959,7 +957,6 @@ class ContinualHarness(Agent):
             self.trajectory.tail(self.HISTORY_WINDOW),
             frames=frames,
             max_chars=self.HISTORY_MAX_CHARS,
-            reasoning_chars=self.HISTORY_REASONING_CHARS,
         )
         history_block = (
             "## RECENT STEPS (compact; call get_recent_trajectory for full detail)\n"

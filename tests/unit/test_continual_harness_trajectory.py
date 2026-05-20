@@ -120,24 +120,20 @@ class TestFormatCompactHistory:
         assert "[1] ACTION1" in lines[0]
         assert "[3] ACTION3" in lines[2]
 
-    def test_reasoning_snippet_appears_inline_quoted(self) -> None:
+    def test_reasoning_is_omitted_from_compact_history(self) -> None:
         rec = _rec(7, "ACTION3", reasoning="trying to push north into the gate")
         out = format_compact_history([rec])
-        assert '"trying to push north into the gate"' in out
+        assert "trying to push north into the gate" not in out
+        assert '"' not in out
 
-    def test_reasoning_truncated_to_reasoning_chars(self) -> None:
+    def test_reasoning_chars_argument_does_not_readd_reasoning(self) -> None:
         long_reason = "x" * 500
         out = format_compact_history(
             [_rec(1, "ACTION1", reasoning=long_reason)], reasoning_chars=50
         )
-        # Truncated reasoning ends with the ellipsis marker.
-        assert "…" in out
-        # Anywhere we find the truncated chunk it's bounded by quotes.
-        assert "x" * 60 not in out  # never the full string
-
-    def test_missing_reasoning_omits_the_quoted_block(self) -> None:
-        out = format_compact_history([_rec(1, "ACTION1", reasoning=None)])
-        assert '"' not in out  # no quoted segment at all
+        assert long_reason not in out
+        assert "…" not in out
+        assert '"' not in out
 
     def test_truncates_oldest_when_over_max_chars(self) -> None:
         records = [
@@ -172,9 +168,24 @@ class TestEffectTags:
             [_rec(0, "ACTION6", chosen_action_data={"x": 1, "y": 1})],
             frames=[_fake_frame(pre), _fake_frame(post)],
         )
-        assert "CHANGE(" in out
-        assert "rows 1-1" in out
-        assert "cols 1-2" in out
+        assert "CHANGE 2 cells" in out
+        assert "region 1 2 @ r1 c1-2 [1->2 x2]" in out
+
+    def test_change_splits_disconnected_regions_without_semantic_labels(self) -> None:
+        pre = [[0 for _ in range(8)] for _ in range(8)]
+        post = [row[:] for row in pre]
+        for r in range(2, 4):
+            for c in range(2, 5):
+                post[r][c] = 1
+        post[7][1] = 9
+
+        out = format_compact_history(
+            [_rec(0, "ACTION1")], frames=[_fake_frame(pre), _fake_frame(post)]
+        )
+
+        assert "CHANGE 7 cells" in out
+        assert "region 1 6 @ r2-3 c2-4 [0->1 x6]" in out
+        assert "region 2 1 @ r7 c1 [0->9 x1]" in out
 
     def test_level_up_outranks_change(self) -> None:
         # Frame also changed, but score went up — LEVEL_UP wins.
@@ -221,6 +232,40 @@ class TestFrameDelta:
         assert d["kind"] == "CHANGE"
         assert d["n"] == 1
         assert d["bbox"] == (1, 1, 1, 1)
+        assert d["components"] == [
+            {
+                "n": 1,
+                "bbox": (1, 1, 1, 1),
+                "transitions": {(0, 9): 1},
+                "cells": [{"r": 1, "c": 1, "from": 0, "to": 9}],
+            }
+        ]
+
+    def test_transition_counts_are_grouped_per_component(self) -> None:
+        d = _frame_delta(
+            [[3, 3, 9, 9], [3, 3, 12, 12]],
+            [[9, 9, 3, 3], [12, 12, 3, 3]],
+        )
+
+        assert d["kind"] == "CHANGE"
+        assert d["n"] == 8
+        assert d["components"] == [
+            {
+                "n": 8,
+                "bbox": (0, 1, 0, 3),
+                "transitions": {(3, 9): 2, (3, 12): 2, (9, 3): 2, (12, 3): 2},
+                "cells": [
+                    {"r": 0, "c": 0, "from": 3, "to": 9},
+                    {"r": 0, "c": 1, "from": 3, "to": 9},
+                    {"r": 0, "c": 2, "from": 9, "to": 3},
+                    {"r": 0, "c": 3, "from": 9, "to": 3},
+                    {"r": 1, "c": 0, "from": 3, "to": 12},
+                    {"r": 1, "c": 1, "from": 3, "to": 12},
+                    {"r": 1, "c": 2, "from": 12, "to": 3},
+                    {"r": 1, "c": 3, "from": 12, "to": 3},
+                ],
+            }
+        ]
 
     def test_unknown_when_either_grid_none(self) -> None:
         assert _frame_delta(None, [[0]])["kind"] == "UNKNOWN"
@@ -300,6 +345,7 @@ class TestPromptInjection:
                 "chosen_action_data": {},
                 "state": "NOT_FINISHED",
                 "score": 0,
+                "reasoning": "this should stay out of recent steps",
             }
         ]
         history = format_compact_history(records)
@@ -314,5 +360,6 @@ class TestPromptInjection:
 
         assert "## RECENT STEPS" in prompt
         assert "[1] ACTION1" in prompt
+        assert "this should stay out of recent steps" not in prompt
         assert prompt.index("## RECENT STEPS") < prompt.index("# TURN:")
         assert "# TURN:\nCall exactly one action." in prompt
