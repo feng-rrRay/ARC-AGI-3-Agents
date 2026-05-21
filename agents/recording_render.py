@@ -13,8 +13,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 RECORDING_SUFFIX = ".recording.jsonl"
 TRACE_SUFFIX = ".trace.jsonl"
+TRAJECTORY_SUFFIX = ".trajectory.jsonl"
+PROMPT_EVOLUTION_NAME = "prompt_evolution.jsonl"
 VIDEO_SUFFIXES = {".gif", ".mp4"}
 RenderFormat = Literal["gif", "mp4"]
+CallKind = Literal["action", "analysis", "evolution"]
 
 # ARC-AGI 16-colour palette indexed by grid values 0..15.
 ARC_PALETTE: tuple[tuple[int, int, int, int], ...] = (
@@ -78,6 +81,34 @@ class RecordingGridFrame:
 
 
 @dataclass(frozen=True)
+class CallEntry:
+    name: str
+    kind: CallKind
+    args: JsonObject
+    executed: bool
+    result: JsonObject | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class RoundEntry:
+    round: int
+    tools_exposed: str | None
+    reasoning: str | None
+    chosen_action: str | None
+    error: str | None
+    calls: tuple[CallEntry, ...]
+
+
+@dataclass(frozen=True)
+class PromptEvolutionEntry:
+    generation: int
+    accepted: bool
+    reasoning: str | None
+    validation_error: str | None
+
+
+@dataclass(frozen=True)
 class RenderSummary:
     recording: Path
     output: Path
@@ -88,6 +119,10 @@ class RenderSummary:
     trace_log: Path | None
     reasoning_trace_count: int
     attached_reasoning_count: int
+    trajectory_log: Path | None = None
+    trajectory_step_count: int = 0
+    prompt_evolution_log: Path | None = None
+    prompt_evolution_count: int = 0
 
 
 def discover_recording_paths(path: str | Path) -> list[Path]:
@@ -197,7 +232,7 @@ def find_trace_log(
 ) -> Path | None:
     """Find a VLM trace JSONL file matching the given recording."""
     recording = Path(recording_path)
-    artifact_trace = _artifact_trace_for_recording(recording)
+    artifact_trace = _artifact_companion_for_recording(recording, TRACE_SUFFIX)
     if artifact_trace is not None:
         return artifact_trace
 
@@ -223,10 +258,24 @@ def find_trace_log(
     return None
 
 
-def parse_trace_log(path: str | Path) -> dict[int, str]:
-    """Parse per-action VLM reasoning from a continual-harness trace JSONL file."""
+def find_trajectory_log(recording_path: str | Path) -> Path | None:
+    """Find a VLM trajectory JSONL file alongside the recording's artifacts."""
+    return _artifact_companion_for_recording(Path(recording_path), TRAJECTORY_SUFFIX)
+
+
+def find_prompt_evolution_log(recording_path: str | Path) -> Path | None:
+    """Find prompt_evolution.jsonl in the recording's run directory."""
+    run_dir = _run_dir_for_recording(Path(recording_path))
+    if run_dir is None:
+        return None
+    candidate = run_dir / PROMPT_EVOLUTION_NAME
+    return candidate if candidate.exists() else None
+
+
+def parse_trace_log(path: str | Path) -> dict[int, list[RoundEntry]]:
+    """Parse VLM trace rounds per action_counter from a trace JSONL file."""
     trace_path = Path(path)
-    accumulators: dict[int, JsonObject] = {}
+    rounds_by_step: dict[int, list[RoundEntry]] = {}
 
     with trace_path.open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, start=1):
@@ -239,18 +288,66 @@ def parse_trace_log(path: str | Path) -> dict[int, str]:
             if action_counter is None:
                 continue
 
-            accumulator = accumulators.setdefault(
-                action_counter,
-                {"analysis_calls": [], "errors": []},
+            rounds_by_step.setdefault(action_counter, []).append(
+                _build_round_entry(event)
             )
-            _merge_trace_event(accumulator, event)
 
-    traces: dict[int, str] = {}
-    for action_counter, accumulator in sorted(accumulators.items()):
-        trace_text = _format_trace_text(action_counter, accumulator)
-        if trace_text is not None:
-            traces[action_counter] = trace_text
-    return traces
+    for rounds in rounds_by_step.values():
+        rounds.sort(key=lambda entry: entry.round)
+    return rounds_by_step
+
+
+def parse_trajectory_log(path: str | Path) -> dict[int, list[JsonObject]]:
+    """Parse executed tool_calls per action_counter from a trajectory JSONL file."""
+    trajectory_path = Path(path)
+    by_step: dict[int, list[JsonObject]] = {}
+
+    with trajectory_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            event = _load_json_object(stripped, trajectory_path, line_number)
+            action_counter = _int_or_none(event.get("action_counter"))
+            if action_counter is None:
+                continue
+
+            calls = event.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            by_step[action_counter] = [
+                cast(JsonObject, call) for call in calls if isinstance(call, dict)
+            ]
+
+    return by_step
+
+
+def parse_prompt_evolution_log(path: str | Path) -> dict[int, PromptEvolutionEntry]:
+    """Parse prompt-evolution entries per action_counter."""
+    evolution_path = Path(path)
+    by_step: dict[int, PromptEvolutionEntry] = {}
+
+    with evolution_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            event = _load_json_object(stripped, evolution_path, line_number)
+            action_counter = _int_or_none(event.get("action_counter"))
+            generation = _int_or_none(event.get("generation"))
+            if action_counter is None or generation is None:
+                continue
+
+            by_step[action_counter] = PromptEvolutionEntry(
+                generation=generation,
+                accepted=bool(event.get("accepted")),
+                reasoning=_clean_string(event.get("reasoning")),
+                validation_error=_clean_string(event.get("validation_error")),
+            )
+
+    return by_step
 
 
 def apply_action_labels(
@@ -576,6 +673,8 @@ def render_recording_file(
     overlay: bool = True,
     actions_log: str | Path | None = None,
     trace_log: str | Path | None = None,
+    trajectory_log: str | Path | None = None,
+    prompt_evolution_log: str | Path | None = None,
     reasoning: bool = True,
 ) -> RenderSummary:
     """Render one recording file and return metadata for CLI reporting."""
@@ -591,19 +690,56 @@ def render_recording_file(
         action_labels = {}
 
     resolved_trace_log: Path | None = None
+    resolved_trajectory_log: Path | None = None
+    resolved_prompt_evolution_log: Path | None = None
+    reasoning_traces: dict[int, str] = {}
+    trajectory_step_count = 0
+    prompt_evolution_count = 0
+
     if reasoning:
         resolved_trace_log = Path(trace_log) if trace_log is not None else None
         resolved_trace_log = resolved_trace_log or find_trace_log(
             recording,
             actions_log=resolved_actions_log,
         )
-        if resolved_trace_log is not None:
-            reasoning_traces = parse_trace_log(resolved_trace_log)
-            frames = apply_reasoning_traces(frames, reasoning_traces)
-        else:
-            reasoning_traces = {}
-    else:
-        reasoning_traces = {}
+        resolved_trajectory_log = (
+            Path(trajectory_log) if trajectory_log is not None else None
+        )
+        resolved_trajectory_log = resolved_trajectory_log or find_trajectory_log(
+            recording
+        )
+        resolved_prompt_evolution_log = (
+            Path(prompt_evolution_log) if prompt_evolution_log is not None else None
+        )
+        resolved_prompt_evolution_log = (
+            resolved_prompt_evolution_log or find_prompt_evolution_log(recording)
+        )
+
+        rounds_by_step: dict[int, list[RoundEntry]] = (
+            parse_trace_log(resolved_trace_log) if resolved_trace_log is not None else {}
+        )
+        trajectory_by_step: dict[int, list[JsonObject]] = (
+            parse_trajectory_log(resolved_trajectory_log)
+            if resolved_trajectory_log is not None
+            else {}
+        )
+        prompt_evolution_by_step: dict[int, PromptEvolutionEntry] = (
+            parse_prompt_evolution_log(resolved_prompt_evolution_log)
+            if resolved_prompt_evolution_log is not None
+            else {}
+        )
+
+        trajectory_step_count = len(trajectory_by_step)
+        prompt_evolution_count = len(prompt_evolution_by_step)
+
+        if trajectory_by_step:
+            rounds_by_step = enrich_rounds_with_trajectory(
+                rounds_by_step, trajectory_by_step
+            )
+        reasoning_traces = build_reasoning_traces(
+            rounds_by_step, prompt_evolution_by_step
+        )
+        frames = apply_reasoning_traces(frames, reasoning_traces)
 
     attached_reasoning_count = sum(1 for frame in frames if frame.reasoning_trace)
     grid_frame_count = len(expand_recording_frames(frames))
@@ -626,6 +762,10 @@ def render_recording_file(
         trace_log=resolved_trace_log,
         reasoning_trace_count=len(reasoning_traces),
         attached_reasoning_count=attached_reasoning_count,
+        trajectory_log=resolved_trajectory_log,
+        trajectory_step_count=trajectory_step_count,
+        prompt_evolution_log=resolved_prompt_evolution_log,
+        prompt_evolution_count=prompt_evolution_count,
     )
 
 
@@ -684,6 +824,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--trajectory-log",
+        type=Path,
+        default=None,
+        help=(
+            "Optional .trajectory.jsonl file used to enrich the panel with the "
+            "results of executed analysis tools. Defaults to the sibling "
+            "artifacts/*.trajectory.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-evolution-log",
+        type=Path,
+        default=None,
+        help=(
+            "Optional prompt_evolution.jsonl file used to annotate evolution "
+            "steps. Defaults to the run directory's prompt_evolution.jsonl."
+        ),
+    )
+    parser.add_argument(
         "--no-reasoning",
         action="store_true",
         help="Disable the right-side VLM reasoning panel.",
@@ -703,6 +862,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     overlay = not cast(bool, args.no_overlay)
     actions_log_arg = cast(Path | None, args.actions_log)
     trace_log_arg = cast(Path | None, args.trace_log)
+    trajectory_log_arg = cast(Path | None, args.trajectory_log)
+    prompt_evolution_log_arg = cast(Path | None, args.prompt_evolution_log)
     reasoning = not cast(bool, args.no_reasoning)
 
     recordings = discover_recording_paths(input_path)
@@ -723,6 +884,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             overlay=overlay,
             actions_log=actions_log_arg,
             trace_log=trace_log_arg,
+            trajectory_log=trajectory_log_arg,
+            prompt_evolution_log=prompt_evolution_log_arg,
             reasoning=reasoning,
         )
         summaries.append(summary)
@@ -740,6 +903,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Loaded {summary.reasoning_trace_count} reasoning traces "
                 f"from {summary.trace_log} "
                 f"({summary.attached_reasoning_count} attached to recording frames)"
+            )
+        if summary.trajectory_log is not None and summary.trajectory_step_count:
+            print(
+                f"Enriched panel with {summary.trajectory_step_count} trajectory "
+                f"steps from {summary.trajectory_log}"
+            )
+        if (
+            summary.prompt_evolution_log is not None
+            and summary.prompt_evolution_count
+        ):
+            print(
+                f"Annotated {summary.prompt_evolution_count} prompt-evolution "
+                f"steps from {summary.prompt_evolution_log}"
             )
     if len(summaries) > 1:
         print(f"Rendered {len(summaries)} recordings from {input_path}")
@@ -806,15 +982,17 @@ def _run_log_for_recording(recording_path: Path) -> Path | None:
     return run_log if run_log.exists() else None
 
 
-def _artifact_trace_for_recording(recording_path: Path) -> Path | None:
+def _artifact_companion_for_recording(
+    recording_path: Path, suffix: str
+) -> Path | None:
     run_dir = _run_dir_for_recording(recording_path)
     if run_dir is None:
         return None
     stem = recording_path.name
     if stem.endswith(RECORDING_SUFFIX):
         stem = stem[: -len(RECORDING_SUFFIX)]
-    trace_path = run_dir / "artifacts" / f"{stem}{TRACE_SUFFIX}"
-    return trace_path if trace_path.exists() else None
+    candidate = run_dir / "artifacts" / f"{stem}{suffix}"
+    return candidate if candidate.exists() else None
 
 
 def _run_dir_for_recording(recording_path: Path) -> Path | None:
@@ -839,104 +1017,47 @@ def _trace_mentions_agent(trace_path: Path, agent_hint: str) -> bool:
     return False
 
 
-def _merge_trace_event(accumulator: JsonObject, event: JsonObject) -> None:
-    chosen_action = _clean_string(event.get("chosen_action"))
-    round_value = _int_or_none(event.get("round"))
+def _build_round_entry(event: JsonObject) -> RoundEntry:
+    round_value = _int_or_none(event.get("round")) or 0
+    tools_exposed = _clean_string(event.get("tools_exposed"))
     reasoning = _clean_string(event.get("reasoning"))
-
-    if chosen_action is not None:
-        accumulator["chosen_action"] = chosen_action
-        if round_value is not None:
-            accumulator["round"] = round_value
-        if reasoning is None:
-            reasoning = _reasoning_from_output_action(event, chosen_action)
-        if reasoning is not None:
-            accumulator["reasoning"] = reasoning
-    elif reasoning is not None and accumulator.get("reasoning") is None:
-        accumulator["reasoning"] = reasoning
-
-    for summary in _analysis_call_summaries(event):
-        _append_unique(accumulator, "analysis_calls", summary)
-
+    chosen_action = _clean_string(event.get("chosen_action"))
     error = _clean_string(event.get("error"))
-    if error is not None:
-        _append_unique(
-            accumulator, "errors", _truncate(_compact_whitespace(error), 220)
+
+    calls: list[CallEntry] = []
+    for raw_call in _output_function_calls(event):
+        name = _clean_string(raw_call.get("name"))
+        if name is None:
+            continue
+        args = raw_call.get("args") if isinstance(raw_call.get("args"), dict) else {}
+        kind, executed = _classify_call(name, chosen_action, tools_exposed)
+        calls.append(
+            CallEntry(
+                name=name,
+                kind=kind,
+                args=cast(JsonObject, args),
+                executed=executed,
+            )
         )
 
-
-def _analysis_call_summaries(event: JsonObject) -> list[str]:
-    summaries: list[str] = []
-    for call in _output_function_calls(event):
-        name = _clean_string(call.get("name"))
-        if name is None or _is_action_name(name):
-            continue
-
-        args = call.get("args")
-        reasoning = args.get("reasoning") if isinstance(args, dict) else None
-        reason_text = _clean_string(reasoning)
-        if reason_text is None:
-            summaries.append(name)
-        else:
-            summaries.append(f"{name}: {_compact_whitespace(reason_text)}")
-
-    tool_calls = event.get("tool_calls")
-    if isinstance(tool_calls, list):
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            name = _clean_string(
-                call.get("name") or call.get("tool") or call.get("function")
-            )
-            if name is None or _is_action_name(name):
-                continue
-
-            result = _clean_string(
-                call.get("result") or call.get("output") or call.get("content")
-            )
-            if result is None:
-                summaries.append(name)
-            else:
-                summaries.append(f"{name} -> {_compact_whitespace(result)}")
-    return [_truncate(summary, 260) for summary in summaries]
+    return RoundEntry(
+        round=round_value,
+        tools_exposed=tools_exposed,
+        reasoning=reasoning,
+        chosen_action=chosen_action,
+        error=error,
+        calls=tuple(calls),
+    )
 
 
-def _format_trace_text(action_counter: int, accumulator: JsonObject) -> str | None:
-    action = _clean_string(accumulator.get("chosen_action"))
-    round_value = _int_or_none(accumulator.get("round"))
-    reasoning = _clean_string(accumulator.get("reasoning"))
-    analysis_calls = _string_list(accumulator.get("analysis_calls"))
-    errors = _string_list(accumulator.get("errors"))
-
-    if action is None and reasoning is None and not analysis_calls and not errors:
-        return None
-
-    details = [f"step={action_counter:03d}"]
-    if action is not None:
-        details.append(f"action={action}")
-    if round_value is not None:
-        details.append(f"round={round_value}")
-
-    lines = ["VLM reasoning", " ".join(details)]
-    if reasoning is not None:
-        lines.extend(("", reasoning))
-    if analysis_calls:
-        lines.extend(("", "Analysis tools:"))
-        lines.extend(f"- {call}" for call in analysis_calls)
-    if errors:
-        lines.extend(("", "Errors:"))
-        lines.extend(f"- {error}" for error in errors)
-    return "\n".join(lines)
-
-
-def _reasoning_from_output_action(event: JsonObject, action_name: str) -> str | None:
-    for call in _output_function_calls(event):
-        if _clean_string(call.get("name")) != action_name:
-            continue
-        args = call.get("args")
-        if isinstance(args, dict):
-            return _clean_string(args.get("reasoning"))
-    return None
+def _classify_call(
+    name: str, chosen_action: str | None, tools_exposed: str | None
+) -> tuple[CallKind, bool]:
+    if _is_action_name(name):
+        return "action", chosen_action is not None and name == chosen_action
+    if name == "evolve_system_prompt" or tools_exposed == "evolution":
+        return "evolution", True
+    return "analysis", chosen_action is None
 
 
 def _output_function_calls(event: JsonObject) -> list[JsonObject]:
@@ -946,7 +1067,337 @@ def _output_function_calls(event: JsonObject) -> list[JsonObject]:
     function_calls = output.get("function_calls")
     if not isinstance(function_calls, list):
         return []
-    return [cast(JsonObject, call) for call in function_calls if isinstance(call, dict)]
+    return [
+        cast(JsonObject, call) for call in function_calls if isinstance(call, dict)
+    ]
+
+
+def enrich_rounds_with_trajectory(
+    rounds_by_step: dict[int, list[RoundEntry]],
+    trajectory_by_step: dict[int, list[JsonObject]],
+) -> dict[int, list[RoundEntry]]:
+    """Attach execution results from trajectory to matching analysis calls."""
+    enriched: dict[int, list[RoundEntry]] = {}
+    for action_counter, rounds in rounds_by_step.items():
+        traj_queue = list(trajectory_by_step.get(action_counter, []))
+        enriched[action_counter] = [
+            _enrich_round_calls(round_entry, traj_queue) for round_entry in rounds
+        ]
+    return enriched
+
+
+def _enrich_round_calls(
+    round_entry: RoundEntry, traj_queue: list[JsonObject]
+) -> RoundEntry:
+    new_calls: list[CallEntry] = []
+    for call in round_entry.calls:
+        if call.kind != "analysis" or not call.executed or not traj_queue:
+            new_calls.append(call)
+            continue
+        next_traj = traj_queue.pop(0)
+        if _clean_string(next_traj.get("name")) != call.name:
+            traj_queue.insert(0, next_traj)
+            new_calls.append(call)
+            continue
+        result = next_traj.get("result") if isinstance(next_traj.get("result"), dict) else None
+        new_calls.append(
+            replace(
+                call,
+                result=cast(JsonObject, result) if result is not None else None,
+                error=_clean_string(next_traj.get("error")),
+            )
+        )
+    return replace(round_entry, calls=tuple(new_calls))
+
+
+def build_reasoning_traces(
+    rounds_by_step: dict[int, list[RoundEntry]],
+    prompt_evolution_by_step: dict[int, PromptEvolutionEntry] | None = None,
+) -> dict[int, str]:
+    """Format the right-side panel text for each action_counter."""
+    evolution = prompt_evolution_by_step or {}
+    all_steps = set(rounds_by_step) | set(evolution)
+    output: dict[int, str] = {}
+    for action_counter in sorted(all_steps):
+        text = _format_step_panel(
+            action_counter,
+            rounds_by_step.get(action_counter, []),
+            evolution.get(action_counter),
+        )
+        if text is not None:
+            output[action_counter] = text
+    return output
+
+
+def _format_step_panel(
+    action_counter: int,
+    rounds: Sequence[RoundEntry],
+    evolution: PromptEvolutionEntry | None,
+) -> str | None:
+    if not rounds and evolution is None:
+        return None
+
+    chosen = next(
+        (entry.chosen_action for entry in rounds if entry.chosen_action), None
+    )
+    header_bits = [f"step={action_counter:03d}"]
+    if chosen is not None:
+        header_bits.append(f"action={chosen}")
+    if rounds:
+        header_bits.append(f"rounds={len(rounds)}")
+
+    lines: list[str] = ["VLM reasoning", " ".join(header_bits)]
+
+    if evolution is not None:
+        accepted = "accepted" if evolution.accepted else "rejected"
+        lines.extend(
+            ("", f"Prompt evolution gen={evolution.generation} [{accepted}]")
+        )
+        if evolution.validation_error is not None:
+            lines.append(
+                "validation_error: "
+                + _truncate(_compact_whitespace(evolution.validation_error), 220)
+            )
+
+    for round_entry in rounds:
+        suffix = (
+            f" ({round_entry.tools_exposed})" if round_entry.tools_exposed else ""
+        )
+        lines.extend(("", f"R{round_entry.round}{suffix}"))
+        if round_entry.reasoning is not None:
+            lines.append(_compact_whitespace(round_entry.reasoning))
+        if round_entry.error is not None:
+            lines.append(
+                "error: " + _truncate(_compact_whitespace(round_entry.error), 220)
+            )
+        for call in round_entry.calls:
+            lines.extend(_format_call_lines(call))
+
+    return "\n".join(lines)
+
+
+def _format_call_lines(call: CallEntry) -> list[str]:
+    if call.kind == "action":
+        return [f"> {call.name}"]
+
+    formatter = _CALL_FORMATTERS.get(call.name, _format_generic_call)
+    return formatter(call)
+
+
+def _status_suffix(call: CallEntry) -> str:
+    if not call.executed:
+        return " [skipped]"
+    if call.error:
+        return " [error]"
+    return ""
+
+
+_DETAIL_LIMITS: dict[str, int] = {
+    "reasoning": 400,
+    "description": 400,
+    "body": 600,
+    "instructions": 600,
+    "code": 600,
+    "task": 400,
+    "answer": 400,
+    "query": 200,
+    "args": 200,
+    "context": 200,
+    "stdout": 400,
+    "stderr": 400,
+    "result": 400,
+}
+
+
+def _append_detail(lines: list[str], label: str, value: Any) -> None:
+    text = _stringify_detail_value(value)
+    if text is None:
+        return
+    limit = _DETAIL_LIMITS.get(label, 300)
+    lines.append(f"    {label}: " + _truncate(text, limit))
+
+
+def _stringify_detail_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _compact_whitespace(value).strip() or None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        return ", ".join(str(item) for item in value)
+    if isinstance(value, dict):
+        if not value:
+            return None
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        except TypeError:
+            return str(value)
+    return _compact_whitespace(str(value))
+
+
+def _tag_suffix(args: JsonObject, result: JsonObject) -> str:
+    tags = args.get("tags") if isinstance(args.get("tags"), list) else result.get("tags")
+    if not isinstance(tags, list) or not tags:
+        return ""
+    return " [" + ",".join(str(tag) for tag in tags) + "]"
+
+
+def _format_process_skill(call: CallEntry) -> list[str]:
+    args, result = call.args, call.result or {}
+    op = _clean_string(args.get("operation")) or "?"
+    skill_name = _clean_string(args.get("name")) or _clean_string(result.get("name"))
+    skill_id = _clean_string(result.get("id")) or _clean_string(args.get("id")) or "?"
+    head = f"- process_skill {op} {skill_id}"
+    if skill_name:
+        head += f' "{skill_name}"'
+    head += _tag_suffix(args, result) + _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", args.get("reasoning"))
+    if op in {"add", "edit"}:
+        _append_detail(lines, "description", args.get("description"))
+        _append_detail(lines, "code", args.get("code"))
+    if op == "search":
+        _append_detail(lines, "query", args.get("query"))
+    _append_detail(lines, "error", call.error)
+    return lines
+
+
+def _format_run_skill(call: CallEntry) -> list[str]:
+    args, result = call.args, call.result or {}
+    skill_id = _clean_string(args.get("id")) or _clean_string(result.get("id")) or "?"
+    skill_name = _clean_string(result.get("name"))
+    head = f"- run_skill {skill_id}"
+    if skill_name:
+        head += f" ({skill_name})"
+    head += _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", args.get("reasoning"))
+    _append_detail(lines, "args", args.get("args"))
+    _append_detail(lines, "result", result.get("result"))
+    _append_detail(lines, "stdout", result.get("stdout"))
+    _append_detail(lines, "stderr", result.get("stderr"))
+    _append_detail(lines, "error", call.error or result.get("error"))
+    return lines
+
+
+def _format_process_memory(call: CallEntry) -> list[str]:
+    args, result = call.args, call.result or {}
+    op = _clean_string(args.get("operation")) or "?"
+    mem_id = _clean_string(result.get("id")) or _clean_string(args.get("id")) or "?"
+    title = _clean_string(args.get("title")) or _clean_string(result.get("title"))
+    head = f"- process_memory {op} {mem_id}"
+    if title:
+        head += f' "{title}"'
+    head += _tag_suffix(args, result) + _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", args.get("reasoning"))
+    if op in {"add", "edit"}:
+        _append_detail(lines, "body", args.get("body"))
+    if op == "search":
+        _append_detail(lines, "query", args.get("query"))
+    _append_detail(lines, "error", call.error)
+    return lines
+
+
+def _format_process_subagent(call: CallEntry) -> list[str]:
+    args, result = call.args, call.result or {}
+    op = _clean_string(args.get("operation")) or "?"
+    sub_name = _clean_string(args.get("name")) or _clean_string(result.get("name"))
+    sub_id = _clean_string(result.get("id")) or _clean_string(args.get("id")) or "?"
+    head = f"- process_subagent {op} {sub_id}"
+    if sub_name:
+        head += f' "{sub_name}"'
+    head += _tag_suffix(args, result) + _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", args.get("reasoning"))
+    if op in {"add", "edit"}:
+        _append_detail(lines, "description", args.get("description"))
+        _append_detail(lines, "instructions", args.get("instructions"))
+        _append_detail(lines, "allowed_tools", args.get("allowed_tools"))
+    if op == "search":
+        _append_detail(lines, "query", args.get("query"))
+    _append_detail(lines, "error", call.error)
+    return lines
+
+
+def _format_run_subagent(call: CallEntry) -> list[str]:
+    args, result = call.args, call.result or {}
+    sub_id = _clean_string(args.get("id")) or _clean_string(result.get("id")) or "?"
+    sub_name = _clean_string(result.get("name"))
+    head = f"- run_subagent {sub_id}"
+    if sub_name:
+        head += f" ({sub_name})"
+    rounds_used = result.get("rounds_used")
+    if rounds_used is not None:
+        head += f" rounds={rounds_used}"
+    head += _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", args.get("reasoning"))
+    _append_detail(lines, "task", args.get("task"))
+    _append_detail(lines, "context", args.get("context"))
+    _append_detail(lines, "result", result.get("result"))
+    _append_detail(lines, "warning", result.get("warning"))
+    _append_detail(lines, "error", call.error or result.get("error"))
+    return lines
+
+
+def _format_get_recent_trajectory(call: CallEntry) -> list[str]:
+    args, result = call.args, call.result or {}
+    limit = args.get("limit")
+    count = result.get("count")
+    head = "- get_recent_trajectory"
+    if limit is not None:
+        head += f"(limit={limit})"
+    if count is not None:
+        head += f" -> {count} steps"
+    head += _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", args.get("reasoning"))
+    _append_detail(lines, "error", call.error)
+    return lines
+
+
+def _format_run_code(call: CallEntry) -> list[str]:
+    args, result = call.args, call.result or {}
+    head = "- run_code" + _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", args.get("reasoning"))
+    _append_detail(lines, "code", args.get("code"))
+    _append_detail(lines, "args", args.get("args"))
+    _append_detail(lines, "result", result.get("result"))
+    _append_detail(lines, "stdout", result.get("stdout"))
+    _append_detail(lines, "stderr", result.get("stderr"))
+    _append_detail(lines, "error", call.error or result.get("error"))
+    return lines
+
+
+def _format_evolve_system_prompt(call: CallEntry) -> list[str]:
+    return ["- evolve_system_prompt" + _status_suffix(call)]
+
+
+def _format_generic_call(call: CallEntry) -> list[str]:
+    op = _clean_string(call.args.get("operation"))
+    head = f"- {call.name}"
+    if op is not None:
+        head += f" {op}"
+    head += _status_suffix(call)
+    lines = [head]
+    _append_detail(lines, "reasoning", call.args.get("reasoning"))
+    _append_detail(lines, "error", call.error)
+    return lines
+
+
+_CALL_FORMATTERS: dict[str, Any] = {
+    "process_skill": _format_process_skill,
+    "run_skill": _format_run_skill,
+    "process_memory": _format_process_memory,
+    "process_subagent": _format_process_subagent,
+    "run_subagent": _format_run_subagent,
+    "get_recent_trajectory": _format_get_recent_trajectory,
+    "run_code": _format_run_code,
+    "evolve_system_prompt": _format_evolve_system_prompt,
+}
 
 
 def _action_input_reasoning(data: JsonObject) -> str | None:
@@ -980,22 +1431,8 @@ def _clean_string(value: Any) -> str | None:
     return text or None
 
 
-def _string_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, str) and item.strip()]
-
-
-def _append_unique(accumulator: JsonObject, key: str, value: str) -> None:
-    values = accumulator.setdefault(key, [])
-    if not isinstance(values, list):
-        return
-    if value not in values:
-        values.append(value)
-
-
 def _is_action_name(name: str) -> bool:
-    return name in _ACTION_NAMES.values()
+    return name == "RESET" or name in _ACTION_NAMES.values()
 
 
 def _add_reasoning_panel(
@@ -1055,13 +1492,27 @@ def _draw_panel_text(
         lines[-1] = _fit_text_to_width(lines[-1], font, width, suffix="...")
 
     for line_index, line in enumerate(lines):
-        if line_index == 0 and line == "VLM reasoning":
-            fill = (255, 255, 255, 255)
-        elif line.startswith("step=") or line in {"Analysis tools:", "Errors:"}:
-            fill = (188, 207, 255, 255)
-        else:
-            fill = (226, 232, 240, 255)
+        fill = _panel_line_color(line_index, line)
         draw.text((x, y + line_index * line_height), line, fill=fill, font=font)
+
+
+_ROUND_HEADER_RE = re.compile(r"^R\d+( \([^()]+\))?$")
+
+
+def _panel_line_color(line_index: int, line: str) -> tuple[int, int, int, int]:
+    if line_index == 0 and line == "VLM reasoning":
+        return (255, 255, 255, 255)
+    if line.startswith("step=") or line.startswith("Prompt evolution"):
+        return (188, 207, 255, 255)
+    if _ROUND_HEADER_RE.match(line):
+        return (148, 199, 247, 255)
+    if line.startswith("> "):
+        return (255, 196, 138, 255)
+    if "[skipped]" in line:
+        return (140, 144, 152, 255)
+    if "[error]" in line or line.startswith("error:") or line.startswith("validation_error:"):
+        return (240, 130, 130, 255)
+    return (226, 232, 240, 255)
 
 
 def _wrap_text_to_width(text: str, font: Any, max_width: int) -> list[str]:
