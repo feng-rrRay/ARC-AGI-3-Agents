@@ -206,11 +206,15 @@ class GeminiBackend(VLMBackend):
                         "quota",
                         "rate",
                         "500",
+                        "502",
                         "503",
                         "504",
+                        "bad gateway",
                         "deadline",
                         "unavailable",
                         "internal",
+                        "timed out",
+                        "timeout",
                     )
                 )
                 if not transient or attempt == max_retries - 1:
