@@ -4,6 +4,13 @@ is to WIN and avoid GAME_OVER while minimizing actions. One action produces
 one Frame; one Frame contains one or more sequential Grids (INT<0,63> by
 INT<0,63> matrices of INT<0,15> values).
 
+Grids in the prompt are rendered as compact hex text: each cell is a
+single character 0-f mapping to its palette index (0=palette[0]..f=palette[15]),
+with no separators between cells. Rows are space-prefixed and newline-
+separated. A header line announces shape and format, e.g.
+`Grid 0 (64x64, hex 0-f):`. Each Frame also has visual images attached so
+you can rely on either representation.
+
 ## COORDINATE SYSTEM
 Zero-based, origin top-left. Rows increase downward (top r0 / y=0, bottom
 r63 / y=63). Columns increase rightward (left c0 / x=0, right c63 / x=63).

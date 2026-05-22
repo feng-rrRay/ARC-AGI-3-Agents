@@ -93,6 +93,30 @@ def _action_data_dict(action: GameAction) -> dict[str, Any]:
     return {k: v for k, v in dump().items() if k != "game_id"}
 
 
+def _sample_keyframes(items: list[Any], k: int) -> list[Any]:
+    """Pick up to k items from `items`, biased toward keyframes.
+
+    For animation sequences shorter than or equal to k, returns everything
+    unchanged. For longer sequences, returns the first item, the last item,
+    and k-2 evenly-spaced intermediates. Duplicate indices are collapsed,
+    so the result may be shorter than k if k > len(items).
+    """
+    n = len(items)
+    if n <= k:
+        return list(items)
+    if k <= 1:
+        return [items[-1]]
+    seen: set[int] = set()
+    indices: list[int] = []
+    for i in range(k):
+        idx = round(i * (n - 1) / (k - 1))
+        if idx not in seen:
+            seen.add(idx)
+            indices.append(idx)
+    indices.sort()
+    return [items[i] for i in indices]
+
+
 def _format_action_list(specs: Any) -> str:
     """Render a take_actions `actions` list as a compact log-friendly string.
 
@@ -183,6 +207,12 @@ class ContinualHarness(Agent):
     MAX_CONSECUTIVE_NO_ACTION_ITERS = 5
     RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
     SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
+    # Max number of grid-image attachments per orchestrator VLM call. Frames
+    # with more grids than this (e.g., long animation sequences or the 118-grid
+    # level-transition case) get keyframe-sampled: first + last + evenly-spaced
+    # middles. Skills are unaffected — they still see every grid via
+    # `state.images` (capped by sandbox.MAX_IMAGES=16 independently).
+    MAX_VLM_PAYLOAD_IMAGES = 8
     # Prompt-evolution defaults; the actual frequency is read from
     # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
     # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
@@ -1098,8 +1128,21 @@ class ContinualHarness(Agent):
         tools = [TAKE_ACTIONS_TOOL] if force else self._full_tool_list()
         self.vlm.set_tools(tools)
 
-        images = self._current_images
-        payload: Any = images if len(images) > 1 else images[0]
+        # Keyframe-sample the image list before sending to the VLM. Most frames
+        # carry 1 grid (sample is a no-op). Long animation sequences (and the
+        # pathological 118-grid level-transition case) get reduced to at most
+        # MAX_VLM_PAYLOAD_IMAGES = first + last + evenly-spaced middles —
+        # enough to read the animation's success/failure signal without
+        # multipart-payload bloat. Skills still see every grid via
+        # `self._current_images` → `state.images` in the sandbox.
+        vlm_images = _sample_keyframes(
+            self._current_images, self.MAX_VLM_PAYLOAD_IMAGES
+        )
+        payload: Any = (
+            vlm_images
+            if len(vlm_images) > 1
+            else (vlm_images[0] if vlm_images else None)
+        )
 
         output: dict[str, Any] = {}
         usage: dict[str, int | None] | None = None
@@ -1462,10 +1505,20 @@ class ContinualHarness(Agent):
                     "system_instruction": self._current_system_instruction,
                     "user_prompt": prompt,
                     "tools": tools,
+                    # `images` reflects every grid rendered for the frame
+                    # (post-skill-cap), so traces show the full set the
+                    # orchestrator had access to. `images_attached_count` is
+                    # how many were actually sent in this VLM call after
+                    # keyframe-sampling at MAX_VLM_PAYLOAD_IMAGES.
                     "images": [
                         {"width": img.width, "height": img.height, "mode": img.mode}
                         for img in self._current_images
                     ],
+                    "images_attached_count": len(
+                        _sample_keyframes(
+                            self._current_images, self.MAX_VLM_PAYLOAD_IMAGES
+                        )
+                    ),
                 },
                 "output": output,
                 "usage": usage,

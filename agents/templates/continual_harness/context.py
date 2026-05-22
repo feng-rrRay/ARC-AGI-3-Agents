@@ -11,13 +11,44 @@ from .models import ToolCallRecord
 from .prompts import HARNESS_USER_PROMPT
 
 
+_HEX_CHARS = "0123456789abcdef"
+
+
 def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
-    # Mirrors LLM.pretty_print_3d in llm_agents.py to keep frame rendering identical.
+    """Render a 3D palette-indexed grid stack as compact hex text.
+
+    Each cell value (an int in 0..15 mapping to the 16-colour ARC palette)
+    becomes one hex character; rows are space-free. This is ~3× denser than
+    the prior Python-list-repr format (~12 KB per 64×64 grid) at ~4 KB per
+    grid, which matters for multi-grid frames (animation sequences captured
+    during a single action). The model needs to know the format — see the
+    explanatory line in the system prompt and the per-frame header here.
+
+    Out-of-range cells (negative, >= 16, non-int) render as `?` so the
+    model can see corruption rather than crashing the render.
+    """
     lines: list[str] = []
     for i, block in enumerate(array_3d):
-        lines.append(f"Grid {i}:")
+        if not block:
+            lines.append(f"Grid {i}: (empty)")
+            lines.append("")
+            continue
+        height = len(block)
+        width = max((len(row) for row in block), default=0)
+        lines.append(f"Grid {i} ({height}x{width}, hex 0-f):")
         for row in block:
-            lines.append(f"  {row}")
+            chars = []
+            for v in row:
+                try:
+                    iv = int(v)
+                except (TypeError, ValueError):
+                    chars.append("?")
+                    continue
+                if 0 <= iv < 16:
+                    chars.append(_HEX_CHARS[iv])
+                else:
+                    chars.append("?")
+            lines.append("  " + "".join(chars))
         lines.append("")
     return "\n".join(lines)
 
