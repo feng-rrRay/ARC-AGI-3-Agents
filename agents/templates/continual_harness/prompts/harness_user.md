@@ -1,17 +1,4 @@
-# State:
-{state}
-
-# Score:
-{score}
-
-# Frame:
-{latest_frame}
-
-# Previous Action:
-{previous_action}
-
-# Previous Action Data:
-{previous_action_data}
-
-# TURN:
-Call exactly one action.
+## TURN
+Decide your next move: commit actions (`take_actions` or an engine-driving
+`run_skill`) or run analysis tools to inform the next turn. Keep responses
+to at most 3 tool calls, and predict each action's effect before committing.

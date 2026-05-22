@@ -291,7 +291,7 @@ def main() -> None:
     else:
         prompt_evolve_frequency = args.prompt_evolve_frequency
 
-    run_artifacts = create_run_artifacts(args.agent or "no-agent")
+    run_artifacts = create_run_artifacts(args.agent or "no-agent", game=args.game)
     export_run_env(run_artifacts)
 
     bootstrap_memory_raw = args.bootstrap_memory or os.getenv(

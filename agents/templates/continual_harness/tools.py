@@ -25,21 +25,21 @@ class FunctionCall:
 GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
     "name": "get_recent_trajectory",
     "description": (
-        "Return the FULL step history (reasoning + analysis tool calls + results) for this "
-        "game. The prompt already shows a compact one-line tail of the last few steps; call "
-        "this to reach further back and read the original reasoning for older steps. Each "
-        "call consumes one of your MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call budget."
+        "Return the FULL step history (reasoning + tool calls + results) for "
+        "this game. The prompt already shows a compact view of the last few "
+        "batches; call this to reach further back, see older reasoning, or "
+        "inspect partial-execution detail."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "reasoning": {
                 "type": "string",
-                "description": "Why the compact tail is insufficient and you need full detail. Required.",
+                "description": "Why the compact view isn't enough. Required.",
             },
             "limit": {
                 "type": "integer",
-                "description": "How many recent steps to retrieve (1-80). Defaults to 40.",
+                "description": "How many recent actions to retrieve (1-80). Defaults to 40.",
             },
         },
         "required": ["reasoning"],
@@ -50,14 +50,13 @@ GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
 PROCESS_MEMORY_TOOL: dict[str, Any] = {
     "name": "process_memory",
     "description": (
-        "Manage memory for this game. Memory persists for the current run by "
-        "default, and across runs when --bootstrap-memory is provided. The current "
-        "index is auto-injected into every prompt under ## LONG-TERM MEMORY "
-        "(id + title + tags); you only need this tool to mutate or to read full "
-        "bodies. Operations: add (title, body, tags?), edit (id, plus any of "
-        "title/body/tags), delete (id), search (query — substring over "
-        "title/body/tags; returns full bodies). Each call consumes one of your "
-        "MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call budget."
+        "Manage long-term memory for this game. Memory persists for the "
+        "current run by default, and across runs when --bootstrap-memory is "
+        "provided. The current index is auto-injected into every prompt "
+        "under ## LONG-TERM MEMORY (id + title + tags); you only need this "
+        "tool to mutate or to read full bodies. Operations: add (title, "
+        "body, tags?), edit (id, plus any of title/body/tags), delete (id), "
+        "search (query — substring over title/body/tags; returns full bodies)."
     ),
     "parameters": {
         "type": "object",
@@ -101,14 +100,14 @@ PROCESS_MEMORY_TOOL: dict[str, Any] = {
 PROCESS_SKILL_TOOL: dict[str, Any] = {
     "name": "process_skill",
     "description": (
-        "Manage saved code skills. Skills persist for the current run by default "
-        "(logs/<run-id>/skills.json) and across runs when --bootstrap-skills is "
-        "provided. The current registry is auto-injected as ## SKILLS (id + name "
-        "+ tags + first description line); call this tool to mutate or to read "
-        "full code via search. Operations: add (name, description, code, tags?), "
-        "edit (id + any of name/description/code/tags), delete (id), search "
-        "(substring over name+description+code+tags). Each call consumes one of "
-        "your MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call budget."
+        "Manage saved Python skills. Skills persist for the current run by "
+        "default (logs/<run-id>/skills.json) and across runs when "
+        "--bootstrap-skills is provided. The current registry is "
+        "auto-injected under ## SKILL LIBRARY (id + name + tags + first "
+        "description line); call this tool to mutate or to read full code "
+        "via search. Operations: add (name, description, code, tags?), edit "
+        "(id + any of name/description/code/tags), delete (id), search "
+        "(substring over name+description+code+tags)."
     ),
     "parameters": {
         "type": "object",
@@ -156,12 +155,29 @@ PROCESS_SKILL_TOOL: dict[str, Any] = {
 RUN_SKILL_TOOL: dict[str, Any] = {
     "name": "run_skill",
     "description": (
-        "Execute a saved skill by id in a subprocess sandbox. The skill receives "
-        "JSON-only state (latest_frame, recent_trajectory, memory_entries, "
-        "skill_entries) and your args dict, may set result = ... to return data, "
-        "and CANNOT commit ARC actions or access the file system / network. "
-        "Returns {success, result?, stdout, stderr?, error?}. 5s wall-clock cap. "
-        "Each call consumes one of your MAX_ANALYSIS_CALLS_PER_STEP=5 budget."
+        "Execute a saved skill by id in a subprocess sandbox. The skill "
+        "receives `state` (latest_frame, recent_trajectory, memory_entries, "
+        "skill_entries, images) and your `args` dict. It may set `result = ...` "
+        "to return data.\n\n"
+        "`state.images` is a list of PIL.Image objects pre-rendered from "
+        "`latest_frame.frame` (one image per grid layer; capped at 16). "
+        "Use the `render_grid(grid_2d)` and `render_grids(grids_3d)` "
+        "helpers (in skill globals) to render any other grid data — for "
+        "example, the post-action `last_frame.frame` returned by a "
+        "tools['take_actions'] RPC.\n\n"
+        "Skills CAN drive the engine inline by calling "
+        "tools['take_actions'](actions=[...]) — this RPCs back to the "
+        "harness, executes the actions, and returns {executed_count, "
+        "last_frame, terminal, state, score, available_actions} so the "
+        "skill can read the new frame and branch on the result. Use this "
+        "for deterministic sub-routines (pathfinding, scanning loops, "
+        "etc.) where one VLM call per action would be wasteful.\n\n"
+        "Sandbox: 30s wall-clock cap; no filesystem or network; no `import` "
+        "statements in user code. Pre-bound modules: math, json, re, "
+        "collections, itertools, functools, statistics, copy, dataclasses, "
+        "hashlib, random; plus numpy as `np` (with file-I/O removed) and "
+        "Pillow as `Image`, `ImageDraw`, `ImageFilter`, `ImageOps`, "
+        "`ImageChops`."
     ),
     "parameters": {
         "type": "object",
@@ -187,13 +203,14 @@ RUN_SKILL_TOOL: dict[str, Any] = {
 RUN_CODE_TOOL: dict[str, Any] = {
     "name": "run_code",
     "description": (
-        "Execute an ad-hoc Python snippet in the same sandbox as run_skill (use "
-        "for one-off analysis before saving as a skill). Allowed modules: math, "
-        "json, re, collections, itertools, functools, statistics, copy, "
-        "dataclasses, hashlib, random. NO os/sys/subprocess/io/network. Read "
-        "state.latest_frame / state.recent_trajectory / state.memory_entries / "
-        "state.skill_entries. Set result = ... to return data. 5s wall-clock "
-        "cap. Each call consumes one MAX_ANALYSIS_CALLS_PER_STEP=5 budget."
+        "Execute an ad-hoc Python snippet in the same sandbox as run_skill "
+        "(use for one-off analysis before saving as a skill). Allowed "
+        "modules: math, json, re, collections, itertools, functools, "
+        "statistics, copy, dataclasses, hashlib, random. NO "
+        "os/sys/subprocess/io/network. Read state.latest_frame / "
+        "state.recent_trajectory / state.memory_entries / "
+        "state.skill_entries. Set `result = ...` to return data. 30s "
+        "wall-clock cap."
     ),
     "parameters": {
         "type": "object",
@@ -237,15 +254,16 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
         "Manage the subagent registry. A subagent is a focused inner agent "
         "registered with a system prompt (instructions) + an allowlist of "
         "tools it can call during its bounded inner loop. The orchestrator "
-        "invokes one via run_subagent(id, task). Subagents cannot commit ARC "
-        "actions and cannot invoke other subagents. The current registry is "
-        "auto-injected as ## SUBAGENTS (id + name + allowed_tools + first "
-        "description line). Operations: add (name, description, instructions, "
-        "allowed_tools, tags?), edit (id + any of name/description/"
-        "instructions/allowed_tools/tags), delete (id), search (substring over "
-        "name+description+instructions+tags). If allowed_tools is omitted on "
-        "add, it defaults to get_recent_trajectory. Each call consumes one "
-        "of your MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call budget."
+        "invokes one via run_subagent(id, task). Subagents cannot directly "
+        "commit ARC actions and cannot invoke other subagents — they return "
+        "text the orchestrator may use to inform its own take_actions call. "
+        "The current registry is auto-injected under ## SUBAGENT REGISTRY "
+        "(id + name + allowed_tools + first description line). Operations: "
+        "add (name, description, instructions, allowed_tools, tags?), edit "
+        "(id + any of name/description/instructions/allowed_tools/tags), "
+        "delete (id), search (substring over "
+        "name+description+instructions+tags). If allowed_tools is omitted "
+        "on add, it defaults to get_recent_trajectory."
     ),
     "parameters": {
         "type": "object",
@@ -305,16 +323,15 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
 RUN_SUBAGENT_TOOL: dict[str, Any] = {
     "name": "run_subagent",
     "description": (
-        "Invoke a registered subagent on a single task. The subagent runs its "
-        "own bounded inner loop (up to MAX_SUBAGENT_ROUNDS_PER_CALL=20) using "
-        "only the tools in its allowlist, then calls subagent_return(answer, "
-        "status) to terminate. Returns {success, result, rounds_used, id, "
-        "name, version, warning?, error?, steps}. Each step documents tool "
-        "usage and parameters. Mutations the subagent makes to memory / skills "
-        "via its allowed tools persist immediately. The subagent CANNOT commit "
-        "ARC actions; the orchestrator still owns action selection. Each call "
-        "consumes one of your MAX_ANALYSIS_CALLS_PER_STEP=5 analysis-call "
-        "budget, plus counts against MAX_SUBAGENT_CALLS_PER_STEP=1."
+        "Invoke a registered subagent on a single task. The subagent runs "
+        "its own bounded inner loop (up to MAX_SUBAGENT_ROUNDS_PER_CALL=20) "
+        "using only the tools in its allowlist, then calls "
+        "subagent_return(answer, status) to terminate. Returns {success, "
+        "result, rounds_used, id, name, version, warning?, error?, steps}. "
+        "Mutations the subagent makes to memory / skills via its allowed "
+        "tools persist immediately. The subagent CANNOT directly commit "
+        "ARC actions — the orchestrator still owns take_actions. Counts "
+        "against MAX_SUBAGENT_CALLS_PER_STEP=1 per outer iteration."
     ),
     "parameters": {
         "type": "object",
@@ -491,12 +508,100 @@ def extract_function_calls(response: Any) -> list[FunctionCall]:
 
 
 def is_action_tool(name: str) -> bool:
-    """True iff `name` is a GameAction enum name."""
+    """True iff `name` is a GameAction enum name.
+
+    Retained as a stray-call detector: in the new design the orchestrator
+    exposes a single `take_actions` tool instead of one per GameAction. If the
+    model still emits a bare ACTION1..ACTION6 call, the harness logs an error
+    record so the model can self-correct on the next round.
+    """
     try:
         GameAction.from_name(name)
     except ValueError:
         return False
     return True
+
+
+# --- Single unified action tool ----------------------------------------------
+# Used by the orchestrator VLM (function call) AND by skills via the sandbox
+# `tools["take_actions"]` callback. Same name everywhere. The orchestrator's
+# tool surface exposes TAKE_ACTIONS_TOOL; the sandbox builds an equivalent
+# callable. See feedback-tool-unification memory.
+
+TAKE_ACTIONS = "take_actions"
+
+TAKE_ACTIONS_TOOL: dict[str, Any] = {
+    "name": TAKE_ACTIONS,
+    "description": (
+        "Advance the game by executing a list of one or more actions in order. "
+        "Each action runs synchronously; after each one the harness records "
+        "the resulting frame. If a step becomes invalid mid-sequence because "
+        "the world changed (level transition, available_actions changed, or "
+        "the game ended), the remaining steps are skipped and you'll see a "
+        "partial-execution block in the next prompt's history.\n\n"
+        "Action key: ACTION1 = Up/W · ACTION2 = Down/S · ACTION3 = Left/A · "
+        "ACTION4 = Right/D · ACTION5 = Enter/Space/Delete · ACTION6 = Click "
+        "(requires x, y in 0..63) · ACTION7 = Undo/Back. The current frame's "
+        "prompt lists which of these are actually available this turn — "
+        "calling an unavailable action will be rejected.\n\n"
+        "Guideline: keep the list short (typically 1-8 actions). Include "
+        "enough actions to make real progress, but not so many that the late "
+        "steps depend on conditions you can't reasonably predict.\n\n"
+        "Skills may also drive the engine inline by calling "
+        "tools['take_actions'](actions=[...]) inside their code; that call "
+        "returns the resulting frame so the skill can react before the next "
+        "step."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": (
+                    "Why this sequence of actions is the right next step. Required."
+                ),
+            },
+            "actions": {
+                "type": "array",
+                "minItems": 1,
+                # No maxItems on purpose: the soft length guideline lives in
+                # the description / system prompt only (see feedback-soft-limits).
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "ARC GameAction name (ACTION1..ACTION6).",
+                        },
+                        "x": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 63,
+                            "description": "X coordinate for ACTION6 (column).",
+                        },
+                        "y": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 63,
+                            "description": "Y coordinate for ACTION6 (row).",
+                        },
+                    },
+                    "required": ["name"],
+                },
+                "description": (
+                    "Ordered list of actions. Each entry must include `name`; "
+                    "ACTION6 additionally requires `x` and `y` in 0-63."
+                ),
+            },
+        },
+        "required": ["reasoning", "actions"],
+    },
+}
+
+
+def is_take_actions_call(name: str) -> bool:
+    """True iff `name` is the unified action-commit tool."""
+    return name == TAKE_ACTIONS
 
 
 # --- Router -------------------------------------------------------------------

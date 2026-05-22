@@ -242,67 +242,236 @@ def _action_with_data(rec: dict[str, Any]) -> str:
     return f"{action}{{{items}}}"
 
 
+def _short_action(rec: dict[str, Any]) -> str:
+    """Short renderable action label: ACTION1 or ACTION6(12,30)."""
+    name = rec.get("chosen_action") or "FAIL"
+    data = rec.get("chosen_action_data") or {}
+    if not data:
+        return name
+    if "x" in data and "y" in data and len(data) == 2:
+        return f"{name}({data['x']},{data['y']})"
+    items = ",".join(f"{k}={v}" for k, v in data.items())
+    return f"{name}({items})"
+
+
+def _per_action_line(
+    rec: dict[str, Any],
+    frames: Sequence[Any] | None,
+) -> str:
+    """Render one action row with score delta + frame-delta tag."""
+    ac = rec.get("action_counter")
+    pre_grid: list[list[int]] | None = None
+    post_grid: list[list[int]] | None = None
+    if frames is not None and isinstance(ac, int):
+        if 0 <= ac < len(frames):
+            pre_grid = _grid_from_frame(frames[ac])
+        if 0 <= ac + 1 < len(frames):
+            post_grid = _grid_from_frame(frames[ac + 1])
+    delta = _frame_delta(pre_grid, post_grid)
+
+    pre_score = rec.get("score")
+    score_delta = rec.get("score_delta")
+    if isinstance(pre_score, int) and isinstance(score_delta, int):
+        score_label = f"score {pre_score}->{pre_score + score_delta}"
+    elif isinstance(pre_score, int):
+        score_label = f"score {pre_score}->?"
+    else:
+        score_label = "score ?"
+
+    # Promote LEVEL_UP / STATE-change tags above the cell-change tag.
+    if isinstance(score_delta, int) and score_delta > 0:
+        tag = f"LEVEL_UP +{score_delta}"
+    else:
+        state_after = rec.get("state_after")
+        if state_after and state_after != rec.get("state"):
+            tag = f"STATE->{state_after}"
+        elif delta["kind"] == "CHANGE":
+            tag = _format_change_delta(delta)
+        else:
+            tag = str(delta["kind"])
+
+    action = _short_action(rec)
+    return f"    {action:<18}  {score_label:<14}  {tag}"
+
+
+def _group_into_batches(
+    records: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Group consecutive rows by batch_id.
+
+    A None batch_id (older / auto_reset / legacy rows) forms its own
+    single-row batch. Consecutive rows sharing a non-None batch_id are
+    grouped together.
+    """
+    batches: list[list[dict[str, Any]]] = []
+    for rec in records:
+        bid = rec.get("batch_id")
+        if (
+            batches
+            and bid is not None
+            and batches[-1]
+            and batches[-1][-1].get("batch_id") == bid
+        ):
+            batches[-1].append(rec)
+        else:
+            batches.append([rec])
+    return batches
+
+
+def _render_batch_block(
+    batch: list[dict[str, Any]],
+    frames: Sequence[Any] | None,
+) -> str:
+    """Render one batch (1+ consecutive same-batch_id rows) as a block."""
+    if not batch:
+        return ""
+    first = batch[0]
+    source = first.get("source") or "vlm"
+    bid = first.get("batch_id") or "-"
+    step = first.get("action_counter")
+    skill_id = first.get("skill_id")
+
+    # Header line.
+    header_bits = [f"batch {bid}", f"step {step}", f"source={source}"]
+    if source == "run_skill" and skill_id:
+        header_bits[-1] = f"source=run_skill {skill_id}"
+    header = "[" + " | ".join(header_bits) + "]"
+
+    # Abort marker if batch_total > number of executed rows in this batch.
+    total = first.get("batch_total")
+    executed = len(batch)
+    abort_suffix = ""
+    if isinstance(total, int) and total > executed:
+        abort_suffix = f"  ⚠ ABORTED at {executed}/{total}"
+
+    lines: list[str] = [header + abort_suffix]
+
+    reasoning = first.get("batch_reasoning") or first.get("reasoning")
+    if reasoning:
+        # Single-line reasoning; collapse internal newlines.
+        compact = " ".join(str(reasoning).split())
+        if len(compact) > 220:
+            compact = compact[:217] + "..."
+        lines.append(f"  reasoning: {compact!r}")
+
+    if isinstance(total, int):
+        lines.append(f"  executed {executed}/{total}:")
+    elif executed > 1:
+        lines.append(f"  executed {executed}:")
+    else:
+        lines.append("  executed:")
+
+    for rec in batch:
+        lines.append(_per_action_line(rec, frames))
+
+    # Show rejection notes only on the head (if present) — they all live there.
+    rejected = first.get("batch_rejected") or []
+    if rejected:
+        for r in rejected[:4]:
+            reason = r.get("reason") if isinstance(r, dict) else str(r)
+            pos = r.get("position") if isinstance(r, dict) else "?"
+            lines.append(f"    [rejected at position {pos}: {reason}]")
+        if len(rejected) > 4:
+            lines.append(f"    [+{len(rejected) - 4} more rejected]")
+
+    if isinstance(total, int) and total > executed:
+        skipped = total - executed
+        lines.append(f"    [+{skipped} step(s) skipped after partial-execution abort]")
+
+    return "\n".join(lines)
+
+
 def format_compact_history(
     records: Iterable[dict[str, Any]],
     frames: Sequence[Any] | None = None,
     max_chars: int = 12000,
-    reasoning_chars: int | None = None,
+    max_batches: int = 5,
+    reasoning_chars: int | None = None,  # kept for backward-compat; ignored
 ) -> str:
-    """ONE line per step with action+data and effect tag.
+    """Batch-grouped action history, last `max_batches` batches.
 
     `frames` is the per-step frame history with frames[i] = pre-action-i and
-    frames[i+1] = post-action-i. When provided, each row carries a CHANGE/NO_OP/
-    LEVEL_UP/STATE tag derived from the frame delta. When omitted, the tag falls
-    back to UNKNOWN.
+    frames[i+1] = post-action-i. When provided, each row carries a CHANGE/
+    NO_OP/LEVEL_UP/STATE tag derived from the frame delta plus score
+    transition. Without frames, only score/state info is shown.
 
-    Truncation drops the OLDEST rows until total chars fit `max_chars`.
+    Truncation drops the OLDEST batches until total chars fit `max_chars`.
     """
-    records = list(records)
-    if not records:
+    del reasoning_chars  # signature kept for callers; new layout chooses its own width
+    record_list = [r for r in records if isinstance(r, dict)]
+    if not record_list:
         return "No previous actions recorded."
 
-    rows: list[str] = []
-    prev: dict[str, Any] | None = None
-    for rec in records:
-        ac = rec.get("action_counter")
-        pre_grid: list[list[int]] | None = None
-        post_grid: list[list[int]] | None = None
-        if frames is not None and isinstance(ac, int):
-            if 0 <= ac < len(frames):
-                pre_grid = _grid_from_frame(frames[ac])
-            if 0 <= ac + 1 < len(frames):
-                post_grid = _grid_from_frame(frames[ac + 1])
-        delta = _frame_delta(pre_grid, post_grid)
-        tag = _effect_tag(rec, prev, delta)
+    batches = _group_into_batches(record_list)
+    if len(batches) > max_batches:
+        batches = batches[-max_batches:]
 
-        rows.append(f"[{ac}] {_action_with_data(rec):<22}  {tag}")
-        prev = rec
-
-    while rows and len("\n".join(rows)) > max_chars:
-        rows.pop(0)
-    return "\n".join(rows)
+    blocks = [_render_batch_block(b, frames) for b in batches]
+    while blocks and len("\n\n".join(blocks)) > max_chars:
+        blocks.pop(0)
+    return "\n\n".join(blocks) if blocks else "No previous actions recorded."
 
 
 def format_full_history(
     records: Iterable[dict[str, Any]], max_chars: int = 4000
 ) -> str:
-    """MULTI-line per step. Returned by get_recent_trajectory; includes reasoning + tool calls."""
-    rows: list[str] = []
-    for rec in records:
-        rows.append(
-            f"[{rec.get('action_counter')}] state={rec.get('state')} "
-            f"score={rec.get('score')} action={rec.get('chosen_action')} "
-            f"data={rec.get('chosen_action_data') or {}}"
-        )
-        if rec.get("reasoning"):
-            rows.append(f"  why: {rec['reasoning']}")
-        for call in rec.get("tool_calls", []) or []:
-            rows.append(f"  tool: {call.get('name')} args={call.get('args')}")
-            if call.get("result") is not None:
-                rendered = json.dumps(call["result"], default=str)
-                rows.append(f"    result: {rendered[:300]}")
-    if not rows:
+    """Full per-action detail with reasoning + tool calls, grouped by batch.
+
+    Returned by `get_recent_trajectory`. Drops oldest batches to fit `max_chars`.
+    """
+    record_list = [r for r in records if isinstance(r, dict)]
+    if not record_list:
         return "No previous actions recorded."
-    while rows and len("\n".join(rows)) > max_chars:
-        rows.pop(0)
-    return "\n".join(rows)
+
+    batches = _group_into_batches(record_list)
+    blocks: list[str] = []
+
+    for batch in batches:
+        first = batch[0]
+        source = first.get("source") or "vlm"
+        bid = first.get("batch_id") or "-"
+        step = first.get("action_counter")
+        header = f"[batch {bid} | step {step} | source={source}]"
+        if source == "run_skill" and first.get("skill_id"):
+            header = f"[batch {bid} | step {step} | source=run_skill {first['skill_id']}]"
+
+        total = first.get("batch_total")
+        executed = len(batch)
+        if isinstance(total, int) and total > executed:
+            header += f"  ⚠ ABORTED at {executed}/{total}"
+
+        block_lines = [header]
+        reasoning = first.get("batch_reasoning") or first.get("reasoning")
+        if reasoning:
+            block_lines.append(f"  reasoning: {reasoning}")
+
+        for rec in batch:
+            ac = rec.get("action_counter")
+            block_lines.append(
+                f"  [{ac}] state={rec.get('state')}->"
+                f"{rec.get('state_after') or rec.get('state')} "
+                f"score={rec.get('score')}->"
+                f"{(rec.get('score') or 0) + (rec.get('score_delta') or 0)} "
+                f"action={_short_action(rec)}"
+            )
+            if rec.get("reasoning") and rec is not first:
+                block_lines.append(f"    why: {rec['reasoning']}")
+            for call in rec.get("tool_calls", []) or []:
+                block_lines.append(
+                    f"    tool: {call.get('name')} args={call.get('args')}"
+                )
+                if call.get("result") is not None:
+                    rendered = json.dumps(call["result"], default=str)
+                    block_lines.append(f"      result: {rendered[:300]}")
+
+        rejected = first.get("batch_rejected") or []
+        for r in rejected:
+            reason = r.get("reason") if isinstance(r, dict) else str(r)
+            pos = r.get("position") if isinstance(r, dict) else "?"
+            block_lines.append(f"  [rejected pos {pos}: {reason}]")
+
+        blocks.append("\n".join(block_lines))
+
+    while blocks and len("\n\n".join(blocks)) > max_chars:
+        blocks.pop(0)
+    return "\n\n".join(blocks)

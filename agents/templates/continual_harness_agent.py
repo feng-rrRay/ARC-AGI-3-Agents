@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+import uuid
 from dataclasses import asdict
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
 
 from ..agent import Agent
-from .continual_harness.context import build_action_prompt, build_subagent_prompt
+from ..tracing import trace_agent_session
+from .continual_harness.context import build_subagent_prompt, build_working_prompt
 from .continual_harness.helpers import (
-    _action_from_name,
     available_game_actions,
-    build_action_tools,
     frame_to_images,
+    validate_action_sequence,
 )
 from .continual_harness.memory import (
     MemoryStore,
@@ -53,6 +55,8 @@ from .continual_harness.tools import (
     PROCESS_SUBAGENT_TOOL,
     RUN_SKILL_TOOL,
     RUN_SUBAGENT_TOOL,
+    TAKE_ACTIONS,
+    TAKE_ACTIONS_TOOL,
     ContinualToolRouter,
     build_analysis_tools,
     build_subagent_tools,
@@ -60,6 +64,7 @@ from .continual_harness.tools import (
     is_action_tool,
     is_evolve_prompt_call,
     is_subagent_return_call,
+    is_take_actions_call,
     render_tool_results,
 )
 from .continual_harness.trace import (
@@ -88,6 +93,48 @@ def _action_data_dict(action: GameAction) -> dict[str, Any]:
     return {k: v for k, v in dump().items() if k != "game_id"}
 
 
+def _format_action_list(specs: Any) -> str:
+    """Render a take_actions `actions` list as a compact log-friendly string.
+
+    Output looks like `[A1,A1,A6(12,30),A5]` (with each item truncated to the
+    short ARC action label). Returns "[?]" if the input isn't a list.
+    """
+    if not isinstance(specs, list):
+        return "[?]"
+    parts: list[str] = []
+    for item in specs:
+        if not isinstance(item, dict):
+            parts.append("?")
+            continue
+        name = str(item.get("name") or "?")
+        # Compact ACTION1 -> A1, ACTION6 -> A6 etc. for log readability.
+        short = name
+        if name.startswith("ACTION") and name[6:].isdigit():
+            short = f"A{name[6:]}"
+        if "x" in item and "y" in item:
+            parts.append(f"{short}({item['x']},{item['y']})")
+        else:
+            parts.append(short)
+    return "[" + ",".join(parts) + "]"
+
+
+def _safe_frame_dump(frame: FrameData) -> dict[str, Any]:
+    """JSON-safe dump of a FrameData for return to a sandboxed skill.
+
+    Falls back to a hand-built dict if model_dump fails (defensive — same
+    pattern used when building the sandbox state at the top of an iter).
+    """
+    try:
+        return frame.model_dump(mode="json")
+    except (AttributeError, TypeError):
+        return {
+            "state": frame.state.name,
+            "score": frame.levels_completed,
+            "frame": frame.frame,
+            "available_actions": list(frame.available_actions),
+        }
+
+
 def _optional_str_list_arg(args: dict[str, Any], key: str) -> list[str] | None:
     if key not in args or args[key] is None:
         return None
@@ -100,28 +147,45 @@ def _optional_str_list_arg(args: dict[str, Any], key: str) -> list[str] | None:
 
 
 class ContinualHarness(Agent):
-    """Single-game VLM agent with a bounded multi-round tool router.
+    """Single-game VLM agent: one VLM call per outer iteration, unified `take_actions`.
 
-    Each step the VLM may run up to MAX_TOOL_ROUNDS rounds; in each round it
-    can call any subset of analysis tools (currently get_recent_trajectory) or
-    commit to an ARC action. A per-step analysis-call budget and a forced-action
-    final round guarantee that every step ends with a GameAction or RuntimeError.
+    Overrides `Agent.main()` to drive the engine directly. Each outer iteration:
+      1. If state is NOT_PLAYED or GAME_OVER, emit RESET and continue.
+      2. Maybe evolve the system prompt (boundary-gated by action_counter).
+      3. Make ONE VLM call via `_vlm_loop_inner`. The response may contain
+         analysis tool calls (process_memory, run_skill, etc.) and/or one
+         `take_actions(actions=[...])` call. All are dispatched in emission
+         order. take_actions executes its action list synchronously.
+      4. If any actions were executed (orchestrator OR via a skill's inline
+         tools["take_actions"] RPC), clear the carried tool-result block.
+         Otherwise carry results forward to the next iteration's prompt
+         (multi-round thinking across iterations).
+      5. If too many consecutive iterations passed without action, force-mode
+         the next iter: only take_actions exposed, with a BACKSTOP block.
+
+    `choose_action` is unused (stubbed); the abstract method is satisfied but
+    the engine is driven from `main()`.
     """
 
     MAX_ACTIONS = 1000
     MODEL = "gemini-3.1-pro-preview"  # default; override via GEMINI_MODEL
-    MAX_TOOL_ROUNDS = 3  # VLM round-trips per step
-    MAX_ANALYSIS_CALLS_PER_STEP = 5  # total analysis tool calls per step
-    HISTORY_WINDOW = 5  # max trajectory rows fed into the auto-injected tail
-    HISTORY_MAX_CHARS = 12000  # ~4k tokens budget for the RECENT STEPS block
+    HISTORY_MAX_CHARS = 12000  # budget for the RECENT HISTORY block
+    HISTORY_BATCH_WINDOW = 5  # last N batches shown in compact history
     FULL_HISTORY_DEFAULT_LIMIT = 40
-    FULL_HISTORY_MAX_LIMIT = 80  # = MAX_ACTIONS, so the model can request the whole run
+    FULL_HISTORY_MAX_LIMIT = 80
     MAX_SUBAGENT_CALLS_PER_STEP = 1  # distinct run_subagent invocations per outer step
     MAX_SUBAGENT_ROUNDS_PER_CALL = 20  # inner VLM rounds per invocation
     SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
+    # No-action-iteration backstop: after this many consecutive outer iters with
+    # zero actions executed, the next iter is force-mode (only take_actions
+    # exposed + BACKSTOP block in prompt). If that still produces no action,
+    # RuntimeError surfaces.
+    MAX_CONSECUTIVE_NO_ACTION_ITERS = 5
+    RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
+    SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
     # Prompt-evolution defaults; the actual frequency is read from
     # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
-    # --prompt-evolve-frequency). 0 disables; positive N means every N steps.
+    # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
     DEFAULT_PROMPT_EVOLVE_FREQUENCY = 25
     PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
     EVOLUTION_TRAJECTORY_WINDOW = 25  # how many recent steps the meta-call sees
@@ -361,14 +425,31 @@ class ContinualHarness(Agent):
                     "error": f"no skill with id={skill_id}",
                 }
             state = self._current_sandbox_state or SandboxState()
-            out = run_python_snippet(
-                skill.code,
-                state=state,
-                args=dict(args.get("args") or {}),
-            )
+
+            # Per-skill sandbox bookkeeping. The on_rpc callback (self._sandbox_rpc)
+            # uses these to tag trajectory rows and to enforce the terminal-state
+            # latch: once an action returns WIN/GAME_OVER, subsequent RPCs from
+            # the same skill are rejected so the skill must exit.
+            self._sandbox_terminal_seen = False
+            self._sandbox_skill_id = skill_id
+            actions_before = self.action_counter
+            try:
+                out = run_python_snippet(
+                    skill.code,
+                    state=state,
+                    args=dict(args.get("args") or {}),
+                    images=self._current_images,
+                    timeout_s=self.SKILL_TIMEOUT_S,
+                    on_rpc=self._sandbox_rpc,
+                )
+            finally:
+                self._sandbox_skill_id = None
+                self._sandbox_terminal_seen = False
+
             out["id"] = skill_id
             out["name"] = skill.name
             out["version"] = skill.version
+            out["actions_taken_inline"] = self.action_counter - actions_before
             return out
 
         # NOTE: run_code is intentionally NOT registered as a handler. It was
@@ -384,14 +465,31 @@ class ContinualHarness(Agent):
         # to run-local storage under logs/<run_id>/subagents.json.
         self.subagents = SubagentStore(active_subagent_path(), game_id=self.game_id)
 
-        # Per-step state used by _handle_run_subagent. Set at the top of every
-        # choose_action() so each subagent invocation in that step sees the same
-        # frame, images, outer-round index, and shares a single per-step call
-        # counter.
+        # Per-iteration state used by _handle_run_subagent. Set at the top of
+        # every _vlm_loop_inner call so any subagent invocation in that
+        # iteration sees the live frame, images, and VLM-call counter, and
+        # shares a single per-iteration call counter.
         self._current_latest_frame: FrameData | None = None
         self._current_images: list[Any] = []
         self._current_outer_round: int = 0
         self._subagent_call_count: int = 0
+
+        # Cross-iteration state for the new VLM-call-driven loop.
+        # `_recent_tool_results` carries forward analysis-tool outputs from one
+        # outer iteration to the next (PokeAgent-style — cleared on action).
+        # `_consecutive_no_action_iters` drives the backstop force-mode.
+        # `_consecutive_vlm_errors` is bookkeeping for hard failure detection.
+        # `_sandbox_*` state is set per-skill by _handle_run_skill and read by
+        # `_sandbox_rpc` to gate take_actions RPCs.
+        # `_batch_counter` mints unique batch IDs for tagging trajectory rows.
+        # `_vlm_call_count` is a monotonic counter set on `_current_outer_round`.
+        self._recent_tool_results: list[ToolCallRecord] = []
+        self._consecutive_no_action_iters: int = 0
+        self._consecutive_vlm_errors: int = 0
+        self._sandbox_terminal_seen: bool = False
+        self._sandbox_skill_id: str | None = None
+        self._batch_counter: int = 0
+        self._vlm_call_count: int = 0
 
         def _handle_process_subagent(args: dict[str, Any]) -> dict[str, Any]:
             op = (args.get("operation") or "").strip().lower()
@@ -897,47 +995,90 @@ class ContinualHarness(Agent):
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        # Base loop calls choose_action even on terminal states; reset first.
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            return GameAction.RESET
+        # Abstract on `Agent`; satisfied here as a stub. ContinualHarness
+        # drives the engine via the overridden `main()` and never calls
+        # `choose_action`. If something does call it (e.g. an external
+        # driver), surface that loudly.
+        raise NotImplementedError(
+            "ContinualHarness drives the engine via main(); "
+            "choose_action is unused."
+        )
 
-        # Prompt-evolution hook: fires BEFORE the normal round loop so any new
-        # system instruction is in effect for this step's VLM calls. Guarded
-        # against re-firing at the same action_counter and against frequency=0.
-        if (
-            self._prompt_evolve_frequency > 0
-            and self.action_counter > 0
-            and self.action_counter % self._prompt_evolve_frequency == 0
-            and self._last_evolution_step != self.action_counter
+    # ------------------------------------------------------------------
+    # Main loop — overrides Agent.main() with @trace_agent_session re-applied.
+    # ------------------------------------------------------------------
+
+    @trace_agent_session
+    def main(self) -> None:
+        self.timer = time.time()
+        while (
+            not self.is_done(self.frames, self.frames[-1])
+            and self.action_counter <= self.MAX_ACTIONS
         ):
-            self._last_evolution_step = self.action_counter
-            self._evolve_system_prompt(latest_frame)
+            latest_frame = self.frames[-1]
 
-        available = available_game_actions(latest_frame.available_actions)
-        action_tools = build_action_tools(available)
-        analysis_tools = list(build_analysis_tools())
-        analysis_tools.append(PROCESS_MEMORY_TOOL)
-        # run_code intentionally removed — see _handle_run_code note in __init__.
-        analysis_tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL])
-        analysis_tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])
-        full_tools = action_tools + analysis_tools
-        self.vlm.set_tools(full_tools)
-        current_tools = full_tools
+            # Terminal / idle states: emit RESET and restart the iteration.
+            if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+                self._execute_one(GameAction.RESET, source="auto_reset")
+                self._recent_tool_results = []
+                self._consecutive_no_action_iters = 0
+                continue
 
-        images = frame_to_images(latest_frame)
-        payload: Any = images if len(images) > 1 else images[0]
+            # Prompt-evolution hook — boundary-gated by action_counter rather
+            # than modulo so multi-action batches that straddle a boundary
+            # still fire exactly once.
+            self._maybe_evolve_prompt(latest_frame)
 
-        # Stash per-step state for _handle_run_subagent (latest_frame + images
-        # + outer-round index) and reset the per-step invocation counter.
+            force = (
+                self._consecutive_no_action_iters
+                >= self.MAX_CONSECUTIVE_NO_ACTION_ITERS
+            )
+
+            actions_executed = self._vlm_loop_inner(latest_frame, force=force)
+
+            if actions_executed > 0:
+                self._consecutive_no_action_iters = 0
+                self._recent_tool_results = []
+            else:
+                self._consecutive_no_action_iters += 1
+                if force:
+                    # We forced action-only mode and the model still didn't
+                    # commit. This is the only hard error path.
+                    raise RuntimeError(
+                        f"ContinualHarness: forced take_actions round produced "
+                        f"no action ({self._consecutive_no_action_iters} "
+                        f"consecutive no-action iters); aborting."
+                    )
+
+        self.cleanup()
+
+    # ------------------------------------------------------------------
+    # Inner VLM dispatch — one VLM call per outer iteration.
+    # ------------------------------------------------------------------
+
+    def _vlm_loop_inner(self, latest_frame: FrameData, *, force: bool) -> int:
+        """Make one VLM call, dispatch every function call, return # actions executed.
+
+        - `take_actions` calls execute their action list synchronously via
+          `_dispatch_take_actions`.
+        - Analysis tool calls (process_*, run_skill, run_subagent, etc.) go
+          through `self.tool_router`. A skill that called tools["take_actions"]
+          inside the sandbox contributes its inline action count via the
+          `actions_taken_inline` field on the returned ToolCallRecord.
+        - Stray legacy ACTION1..ACTION6 calls are rejected with an explicit
+          error record so the model can self-correct next round.
+        """
+        # Stash per-iteration state used by sub-handlers (run_subagent, etc.).
         self._current_latest_frame = latest_frame
-        self._current_images = list(images)
+        self._current_images = list(frame_to_images(latest_frame))
         self._subagent_call_count = 0
+        self._vlm_call_count += 1
+        self._current_outer_round = self._vlm_call_count
 
-        # Build a JSON-only sandbox snapshot once per step. All sandbox tool
-        # invocations within this step share the same view of the world.
-        # `mode="json"` ensures enum fields (GameAction, GameState) serialize
-        # to plain strings/ints — without it, the sandbox payload would carry
-        # enum objects that json.dumps refuses.
+        # Build a JSON-only sandbox snapshot. The sandbox sees this view at
+        # the *start* of the skill call; subsequent take_actions RPCs update
+        # the engine state but `state.latest_frame` inside the sandbox stays
+        # fixed (the skill should read fresh frames from the RPC's return).
         try:
             frame_dump = latest_frame.model_dump(mode="json")
         except (AttributeError, TypeError):
@@ -953,191 +1094,386 @@ class ContinualHarness(Agent):
             skill_entries=[asdict(e) for e in self.skills.all_entries()],
         )
 
-        history = format_compact_history(
-            self.trajectory.tail(self.HISTORY_WINDOW),
-            frames=frames,
-            max_chars=self.HISTORY_MAX_CHARS,
-        )
-        history_block = (
-            "## RECENT STEPS (compact; call get_recent_trajectory for full detail)\n"
-            + history
-        )
-        # Tool results accumulate across rounds; each round rebuilds the prompt so the
-        # `# TURN:` line stays the LAST thing the model reads. Memory overview is
-        # re-read each round so add/edit/delete made by a previous round show up.
-        tool_results_blocks: list[str] = []
+        prompt = self._build_working_prompt(latest_frame, force_take_actions=force)
+        tools = [TAKE_ACTIONS_TOOL] if force else self._full_tool_list()
+        self.vlm.set_tools(tools)
 
-        def _build_working_prompt() -> str:
-            extras: list[str] = []
-            extras.append(format_memory_overview(self.memory.all_entries()))
-            extras.append(format_skill_overview(self.skills.all_entries()))
-            extras.append(format_subagent_overview(self.subagents.all_entries()))
-            extras.append(history_block)
-            extras.extend(tool_results_blocks)
-            return build_action_prompt(latest_frame, extra_context="\n\n".join(extras))
+        images = self._current_images
+        payload: Any = images if len(images) > 1 else images[0]
 
-        working_prompt = _build_working_prompt()
-
-        tool_calls_this_step: list[ToolCallRecord] = []
-        analysis_budget = self.MAX_ANALYSIS_CALLS_PER_STEP
-        last_exc: Exception | None = None
-        chosen: GameAction | None = None
-        round_idx = 0
-
-        for round_idx in range(1, self.MAX_TOOL_ROUNDS + 1):
-            # Invariant: every step must end with an action call. Strip analysis
-            # tools when (a) the per-step budget is exhausted or (b) this is the
-            # final round (force-action — guarantees the last VLM call commits).
-            self._current_outer_round = round_idx
-            is_final_round = round_idx == self.MAX_TOOL_ROUNDS
-            expose_analysis = analysis_budget > 0 and not is_final_round
-            desired_tools = full_tools if expose_analysis else action_tools
-            if desired_tools is not current_tools:
-                self.vlm.set_tools(desired_tools)
-                current_tools = desired_tools
-
-            output: dict[str, Any] = {}
-            usage: dict[str, int | None] | None = None
-            round_chosen: GameAction | None = None
-            round_error: str | None = None
-            round_tool_records: list[ToolCallRecord] = []
-
-            try:
-                response = self.vlm.get_query(
-                    payload, working_prompt, module_name=self.name
-                )
-                output = serialize_response(response)
-                usage = self.vlm.extract_usage(response)
-                fcs = extract_function_calls(response)
-
-                # Priority: any usable action tool call wins immediately.
-                for fc in fcs:
-                    if is_action_tool(fc.name):
-                        round_chosen = _action_from_name(fc.name, fc.args, available)
-                        if round_chosen is not None:
-                            break
-
-                # No usable action → run analysis tool calls (in order), up to budget.
-                if round_chosen is None:
-                    for fc in fcs:
-                        if is_action_tool(fc.name):
-                            continue
-                        if analysis_budget <= 0:
-                            round_tool_records.append(
-                                ToolCallRecord(
-                                    name=fc.name,
-                                    args=fc.args,
-                                    error="analysis budget exhausted; commit to an action next round",
-                                )
-                            )
-                            continue
-                        round_tool_records.append(self.tool_router.execute(fc))
-                        analysis_budget -= 1
-            except Exception as exc:
-                last_exc = exc
-                round_error = repr(exc)
-                logger.warning(
-                    "Round %d/%d: VLM call failed: %s",
-                    round_idx,
-                    self.MAX_TOOL_ROUNDS,
-                    exc,
-                )
-            finally:
-                self.trace.write(
-                    {
-                        "agent": self.name,
-                        "model": self.model_name,
-                        "game_id": self.game_id,
-                        "action_counter": self.action_counter,
-                        "round": round_idx,
-                        "analysis_budget_remaining": analysis_budget,
-                        "tools_exposed": (
-                            "action_only" if current_tools is action_tools else "full"
-                        ),
-                        "input": {
-                            "system_instruction": self._current_system_instruction,
-                            "user_prompt": working_prompt,
-                            "tools": current_tools,
-                            "images": [
-                                {
-                                    "width": img.width,
-                                    "height": img.height,
-                                    "mode": img.mode,
-                                }
-                                for img in images
-                            ],
-                        },
-                        "output": output,
-                        "usage": usage,
-                        "chosen_action": round_chosen.name if round_chosen else None,
-                        "reasoning": (
-                            getattr(round_chosen, "reasoning", None)
-                            if round_chosen
-                            else None
-                        ),
-                        "tool_calls": [asdict(r) for r in round_tool_records],
-                        "error": round_error,
-                    }
-                )
-                if usage is not None:
-                    self.total_calls += 1
-                    self.total_prompt_tokens += int(usage.get("prompt") or 0)
-                    self.total_output_tokens += int(usage.get("output") or 0)
-                    self.total_tokens += int(usage.get("total") or 0)
-
-            tool_calls_this_step.extend(round_tool_records)
-
-            if round_chosen is not None:
-                chosen = round_chosen
-                break
-
-            if round_error is not None:
-                # Plain VLM/network error — retry the same prompt next round.
-                continue
-
-            if not round_tool_records:
-                # Model produced no function calls at all → next round won't have
-                # new info; bail out and fail hard.
-                break
-
-            # Feed analysis results back into the prompt for the next round.
-            # Splice them ABOVE `# TURN:` (via _build_working_prompt) so the
-            # action cue stays the last thing the model reads.
-            tool_results_blocks.append(render_tool_results(round_tool_records))
-            working_prompt = _build_working_prompt()
-
-        if chosen is None:
-            self.trajectory.append(
-                StepRecord(
-                    game_id=self.game_id,
-                    action_counter=self.action_counter,
-                    state=latest_frame.state.name,
-                    score=latest_frame.levels_completed,
-                    chosen_action=None,
-                    tool_calls=tool_calls_this_step,
-                    vlm_attempts=round_idx,
-                    error=repr(last_exc) if last_exc else "no action chosen",
-                )
+        output: dict[str, Any] = {}
+        usage: dict[str, int | None] | None = None
+        error: str | None = None
+        try:
+            response = self.vlm.get_query(payload, prompt, module_name=self.name)
+            output = serialize_response(response)
+            usage = self.vlm.extract_usage(response)
+        except Exception as exc:
+            self._consecutive_vlm_errors += 1
+            self._write_orchestrator_trace(
+                prompt=prompt, output={}, usage=None, tools=tools, force=force,
+                tool_calls=[], actions_executed=0, error=repr(exc),
             )
-            raise RuntimeError(
-                f"ContinualHarness could not select an action after "
-                f"{self.MAX_TOOL_ROUNDS} rounds"
-            ) from last_exc
+            logger.warning("VLM call failed: %s", exc)
+            return 0
+        self._consecutive_vlm_errors = 0
+
+        fcs = extract_function_calls(response)
+        actions_executed = 0
+        new_results: list[ToolCallRecord] = []
+        # Track the human-readable name of every tool call this round, in
+        # emission order, for the run.log summary at the end. take_actions
+        # entries include the emitted action list inline so a `grep
+        # take_actions` against run.log shows exactly what was committed.
+        round_tool_log: list[str] = []
+
+        for fc in fcs:
+            if is_take_actions_call(fc.name):
+                action_specs = fc.args.get("actions") if isinstance(fc.args, dict) else None
+                spec_label = _format_action_list(action_specs)
+                executed = self._dispatch_take_actions(fc.args, source="vlm")
+                actions_executed += executed
+                round_tool_log.append(f"take_actions{spec_label}={executed}")
+                # We don't add a TOOL RESULTS entry for take_actions — the
+                # next prompt's RECENT HISTORY block already shows what ran.
+            elif is_action_tool(fc.name):
+                # Legacy per-action tool emitted directly — reject and
+                # surface so the model corrects.
+                new_results.append(
+                    ToolCallRecord(
+                        name=fc.name,
+                        args=fc.args,
+                        error=(
+                            f"per-action tool deprecated; emit {TAKE_ACTIONS} "
+                            "with an actions=[...] list"
+                        ),
+                    )
+                )
+                round_tool_log.append(f"REJECTED:{fc.name}")
+            else:
+                record = self.tool_router.execute(fc)
+                inline = record.actions_taken_inline or 0
+                actions_executed += inline
+                new_results.append(record)
+                if fc.name == "run_skill" and inline > 0:
+                    skill_id = (fc.args or {}).get("id") if isinstance(fc.args, dict) else None
+                    round_tool_log.append(f"run_skill({skill_id})={inline}")
+                else:
+                    round_tool_log.append(fc.name)
+
+            if self.frames[-1].state in (GameState.WIN, GameState.GAME_OVER):
+                # Terminal mid-response — stop processing further fcs.
+                break
+
+        if usage is not None:
+            self.total_calls += 1
+            self.total_prompt_tokens += int(usage.get("prompt") or 0)
+            self.total_output_tokens += int(usage.get("output") or 0)
+            self.total_tokens += int(usage.get("total") or 0)
+
+        self._write_orchestrator_trace(
+            prompt=prompt, output=output, usage=usage, tools=tools, force=force,
+            tool_calls=new_results, actions_executed=actions_executed, error=error,
+        )
+
+        # Carry analysis results to the next iteration's prompt. Cap to avoid
+        # unbounded growth across consecutive no-action iters. If actions
+        # executed, main() will clear this list anyway.
+        if new_results:
+            self._recent_tool_results = (
+                self._recent_tool_results + new_results
+            )[-self.RECENT_RESULTS_CAP:]
+
+        # Per-VLM-call run.log summary. One line per outer iteration.
+        latest = self.frames[-1]
+        tokens_total = int((usage or {}).get("total") or 0) if usage else 0
+        tools_label = ", ".join(round_tool_log) if round_tool_log else "(no fcs)"
+        logger.info(
+            "[%s] vlm#%d step=%d lvl=%d state=%s tokens=%d actions=%d tools=[%s]%s",
+            self.game_id,
+            self._vlm_call_count,
+            self.action_counter,
+            latest.levels_completed,
+            latest.state.name,
+            tokens_total,
+            actions_executed,
+            tools_label,
+            " (FORCE)" if force else "",
+        )
+
+        return actions_executed
+
+    # ------------------------------------------------------------------
+    # take_actions dispatch — used by both the VLM path and the sandbox RPC.
+    # ------------------------------------------------------------------
+
+    def _dispatch_take_actions(
+        self,
+        args: dict[str, Any],
+        *,
+        source: str,
+        skill_id: str | None = None,
+    ) -> int:
+        """Validate + execute an actions list synchronously. Returns # executed.
+
+        No length-cap truncation — the soft 1-8 guideline lives in the prompt
+        only. Real bounds come from per-step revalidation (level transitions
+        / available_actions changes), terminal-state detection, and the global
+        `MAX_ACTIONS` counter checked after each step.
+        """
+        available = available_game_actions(self.frames[-1].available_actions)
+        steps, _rejected = validate_action_sequence(
+            args.get("actions"), available
+        )
+        if not steps:
+            return 0
+        batch_id = self._mint_batch_id()
+        batch_reasoning = str(args.get("reasoning") or "")
+        rejected_payload = (
+            [r.to_dict() for r in _rejected] if _rejected else None
+        )
+        total = len(steps)
+        skill_id = skill_id if skill_id is not None else self._sandbox_skill_id
+        executed = 0
+
+        for step in steps:
+            # Per-step revalidation: state may have moved (e.g., level
+            # transition) so the next action may no longer be available.
+            live_avail = available_game_actions(
+                self.frames[-1].available_actions
+            )
+            if step.action not in live_avail:
+                break
+            self._execute_one(
+                step.action,
+                source=source,
+                batch_id=batch_id,
+                batch_position=step.position,
+                batch_total=total,
+                batch_reasoning=batch_reasoning if step.position == 1 else None,
+                batch_rejected=rejected_payload if step.position == 1 else None,
+                skill_id=skill_id,
+            )
+            executed += 1
+            if self.frames[-1].state in (GameState.WIN, GameState.GAME_OVER):
+                break
+            if self.action_counter > self.MAX_ACTIONS:
+                break
+        return executed
+
+    # ------------------------------------------------------------------
+    # _execute_one — the single execution path (drain, vlm, skill, reset, backstop).
+    # ------------------------------------------------------------------
+
+    def _execute_one(
+        self,
+        action: GameAction,
+        *,
+        source: str,
+        batch_id: str | None = None,
+        batch_position: int | None = None,
+        batch_total: int | None = None,
+        batch_reasoning: str | None = None,
+        batch_rejected: list[dict[str, Any]] | None = None,
+        skill_id: str | None = None,
+    ) -> FrameData | None:
+        pre = self.frames[-1]
+        pre_state, pre_score = pre.state.name, pre.levels_completed
+
+        frame = self.take_action(action)        # base class: arc_env.step + validate
+        if frame is not None:
+            self.append_frame(frame)            # base class: also calls recorder.record
+        self.action_counter += 1                # mirror base Agent.main() semantics
+
+        post = frame if frame is not None else pre
+        score_after = post.levels_completed
+        state_after = post.state.name if frame is not None else "INVALID"
 
         self.trajectory.append(
             StepRecord(
                 game_id=self.game_id,
-                action_counter=self.action_counter,
-                state=latest_frame.state.name,
-                score=latest_frame.levels_completed,
-                chosen_action=chosen.name,
-                chosen_action_data=_action_data_dict(chosen),
-                reasoning=getattr(chosen, "reasoning", None),
-                tool_calls=tool_calls_this_step,
-                vlm_attempts=round_idx,
+                action_counter=self.action_counter - 1,
+                state=pre_state,
+                score=pre_score,
+                state_after=state_after,
+                score_delta=(score_after - pre_score) if frame is not None else None,
+                chosen_action=action.name,
+                chosen_action_data=_action_data_dict(action),
+                reasoning=getattr(action, "reasoning", None),
+                source=source,
+                batch_id=batch_id,
+                batch_position=batch_position,
+                batch_total=batch_total,
+                batch_reasoning=batch_reasoning,
+                batch_rejected=batch_rejected,
+                skill_id=skill_id,
+                tool_calls=[],
             )
         )
-        return chosen
+
+        # Per-action progress log (visible in run.log). Replaces the
+        # base-class line we lose by overriding main(). Includes the batch
+        # context, levels_completed, score delta, and avg fps so a single
+        # tail of run.log shows engine progression.
+        action_label = action.name
+        data = _action_data_dict(action)
+        if data:
+            action_label = f"{action.name}({','.join(f'{k}={v}' for k, v in data.items())})"
+        batch_ctx = ""
+        if batch_id and batch_position is not None and batch_total is not None:
+            batch_ctx = f" {batch_id}[{batch_position}/{batch_total}]"
+        score_label = f"lvl {pre_score}"
+        if frame is not None and score_after != pre_score:
+            score_label = f"lvl {pre_score}->{score_after}"
+        state_label = state_after if state_after != pre_state else pre_state
+        logger.info(
+            "[%s] step=%d %s%s src=%s %s state=%s fps=%.2f",
+            self.game_id,
+            self.action_counter - 1,
+            action_label,
+            batch_ctx,
+            source,
+            score_label,
+            state_label,
+            self.fps,
+        )
+        return frame
+
+    # ------------------------------------------------------------------
+    # Sandbox RPC dispatcher — invoked from a skill's tools["take_actions"].
+    # ------------------------------------------------------------------
+
+    def _sandbox_rpc(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Handle one RPC from a sandboxed skill.
+
+        Returns the response dict that the sandbox parent will JSON-encode and
+        send back over stdin to the worker.
+        """
+        if method != "take_actions":
+            return {"ok": False, "error": f"unknown rpc method: {method!r}"}
+        if self._sandbox_terminal_seen:
+            return {
+                "ok": False,
+                "error": "terminal state already reached; skill must return",
+                "terminal": True,
+            }
+        executed = self._dispatch_take_actions(args, source="run_skill")
+        last = self.frames[-1]
+        terminal = last.state in (GameState.WIN, GameState.GAME_OVER)
+        if terminal:
+            self._sandbox_terminal_seen = True
+        return {
+            "ok": executed > 0,
+            "value": {
+                "executed_count": executed,
+                "last_frame": _safe_frame_dump(last),
+                "terminal": terminal,
+                "state": last.state.name,
+                "score": last.levels_completed,
+                "available_actions": [
+                    a.name for a in available_game_actions(last.available_actions)
+                ],
+            },
+            "terminal": terminal,
+        }
+
+    # ------------------------------------------------------------------
+    # Working-prompt assembly.
+    # ------------------------------------------------------------------
+
+    def _build_working_prompt(
+        self, latest_frame: FrameData, *, force_take_actions: bool
+    ) -> str:
+        history_block = format_compact_history(
+            self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT),
+            frames=self.frames,
+            max_chars=self.HISTORY_MAX_CHARS,
+            max_batches=self.HISTORY_BATCH_WINDOW,
+        )
+        memory_overview = format_memory_overview(self.memory.all_entries())
+        skill_overview = format_skill_overview(self.skills.all_entries())
+        subagent_overview = format_subagent_overview(self.subagents.all_entries())
+        return build_working_prompt(
+            latest_frame,
+            action_counter=self.action_counter,
+            recent_tool_results=self._recent_tool_results,
+            history_block=history_block,
+            memory_overview=memory_overview,
+            skill_overview=skill_overview,
+            subagent_overview=subagent_overview,
+            force_take_actions=force_take_actions,
+            no_action_iters=self._consecutive_no_action_iters,
+        )
+
+    # ------------------------------------------------------------------
+    # Tool list, prompt-evolution gate, batch IDs, trace writer.
+    # ------------------------------------------------------------------
+
+    def _full_tool_list(self) -> list[dict[str, Any]]:
+        """Unified action tool + analysis tools. Used in normal (non-force) mode."""
+        tools: list[dict[str, Any]] = [TAKE_ACTIONS_TOOL]
+        tools.extend(build_analysis_tools())  # get_recent_trajectory
+        tools.append(PROCESS_MEMORY_TOOL)
+        tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL])
+        tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])
+        return tools
+
+    def _maybe_evolve_prompt(self, latest_frame: FrameData) -> None:
+        if self._prompt_evolve_frequency <= 0:
+            return
+        if self.action_counter == 0:
+            return
+        gap = self.action_counter - self._last_evolution_step
+        if gap < self._prompt_evolve_frequency:
+            return
+        self._last_evolution_step = self.action_counter
+        self._evolve_system_prompt(latest_frame)
+
+    def _mint_batch_id(self) -> str:
+        self._batch_counter += 1
+        # Suffix with a short uuid fragment so batch IDs are unique even
+        # across restarts within the same trajectory file.
+        return f"b_{self._batch_counter:04d}_{uuid.uuid4().hex[:4]}"
+
+    def _write_orchestrator_trace(
+        self,
+        *,
+        prompt: str,
+        output: dict[str, Any],
+        usage: dict[str, int | None] | None,
+        tools: list[dict[str, Any]],
+        force: bool,
+        tool_calls: list[ToolCallRecord],
+        actions_executed: int,
+        error: str | None = None,
+    ) -> None:
+        self.trace.write(
+            {
+                "agent": self.name,
+                "model": self.model_name,
+                "game_id": self.game_id,
+                "action_counter": self.action_counter,
+                "vlm_call": self._vlm_call_count,
+                "round": self._current_outer_round,
+                "tools_exposed": "take_actions_only" if force else "full",
+                "force_take_actions": force,
+                "consecutive_no_action_iters": self._consecutive_no_action_iters,
+                "input": {
+                    "system_instruction": self._current_system_instruction,
+                    "user_prompt": prompt,
+                    "tools": tools,
+                    "images": [
+                        {"width": img.width, "height": img.height, "mode": img.mode}
+                        for img in self._current_images
+                    ],
+                },
+                "output": output,
+                "usage": usage,
+                "actions_executed": actions_executed,
+                "tool_calls": [asdict(r) for r in tool_calls],
+                "error": error,
+            }
+        )
 
     def cleanup(self, *args: Any, **kwargs: Any) -> None:
         logger.info(

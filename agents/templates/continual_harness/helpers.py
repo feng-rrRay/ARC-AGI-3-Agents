@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence, TypeAlias
 
 from arcengine import FrameData, GameAction
@@ -243,3 +244,75 @@ def parse_action_response(
     return _action_from_name(
         data.get("action", data.get("name")), args, available_actions
     )
+
+
+# --- Multi-action validation (unified take_actions tool) ---------------------
+# Used by both the orchestrator's take_actions dispatch and the sandbox RPC for
+# skill-driven tools["take_actions"] calls.
+
+
+@dataclass(slots=True)
+class ActionStep:
+    """One validated action within a take_actions batch."""
+
+    action: GameAction
+    position: int  # 1-indexed within the batch
+    raw: dict[str, Any]
+
+
+@dataclass(slots=True)
+class RejectedStep:
+    """A single rejected entry from a take_actions actions list."""
+
+    raw: Any
+    reason: str
+    position: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"raw": self.raw, "reason": self.reason, "position": self.position}
+
+
+def validate_action_sequence(
+    raw: Any,
+    available_actions: Sequence[GameAction],
+) -> tuple[list[ActionStep], list[RejectedStep]]:
+    """Validate a take_actions actions list against the current available set.
+
+    No length cap. The soft 1-8 guideline lives in the prompt only; real
+    bounds come from total MAX_ACTIONS and terminal-state detection during
+    per-step dispatch.
+
+    Truncates at the first invalid entry on purpose: subsequent steps usually
+    depend on the invalid one being satisfied, so executing them anyway would
+    produce surprising effects. The truncated tail is returned in `rejected`.
+    """
+    steps: list[ActionStep] = []
+    rejected: list[RejectedStep] = []
+
+    if not isinstance(raw, list):
+        return steps, [RejectedStep(raw=raw, reason="actions must be a list", position=0)]
+
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, Mapping) or "name" not in item:
+            rejected.append(
+                RejectedStep(raw=item, reason="missing 'name' field", position=i)
+            )
+            break
+        item_dict = dict(item)
+        args = {k: v for k, v in item_dict.items() if k != "name"}
+        action = _action_from_name(item_dict["name"], args, available_actions)
+        if action is None:
+            rejected.append(
+                RejectedStep(
+                    raw=item_dict,
+                    reason=(
+                        "unknown action name / not in available_actions / "
+                        "invalid args (ACTION6 needs x,y in 0..63)"
+                    ),
+                    position=i,
+                )
+            )
+            break
+        steps.append(ActionStep(action=action, position=i, raw=item_dict))
+
+    return steps, rejected

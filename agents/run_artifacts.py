@@ -101,6 +101,7 @@ def safe_slug(value: str) -> str:
 def create_run_artifacts(
     agent_name: str | None,
     *,
+    game: str | None = None,
     logs_dir: str | Path = "logs",
     timestamp: str | None = None,
 ) -> RunArtifacts:
@@ -108,7 +109,11 @@ def create_run_artifacts(
     root = Path(logs_dir)
     root.mkdir(parents=True, exist_ok=True)
     stamp = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
-    base_run_id = f"{safe_slug(agent_name or 'no-agent')}-{stamp}"
+    parts = [safe_slug(agent_name or "no-agent")]
+    if game:
+        parts.append(safe_slug(game))
+    parts.append(stamp)
+    base_run_id = "-".join(parts)
     run_id, run_dir = _unique_run_dir(root, base_run_id)
     recordings_dir = run_dir / "recordings"
     artifacts_dir = run_dir / "artifacts"
