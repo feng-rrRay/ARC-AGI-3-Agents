@@ -103,11 +103,39 @@ PROCESS_SKILL_TOOL: dict[str, Any] = {
         "Manage saved Python skills. Skills persist for the current run by "
         "default (logs/<run-id>/skills.json) and across runs when "
         "--bootstrap-skills is provided. The current registry is "
-        "auto-injected under ## SKILL LIBRARY (id + name + tags + first "
-        "description line); call this tool to mutate or to read full code "
-        "via search. Operations: add (name, description, code, tags?), edit "
-        "(id + any of name/description/code/tags), delete (id), search "
-        "(substring over name+description+code+tags)."
+        "auto-injected under ## SKILLS (one row per skill listing both `id` "
+        "— e.g. skill_007 — and `name`); call this tool to mutate or to read "
+        "full code via search. Operations: add (name, description, code, "
+        "tags?), edit (id-or-name + any of name/description/code/tags), "
+        "delete (id-or-name), search (substring over "
+        "name+description+code+tags).\n\n"
+        "## Skill code rules\n"
+        "The `code` you provide becomes the body of the skill and runs in a "
+        "subprocess sandbox.\n"
+        "- Pre-loaded names (no `import` needed): `np`, `numpy`, "
+        "`collections`, `copy`, `dataclasses`, `functools`, `hashlib`, "
+        "`itertools`, `json`, `math`, `random`, `re`, `statistics`, `Image`, "
+        "`ImageDraw`, `ImageFilter`, `ImageOps`, `ImageChops`, plus helpers "
+        "`render_grid(grid_2d)` and `render_grids(grids_3d)`. `import X` / "
+        "`from X import Y` is accepted ONLY when X is one of those roots "
+        "(or `PIL`); imports of anything else are rejected at parse time.\n"
+        "- `state` is attribute-access only: use `state.latest_frame`, "
+        "`state.images`, `state.recent_trajectory`, `state.memory_entries`, "
+        "`state.skill_entries`. Bracket access (`state['latest_frame']`) "
+        "raises TypeError. `args`, by contrast, is a plain dict.\n"
+        "- Banned at parse time: `exec`, `eval`, `open`, `compile`, "
+        "`getattr`, `setattr`, `globals`, `locals`, `__import__`, any "
+        "dunder name, any `_`-prefixed attribute, filesystem/network I/O.\n"
+        "- Engine-driving skills: call `tools[\"take_actions\"](actions=[...])` "
+        "to advance the engine inline. The call returns "
+        "`{executed_count, last_frame, terminal, level_changed, state, "
+        "score, available_actions}`. After a call you MUST check `terminal` "
+        "and `level_changed` before queueing more actions — once `terminal` "
+        "is True the parent latches and further calls return an error. On "
+        "`level_changed=True` the new level needs a fresh plan; do not "
+        "re-send a sequence you computed for the previous level.\n"
+        "- Return shape: assign `result = ...` for analysis output. Output "
+        "is JSON-serialized with size caps; keep results compact."
     ),
     "parameters": {
         "type": "object",
@@ -140,7 +168,10 @@ PROCESS_SKILL_TOOL: dict[str, Any] = {
             },
             "id": {
                 "type": "string",
-                "description": "Existing skill id (e.g. 'skill_003'). Required for delete and edit.",
+                "description": (
+                    "Existing skill id (e.g. 'skill_007') or unique skill "
+                    "name (e.g. 'eval_python'). Required for delete and edit."
+                ),
             },
             "query": {
                 "type": "string",
@@ -155,10 +186,11 @@ PROCESS_SKILL_TOOL: dict[str, Any] = {
 RUN_SKILL_TOOL: dict[str, Any] = {
     "name": "run_skill",
     "description": (
-        "Execute a saved skill by id in a subprocess sandbox. The skill "
-        "receives `state` (latest_frame, recent_trajectory, memory_entries, "
-        "skill_entries, images) and your `args` dict. It may set `result = ...` "
-        "to return data.\n\n"
+        "Execute a saved skill in a subprocess sandbox. Address it by `id` "
+        "(e.g. 'skill_007') or by `name` (e.g. 'eval_python') — the "
+        "registry resolves both. The skill receives `state` (latest_frame, "
+        "recent_trajectory, memory_entries, skill_entries, images) and your "
+        "`args` dict. It may set `result = ...` to return data.\n\n"
         "`state.images` is a list of PIL.Image objects pre-rendered from "
         "`latest_frame.frame` (one image per grid layer; capped at 16). "
         "Use the `render_grid(grid_2d)` and `render_grids(grids_3d)` "
@@ -168,16 +200,21 @@ RUN_SKILL_TOOL: dict[str, Any] = {
         "Skills CAN drive the engine inline by calling "
         "tools['take_actions'](actions=[...]) — this RPCs back to the "
         "harness, executes the actions, and returns {executed_count, "
-        "last_frame, terminal, state, score, available_actions} so the "
-        "skill can read the new frame and branch on the result. Use this "
-        "for deterministic sub-routines (pathfinding, scanning loops, "
-        "etc.) where one VLM call per action would be wasteful.\n\n"
-        "Sandbox: 30s wall-clock cap; no filesystem or network; no `import` "
-        "statements in user code. Pre-bound modules: math, json, re, "
-        "collections, itertools, functools, statistics, copy, dataclasses, "
-        "hashlib, random; plus numpy as `np` (with file-I/O removed) and "
-        "Pillow as `Image`, `ImageDraw`, `ImageFilter`, `ImageOps`, "
-        "`ImageChops`."
+        "last_frame, terminal, level_changed, state, score, "
+        "available_actions} so the skill can read the new frame and branch "
+        "on the result. Use this for deterministic sub-routines "
+        "(pathfinding, scanning loops, etc.) where one VLM call per action "
+        "would be wasteful. Check both `terminal` and `level_changed` "
+        "before sending another batch — a level transition means the rest "
+        "of any precomputed plan is stale.\n\n"
+        "Sandbox: 30s wall-clock cap; no filesystem or network; no `exec`/"
+        "`eval`/`open`/`__`-anything. Pre-loaded modules are usable WITHOUT "
+        "`import`: math, json, re, collections, itertools, functools, "
+        "statistics, copy, dataclasses, hashlib, random; plus numpy as "
+        "`np` (with file-I/O removed) and Pillow as `Image`, `ImageDraw`, "
+        "`ImageFilter`, `ImageOps`, `ImageChops`. `import X` / `from X "
+        "import Y` is accepted for the listed names (and `PIL`); imports "
+        "of anything else are rejected at parse time."
     ),
     "parameters": {
         "type": "object",
@@ -188,7 +225,11 @@ RUN_SKILL_TOOL: dict[str, Any] = {
             },
             "id": {
                 "type": "string",
-                "description": "Existing skill id (e.g. 'skill_003'). Required.",
+                "description": (
+                    "Existing skill id (e.g. 'skill_007') OR unique skill "
+                    "name (e.g. 'eval_python'). Required. The `## SKILLS` "
+                    "overview lists both fields for every saved skill."
+                ),
             },
             "args": {
                 "type": "object",

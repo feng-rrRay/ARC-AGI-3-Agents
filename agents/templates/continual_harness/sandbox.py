@@ -181,11 +181,11 @@ _BANNED_AUDIT_PREFIXES = (
     "urllib.",
 )
 
-# Module names blocked at `import` audit time. Note that user code already
-# cannot write `import os` (the AST validator rejects import statements). This
-# list only protects against lazy/internal imports that might be triggered by
-# something we didn't anticipate — stdlib lazy imports like `heapq` (used by
-# Counter.most_common) are intentionally NOT here.
+# Module names blocked at `import` audit time. The AST validator only accepts
+# imports of names in `_PRELOADED_MODULE_NAMES`; this list is the runtime
+# backstop for lazy/internal imports a banned module might still trigger.
+# stdlib lazy imports like `heapq` (used by Counter.most_common) are
+# intentionally NOT here.
 _BANNED_IMPORT_MODULES = frozenset(
     {
         "ctypes",
@@ -207,6 +207,38 @@ _BANNED_IMPORT_MODULES = frozenset(
         "telnetlib",
         "urllib",
         "urllib.request",
+    }
+)
+
+# Modules that `_safe_modules()` pre-binds into the worker's globals dict. The
+# AST validator allows `import X` / `from X import Y` only when every root in
+# the statement is in this set. The pre-bound binding still wins at runtime
+# (the import becomes a no-op in practice for `import X`, while `from X import
+# Y` succeeds against the real module — both forms are intentional). Keep this
+# in sync with `_safe_modules()` below.
+_PRELOADED_MODULE_NAMES: frozenset[str] = frozenset(
+    {
+        "Image",
+        "ImageChops",
+        "ImageDraw",
+        "ImageFilter",
+        "ImageOps",
+        # `PIL` is the real package root; `from PIL import Image` is the
+        # natural idiom even though `Image` is also pre-bound directly.
+        "PIL",
+        "collections",
+        "copy",
+        "dataclasses",
+        "functools",
+        "hashlib",
+        "itertools",
+        "json",
+        "math",
+        "np",
+        "numpy",
+        "random",
+        "re",
+        "statistics",
     }
 )
 
@@ -598,8 +630,29 @@ def _validate_code(code: str) -> str | None:
         return f"SyntaxError: {exc.msg}"
 
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            return "sandbox policy: import statements are not allowed"
+        if isinstance(node, ast.Import):
+            # `import x, y, z` is allowed only when every root is pre-loaded.
+            for alias in node.names:
+                root = (alias.name or "").split(".", 1)[0]
+                if root not in _PRELOADED_MODULE_NAMES:
+                    return (
+                        f"sandbox policy: import of {alias.name!r} is not "
+                        "allowed; pre-loaded modules are already in scope"
+                    )
+            continue
+        if isinstance(node, ast.ImportFrom):
+            # `from x import a, b` — allowed only when the source module is
+            # pre-loaded. Relative imports (level > 0) are rejected outright.
+            if node.level and node.level > 0:
+                return "sandbox policy: relative imports are not allowed"
+            module = node.module or ""
+            root = module.split(".", 1)[0]
+            if not module or root not in _PRELOADED_MODULE_NAMES:
+                return (
+                    f"sandbox policy: import from {module!r} is not allowed; "
+                    "pre-loaded modules are already in scope"
+                )
+            continue
         if isinstance(node, ast.Name):
             if "__" in node.id or node.id in _BANNED_NAMES:
                 return f"sandbox policy: name {node.id!r} is not allowed"

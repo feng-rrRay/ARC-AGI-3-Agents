@@ -11,6 +11,7 @@ from agents.templates.continual_harness.sandbox import (
     RESULT_CAP,
     STDOUT_CAP,
     SandboxState,
+    _validate_code,
     run_python_snippet,
 )
 
@@ -169,6 +170,53 @@ class TestSandboxSafety:
         out = run_python_snippet("def (", state=_empty_state())
         assert out["success"] is False
         assert "SyntaxError" in (out.get("error") or "")
+
+
+@pytest.mark.unit
+class TestSandboxImportWhitelist:
+    """The AST validator allows `import X` only when X is pre-loaded; the
+    audit hook still blocks dangerous root modules at runtime as a backstop.
+    """
+
+    def test_validator_accepts_import_numpy_as_np(self) -> None:
+        assert _validate_code("import numpy as np\nresult = 0") is None
+
+    def test_validator_accepts_from_collections_import(self) -> None:
+        assert (
+            _validate_code("from collections import Counter\nresult = 0") is None
+        )
+
+    def test_validator_accepts_from_pil_import(self) -> None:
+        assert (
+            _validate_code("from PIL import Image, ImageDraw\nresult = 0") is None
+        )
+
+    def test_validator_accepts_multi_module_import(self) -> None:
+        assert _validate_code("import numpy, collections\nresult = 0") is None
+
+    def test_validator_rejects_import_os(self) -> None:
+        err = _validate_code("import os")
+        assert err is not None and "not allowed" in err
+
+    def test_validator_rejects_from_os_import(self) -> None:
+        err = _validate_code("from os import path")
+        assert err is not None and "not allowed" in err
+
+    def test_validator_rejects_mixed_safe_and_unsafe(self) -> None:
+        err = _validate_code("import numpy, os")
+        assert err is not None and "not allowed" in err
+
+    def test_validator_rejects_relative_import(self) -> None:
+        err = _validate_code("from . import x")
+        assert err is not None and "relative" in err
+
+    def test_runtime_import_numpy_succeeds_end_to_end(self) -> None:
+        out = run_python_snippet(
+            "import numpy as np\nresult = int(np.array([1, 2, 3]).sum())",
+            state=_empty_state(),
+        )
+        assert out["success"] is True
+        assert out["result"] == 6
 
 
 @pytest.mark.unit

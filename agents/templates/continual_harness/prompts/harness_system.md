@@ -70,3 +70,11 @@ action over a long speculative batch. Use analysis tools when their result
 will plausibly change which actions you pick — skip them when you already
 know what to do. Every tool call must include a non-empty `reasoning`
 string.
+
+If your previous step was analysis-only (no `take_actions` and no
+engine-driving `run_skill`), the next step should commit at least one
+action unless a TOOL RESULTS block from that step makes another analysis
+call strictly necessary. After at most one or two analysis-only steps in a
+row, prefer a single exploratory action over more analysis — burning the
+action budget on inspection alone is the most common cause of stalling
+out a level.

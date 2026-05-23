@@ -1216,3 +1216,129 @@ class TestFinalRoundStripsSkillsToo:
         assert "run_code" not in final_names
         assert "process_memory" not in final_names
         assert "get_recent_trajectory" not in final_names
+
+
+# --- Fix 1: level-change batch abort + RPC signal ----------------------------
+
+
+def _patch_take_action_with_levels(
+    agent: ContinualHarness,
+    levels_per_step: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[GameAction]:
+    """Replace `take_action` with a stub that walks through scripted level values.
+
+    Each call returns a FrameData with `levels_completed=levels_per_step[i]`,
+    same available_actions as the agent's current frame, and NOT_FINISHED
+    state. Records calls in the returned list so the test can assert how
+    many actions actually fired.
+    """
+    seen: list[GameAction] = []
+    levels = iter(levels_per_step)
+
+    def _stub(action: GameAction) -> FrameData:
+        seen.append(action)
+        lvl = next(levels)
+        return FrameData(
+            game_id=agent.game_id,
+            frame=[[[0]]],
+            state=GameState.NOT_FINISHED,
+            levels_completed=lvl,
+            win_levels=2,
+            action_input=ActionInput(),
+            available_actions=[1, 2, 3, 6],
+        )
+
+    monkeypatch.setattr(agent, "take_action", _stub)
+    return seen
+
+
+@pytest.mark.unit
+class TestBatchAbortsOnLevelChange:
+    """Fix 1: queued take_actions stops when levels_completed increments."""
+
+    def test_remaining_steps_skipped_after_level_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        agent.frames = [_make_frame()]
+        # Level flips from 0 to 1 on the 2nd action; remaining 2 actions
+        # were planned for the old level and must NOT run.
+        seen = _patch_take_action_with_levels(agent, [0, 1, 1, 1], monkeypatch)
+
+        executed = agent._dispatch_take_actions(
+            {
+                "reasoning": "test",
+                "actions": [
+                    {"name": "ACTION1"},
+                    {"name": "ACTION1"},
+                    {"name": "ACTION3"},
+                    {"name": "ACTION1"},
+                ],
+            },
+            source="vlm",
+        )
+
+        assert executed == 2
+        assert len(seen) == 2  # only the first two actions actually fired
+
+    def test_batch_runs_to_end_when_level_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        agent.frames = [_make_frame()]
+        seen = _patch_take_action_with_levels(agent, [0, 0, 0, 0], monkeypatch)
+
+        executed = agent._dispatch_take_actions(
+            {
+                "reasoning": "test",
+                "actions": [
+                    {"name": "ACTION1"},
+                    {"name": "ACTION1"},
+                    {"name": "ACTION3"},
+                    {"name": "ACTION1"},
+                ],
+            },
+            source="vlm",
+        )
+
+        assert executed == 4
+        assert len(seen) == 4
+
+
+@pytest.mark.unit
+class TestSandboxRpcSignalsLevelChange:
+    """Fix 1: the sandbox RPC return value carries `level_changed` so an
+    engine-driving skill can react when a mid-batch level transition fires."""
+
+    def test_level_changed_true_when_levels_completed_increments(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        agent.frames = [_make_frame()]
+        _patch_take_action_with_levels(agent, [1], monkeypatch)
+
+        resp = agent._sandbox_rpc(
+            "take_actions",
+            {"reasoning": "skill drives", "actions": [{"name": "ACTION1"}]},
+        )
+
+        assert resp["ok"] is True
+        assert resp["value"]["level_changed"] is True
+        assert resp["value"]["terminal"] is False
+        assert resp["value"]["score"] == 1
+
+    def test_level_changed_false_when_level_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        agent.frames = [_make_frame()]
+        _patch_take_action_with_levels(agent, [0], monkeypatch)
+
+        resp = agent._sandbox_rpc(
+            "take_actions",
+            {"reasoning": "skill drives", "actions": [{"name": "ACTION1"}]},
+        )
+
+        assert resp["ok"] is True
+        assert resp["value"]["level_changed"] is False

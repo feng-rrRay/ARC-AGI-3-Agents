@@ -202,8 +202,8 @@ class ContinualHarness(Agent):
     SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
     # No-action-iteration backstop: after this many consecutive outer iters with
     # zero actions executed, the next iter is force-mode (only take_actions
-    # exposed + BACKSTOP block in prompt). If that still produces no action,
-    # RuntimeError surfaces.
+    # exposed + BACKSTOP block in prompt). Force-mode is a soft nudge — the
+    # loop keeps going even if force still produces no action.
     MAX_CONSECUTIVE_NO_ACTION_ITERS = 5
     RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
     SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
@@ -382,33 +382,47 @@ class ContinualHarness(Agent):
                         "tags": entry.tags,
                     }
                 if op == "delete":
-                    skill_id = args.get("id") or ""
-                    if not skill_id:
+                    key = args.get("id") or ""
+                    if not key:
                         return {
                             "success": False,
                             "operation": "delete",
-                            "error": "delete requires an id",
+                            "error": "delete requires an id (or name)",
                         }
-                    deleted = self.skills.delete(skill_id)
-                    result: dict[str, Any] = {
+                    target = self.skills.get_by_id_or_name(key)
+                    if target is None:
+                        return {
+                            "success": False,
+                            "operation": "delete",
+                            "id": key,
+                            "deleted": False,
+                            "error": f"no skill with id-or-name={key}",
+                        }
+                    deleted = self.skills.delete(target.id)
+                    return {
                         "success": deleted,
                         "operation": "delete",
-                        "id": skill_id,
+                        "id": target.id,
                         "deleted": deleted,
                     }
-                    if not deleted:
-                        result["error"] = f"no skill with id={skill_id}"
-                    return result
                 if op == "edit":
-                    skill_id = args.get("id") or ""
-                    if not skill_id:
+                    key = args.get("id") or ""
+                    if not key:
                         return {
                             "success": False,
                             "operation": "edit",
-                            "error": "edit requires an id",
+                            "error": "edit requires an id (or name)",
+                        }
+                    target = self.skills.get_by_id_or_name(key)
+                    if target is None:
+                        return {
+                            "success": False,
+                            "operation": "edit",
+                            "id": key,
+                            "error": f"no skill with id-or-name={key}",
                         }
                     edited = self.skills.edit(
-                        skill_id,
+                        target.id,
                         name=args.get("name"),
                         description=args.get("description"),
                         code=args.get("code"),
@@ -418,13 +432,13 @@ class ContinualHarness(Agent):
                         return {
                             "success": False,
                             "operation": "edit",
-                            "id": skill_id,
-                            "error": f"no skill with id={skill_id}",
+                            "id": target.id,
+                            "error": f"no skill with id={target.id}",
                         }
                     return {
                         "success": True,
                         "operation": "edit",
-                        "id": skill_id,
+                        "id": target.id,
                         "version": edited.version,
                         "updated_at": edited.updated_at,
                     }
@@ -447,12 +461,15 @@ class ContinualHarness(Agent):
             skill_id = args.get("id") or ""
             if not skill_id:
                 return {"success": False, "error": "run_skill requires an id"}
-            skill = self.skills.get(skill_id)
+            # Accept either canonical id (skill_NNN) or the human name shown
+            # in the SKILLS overview — the model regularly confuses them and
+            # eating a retry to disambiguate isn't worth it.
+            skill = self.skills.get_by_id_or_name(skill_id)
             if skill is None:
                 return {
                     "success": False,
                     "id": skill_id,
-                    "error": f"no skill with id={skill_id}",
+                    "error": f"no skill with id-or-name={skill_id}",
                 }
             state = self._current_sandbox_state or SandboxState()
 
@@ -1071,14 +1088,6 @@ class ContinualHarness(Agent):
                 self._recent_tool_results = []
             else:
                 self._consecutive_no_action_iters += 1
-                if force:
-                    # We forced action-only mode and the model still didn't
-                    # commit. This is the only hard error path.
-                    raise RuntimeError(
-                        f"ContinualHarness: forced take_actions round produced "
-                        f"no action ({self._consecutive_no_action_iters} "
-                        f"consecutive no-action iters); aborting."
-                    )
 
         self.cleanup()
 
@@ -1278,6 +1287,12 @@ class ContinualHarness(Agent):
         total = len(steps)
         skill_id = skill_id if skill_id is not None else self._sandbox_skill_id
         executed = 0
+        # Snapshot the level before the batch so we can abort the remainder if a
+        # mid-batch level transition happens. The available_actions check below
+        # already covers most cases, but a level can advance without changing
+        # the action set, and the rest of the queue was planned for the OLD
+        # level — running it blindly burns the budget on the wrong puzzle.
+        pre_level = self.frames[-1].levels_completed
 
         for step in steps:
             # Per-step revalidation: state may have moved (e.g., level
@@ -1299,6 +1314,8 @@ class ContinualHarness(Agent):
             )
             executed += 1
             if self.frames[-1].state in (GameState.WIN, GameState.GAME_OVER):
+                break
+            if self.frames[-1].levels_completed != pre_level:
                 break
             if self.action_counter > self.MAX_ACTIONS:
                 break
@@ -1400,9 +1417,11 @@ class ContinualHarness(Agent):
                 "error": "terminal state already reached; skill must return",
                 "terminal": True,
             }
+        pre_level = self.frames[-1].levels_completed
         executed = self._dispatch_take_actions(args, source="run_skill")
         last = self.frames[-1]
         terminal = last.state in (GameState.WIN, GameState.GAME_OVER)
+        level_changed = last.levels_completed != pre_level
         if terminal:
             self._sandbox_terminal_seen = True
         return {
@@ -1411,6 +1430,7 @@ class ContinualHarness(Agent):
                 "executed_count": executed,
                 "last_frame": _safe_frame_dump(last),
                 "terminal": terminal,
+                "level_changed": level_changed,
                 "state": last.state.name,
                 "score": last.levels_completed,
                 "available_actions": [

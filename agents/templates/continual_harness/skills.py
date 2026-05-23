@@ -144,6 +144,27 @@ class SkillStore:
                 return entry
         return None
 
+    def get_by_id_or_name(self, key: str) -> SkillEntry | None:
+        """Resolve a skill by its canonical id (skill_NNN) or its unique name.
+
+        Models frequently confuse the bracketed id shown in the overview with
+        the human-readable name; accepting either avoids burning a turn on a
+        retry. Name lookup is case-insensitive. Returns the FIRST match in
+        store order — names are unique by add() invariants, but for legacy
+        files we still favour id matches.
+        """
+        if not key:
+            return None
+        entries = self.all_entries()
+        for entry in entries:
+            if entry.id == key:
+                return entry
+        needle = key.lower()
+        for entry in entries:
+            if entry.name.lower() == needle:
+                return entry
+        return None
+
     def add(
         self,
         name: str,
@@ -276,20 +297,22 @@ class SkillStore:
 
 
 def format_skill_overview(entries: list[SkillEntry]) -> str:
-    """Compact index for auto-injection. Shows id + name + tags + first description line."""
+    """Compact index for auto-injection. Labels both `id` and `name` so the
+    model can address a skill by either when calling run_skill / process_skill.
+    """
     if not entries:
         return (
             "## SKILLS (0 saved)\n"
             'No skills saved yet. Use process_skill(operation="add", name=..., '
             "description=..., code=...) to save reusable analysis snippets, "
-            "then run_skill(id) to execute one."
+            "then run_skill(id_or_name) to execute one."
         )
     rows = [f"## SKILLS ({len(entries)} saved)"]
     for e in entries:
-        tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
+        tag_str = f" tags={','.join(e.tags)}" if e.tags else ""
         first_line = (
             (e.description or "").splitlines()[0][:120] if e.description else ""
         )
         sep = " — " if first_line else ""
-        rows.append(f"[{e.id}] {e.name}{tag_str}{sep}{first_line}")
+        rows.append(f"- id={e.id} name={e.name}{tag_str}{sep}{first_line}")
     return "\n".join(rows)
