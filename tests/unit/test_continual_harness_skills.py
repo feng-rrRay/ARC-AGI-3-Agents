@@ -100,11 +100,21 @@ class TestSkillStoreCRUD:
         with pytest.raises(ValueError):
             store.add("has space", "desc", "result = 1")
 
-    def test_add_rejects_duplicate_name(self, tmp_path: Path) -> None:
+    def test_add_with_existing_name_upserts(self, tmp_path: Path) -> None:
+        """Same-name `add` updates the existing entry in place."""
         store = _store(tmp_path)
-        store.add("find_player", "desc1", "result = 1")
-        with pytest.raises(ValueError, match="already in use"):
-            store.add("find_player", "desc2", "result = 2")
+        first = store.add("find_player", "desc1", "result = 1")
+        second = store.add(
+            "find_player", "desc2", "result = 2", tags=["geo"]
+        )
+        # Same id; bumped version; fresh code/description/tags.
+        assert second.id == first.id
+        assert second.version == first.version + 1
+        assert second.description == "desc2"
+        assert second.code == "result = 2"
+        assert second.tags == ["geo"]
+        # Store still has only one entry.
+        assert len(store.all_entries()) == 1
 
     def test_add_rejects_empty_code(self, tmp_path: Path) -> None:
         store = _store(tmp_path)

@@ -331,3 +331,100 @@ class TestSandboxErrorPaths:
         out = run_python_snippet("result = 1", state=_empty_state())
         assert out["success"] is False
         assert "did not emit JSON" in (out.get("error") or "")
+
+
+@pytest.mark.unit
+class TestSandboxReflection:
+    """Fix A — `getattr`/`hasattr` are public; `heapq` is pre-loaded."""
+
+    def test_getattr_allowed_at_parse(self) -> None:
+        assert _validate_code('x = getattr(state, "latest_frame", None)') is None
+
+    def test_hasattr_allowed_at_parse(self) -> None:
+        assert _validate_code('x = hasattr(state, "latest_frame")') is None
+
+    def test_getattr_with_dunder_string_still_rejected(self) -> None:
+        # The dunder-string check fires before getattr is involved.
+        err = _validate_code('x = getattr(o, "__class__")')
+        assert err is not None and "dunder strings" in err
+
+    def test_setattr_still_rejected(self) -> None:
+        err = _validate_code('setattr(o, "x", 1)')
+        assert err is not None and "setattr" in err
+
+    def test_getattr_runs_end_to_end(self) -> None:
+        state = SandboxState(latest_frame={"state": "NOT_FINISHED"})
+        out = run_python_snippet(
+            'result = [hasattr(state, "latest_frame"), '
+            'getattr(state, "missing", "fallback")]',
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"] == [True, "fallback"]
+
+    def test_heapq_import_allowed(self) -> None:
+        assert _validate_code("import heapq") is None
+        assert _validate_code("from heapq import heappush, heappop") is None
+
+    def test_heapq_runs_end_to_end(self) -> None:
+        out = run_python_snippet(
+            "import heapq\nh = []\n"
+            "for v in (5, 1, 3, 2, 4):\n    heapq.heappush(h, v)\n"
+            "result = [heapq.heappop(h) for _ in range(len(h))]",
+            state=_empty_state(),
+        )
+        assert out["success"] is True
+        assert out["result"] == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.unit
+class TestSandboxDualAccess:
+    """Fix C — state and RPC return values accept both attr and subscript."""
+
+    def test_state_top_level_attr_and_subscript(self) -> None:
+        state = SandboxState(latest_frame={"a": 1, "b": 2})
+        out = run_python_snippet(
+            "result = [state.latest_frame, state['latest_frame']]",
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"][0] == {"a": 1, "b": 2}
+        assert out["result"][1] == {"a": 1, "b": 2}
+
+    def test_state_nested_dict_dual_access(self) -> None:
+        state = SandboxState(latest_frame={"frame": [[0, 1], [2, 3]]})
+        out = run_python_snippet(
+            "result = [state.latest_frame.frame, "
+            "state['latest_frame']['frame'], "
+            "state.latest_frame['frame'], "
+            "state['latest_frame'].frame]",
+            state=state,
+        )
+        assert out["success"] is True
+        first = out["result"][0]
+        assert all(part == first for part in out["result"])
+
+    def test_dict_inside_list_is_also_wrapped(self) -> None:
+        state = SandboxState(
+            recent_trajectory=[{"step": 1, "action": "ACTION1"}]
+        )
+        out = run_python_snippet(
+            "row = state.recent_trajectory[0]\n"
+            "result = [row.step, row['step'], row.action]",
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"] == [1, 1, "ACTION1"]
+
+    def test_missing_key_raises_attribute_error(self) -> None:
+        state = SandboxState(latest_frame={"a": 1})
+        out = run_python_snippet(
+            "try:\n"
+            "    _ = state.latest_frame.nonexistent\n"
+            "    result = 'no-error'\n"
+            "except AttributeError:\n"
+            "    result = 'attribute-error'\n",
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"] == "attribute-error"

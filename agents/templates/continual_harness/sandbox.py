@@ -78,7 +78,6 @@ _BANNED_NAMES = {
     "dir",
     "eval",
     "exec",
-    "getattr",
     "globals",
     "help",
     "input",
@@ -88,6 +87,11 @@ _BANNED_NAMES = {
     "vars",
 }
 
+# `getattr` / `hasattr` are allowed by name and as attribute references — skill
+# code uses them for ordinary read-only introspection. Dynamic dunder access
+# (`getattr(obj, "__class__")`) is still blocked by the dunder-string check in
+# `_validate_code`, and dangerous attributes (`f_globals`, `tb_frame`, …) are
+# still listed below.
 _BANNED_ATTRIBUTES = {
     "__builtins__",
     "__import__",
@@ -102,7 +106,6 @@ _BANNED_ATTRIBUTES = {
     "f_locals",
     "func_globals",
     "gi_frame",
-    "getattr",
     "globals",
     "help",
     "input",
@@ -231,6 +234,7 @@ _PRELOADED_MODULE_NAMES: frozenset[str] = frozenset(
         "dataclasses",
         "functools",
         "hashlib",
+        "heapq",
         "itertools",
         "json",
         "math",
@@ -691,6 +695,8 @@ _SAFE_BUILTIN_NAMES: tuple[str, ...] = (
     "float",
     "format",
     "frozenset",
+    "getattr",
+    "hasattr",
     "hash",
     "hex",
     "id",
@@ -821,6 +827,7 @@ def _safe_modules() -> dict[str, Any]:
     import dataclasses
     import functools
     import hashlib
+    import heapq
     import itertools
     import json as _json
     import math
@@ -908,6 +915,19 @@ def _safe_modules() -> dict[str, Any]:
                 "sha256",
                 "sha384",
                 "sha512",
+            ),
+        ),
+        "heapq": _module_namespace(
+            heapq,
+            (
+                "heapify",
+                "heappush",
+                "heappop",
+                "heappushpop",
+                "heapreplace",
+                "merge",
+                "nlargest",
+                "nsmallest",
             ),
         ),
         "itertools": _public_namespace(itertools),
@@ -1085,6 +1105,42 @@ def _apply_rlimits() -> None:
             pass
 
 
+class _DualAccess(dict):
+    """JSON-style dict that also supports attribute access on string keys.
+
+    Lets skill code read the same payload either way: `state.latest_frame`
+    and `state["latest_frame"]` both work, and the same applies recursively
+    to nested dicts. Models routinely confuse the two access styles; making
+    them equivalent removes a large class of run_skill failures.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _wrap(value: Any, _depth: int = 0) -> Any:
+    """Recursively wrap dicts as _DualAccess; pass lists element-wise.
+
+    Cap recursion at 8 levels to defend against pathological self-referential
+    payloads (everything we ferry through is JSON-serialized, so legitimate
+    nesting is shallow).
+    """
+    if _depth >= 8:
+        return value
+    if isinstance(value, dict):
+        return _DualAccess(
+            {k: _wrap(v, _depth + 1) for k, v in value.items()}
+        )
+    if isinstance(value, list):
+        return [_wrap(v, _depth + 1) for v in value]
+    return value
+
+
 def _worker_main() -> int:
     import io
     from contextlib import redirect_stderr, redirect_stdout
@@ -1143,7 +1199,9 @@ def _worker_main() -> int:
                 continue
     state_dict["images"] = decoded_images
 
-    state = SimpleNamespace(**state_dict)
+    # `_wrap` makes both `state.foo` and `state["foo"]` legal; `state.images`
+    # is a list of PIL.Image objects and passes through unchanged.
+    state = _wrap(state_dict)
     validation_error = _validate_code(code)
     if validation_error is not None:
         real_stdout.write(json.dumps({"type": "result", "success": False, "error": validation_error}) + "\n")
@@ -1180,7 +1238,9 @@ def _worker_main() -> int:
                 raise RuntimeError(
                     f"sandbox tool {method}: {resp.get('error', 'unknown error')}"
                 )
-            return resp.get("value")
+            # Wrap the dict result so skill code can use BOTH `r.last_frame`
+            # and `r["last_frame"]`. Lists/scalars pass through unchanged.
+            return _wrap(resp.get("value"))
         return call
 
     tools_ns: Any = None

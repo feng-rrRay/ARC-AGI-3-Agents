@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 NAME_MAX_CHARS = 100
 DESCRIPTION_MAX_CHARS = 500
 CODE_MAX_CHARS = 8000
-MAX_SKILLS = 50
+MAX_SKILLS = 200
 SEARCH_MAX_MATCHES = 10
 
 
@@ -172,6 +172,15 @@ class SkillStore:
         code: str,
         tags: list[str] | None = None,
     ) -> SkillEntry:
+        """Add a skill, or upsert if `name` already exists.
+
+        Models routinely re-save the same skill name with revised code to mark
+        progress on a hypothesis. Treating that as a hard error caused two
+        failure modes: silent variant churn (`solve_foo_v2..v28`) and, once
+        the cap hit, every further `add` failing while the model believed it
+        had saved. Same-name `add` now routes to `edit`, returning the
+        updated entry; new names still allocate a new id.
+        """
         name = (name or "").strip()
         if not _VALID_NAME.match(name):
             raise ValueError(
@@ -185,14 +194,27 @@ class SkillStore:
             raise ValueError(f"code exceeds {CODE_MAX_CHARS} chars")
         with self._lock:
             state = self._load()
-            if len(state["entries"]) >= MAX_SKILLS:
+            existing_id: str | None = None
+            for e in state["entries"]:
+                if e.get("name") == name:
+                    existing_id = e.get("id")
+                    break
+            if existing_id is None and len(state["entries"]) >= MAX_SKILLS:
                 raise ValueError(
                     f"skills full ({MAX_SKILLS} entries); delete or edit one first"
                 )
-            if any(e.get("name") == name for e in state["entries"]):
-                raise ValueError(
-                    f"skill name {name!r} already in use; use edit instead"
-                )
+            if existing_id is not None:
+                # Upsert: re-saving an existing name updates that skill in
+                # place, bumping its version.
+                for entry in state["entries"]:
+                    if entry.get("id") == existing_id:
+                        entry["description"] = description
+                        entry["code"] = code
+                        entry["tags"] = list(tags or [])
+                        entry["version"] = int(entry.get("version", 1)) + 1
+                        entry["updated_at"] = self._now()
+                        self._save(state)
+                        return SkillEntry(**entry)
             now = self._now()
             entry = SkillEntry(
                 id=f"skill_{state['next_id']:03d}",

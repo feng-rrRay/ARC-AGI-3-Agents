@@ -69,16 +69,8 @@ def build_action_prompt(latest_frame: FrameData, extra_context: str = "") -> str
 # full per-step prompt directly from data, without placeholder substitution.
 # Layout intentionally mirrors PokeAgent._build_structured_prompt:
 #   [RECENT HISTORY] [TOOL RESULTS FROM PREVIOUS STEP] [LONG-TERM MEMORY]
-#   [SKILL LIBRARY] [SUBAGENT REGISTRY] [CURRENT STATE] [BACKSTOP?]
+#   [SKILL LIBRARY] [SUBAGENT REGISTRY] [CURRENT STATE]
 #   [TURN instructions from harness_user.md]
-
-
-_BACKSTOP_TEMPLATE = (
-    "## BACKSTOP\n"
-    "You have spent {n} consecutive iteration(s) on analysis without "
-    "committing actions. Tools other than take_actions are not available "
-    "this round; you must call take_actions to advance the game."
-)
 
 
 def _render_tool_results(records: Iterable[ToolCallRecord]) -> str:
@@ -126,15 +118,8 @@ def build_working_prompt(
     skill_overview: str,
     subagent_overview: str,
     turn_block: str = HARNESS_USER_PROMPT,
-    force_take_actions: bool = False,
-    no_action_iters: int = 0,
 ) -> str:
-    """Assemble the per-VLM-call working prompt.
-
-    `force_take_actions=True` appends a BACKSTOP block telling the model that
-    only `take_actions` is exposed this round; the caller is responsible for
-    actually restricting the tool list before the VLM query.
-    """
+    """Assemble the per-VLM-call working prompt."""
     available = available_game_actions(latest_frame.available_actions)
     frame_text = pretty_print_3d(latest_frame.frame) or "(empty frame)"
 
@@ -163,11 +148,6 @@ def build_working_prompt(
         f"frame:\n{frame_text}"
     )
     sections.append(state_block)
-
-    if force_take_actions:
-        sections.append(
-            _BACKSTOP_TEMPLATE.format(n=max(1, no_action_iters))
-        )
 
     sections.append(turn_block.strip())
     return "\n\n".join(sections)

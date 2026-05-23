@@ -184,8 +184,6 @@ class ContinualHarness(Agent):
          tools["take_actions"] RPC), clear the carried tool-result block.
          Otherwise carry results forward to the next iteration's prompt
          (multi-round thinking across iterations).
-      5. If too many consecutive iterations passed without action, force-mode
-         the next iter: only take_actions exposed, with a BACKSTOP block.
 
     `choose_action` is unused (stubbed); the abstract method is satisfied but
     the engine is driven from `main()`.
@@ -200,11 +198,6 @@ class ContinualHarness(Agent):
     MAX_SUBAGENT_CALLS_PER_STEP = 1  # distinct run_subagent invocations per outer step
     MAX_SUBAGENT_ROUNDS_PER_CALL = 20  # inner VLM rounds per invocation
     SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
-    # No-action-iteration backstop: after this many consecutive outer iters with
-    # zero actions executed, the next iter is force-mode (only take_actions
-    # exposed + BACKSTOP block in prompt). Force-mode is a soft nudge — the
-    # loop keeps going even if force still produces no action.
-    MAX_CONSECUTIVE_NO_ACTION_ITERS = 5
     RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
     SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
     # Max number of grid-image attachments per orchestrator VLM call. Frames
@@ -374,12 +367,23 @@ class ContinualHarness(Agent):
                     entry = self.skills.add(
                         name=name, description=description, code=code, tags=tags
                     )
+                    # Version > 1 means add() routed to upsert-by-name; tell
+                    # the model so it knows the prior code was replaced.
+                    upserted = entry.version > 1
                     return {
                         "success": True,
                         "operation": "add",
                         "id": entry.id,
                         "name": entry.name,
                         "tags": entry.tags,
+                        "version": entry.version,
+                        "upserted": upserted,
+                        "message": (
+                            f"updated existing skill {entry.name!r} "
+                            f"(now version {entry.version})"
+                            if upserted
+                            else f"added new skill {entry.name!r}"
+                        ),
                     }
                 if op == "delete":
                     key = args.get("id") or ""
@@ -524,14 +528,12 @@ class ContinualHarness(Agent):
         # Cross-iteration state for the new VLM-call-driven loop.
         # `_recent_tool_results` carries forward analysis-tool outputs from one
         # outer iteration to the next (PokeAgent-style — cleared on action).
-        # `_consecutive_no_action_iters` drives the backstop force-mode.
         # `_consecutive_vlm_errors` is bookkeeping for hard failure detection.
         # `_sandbox_*` state is set per-skill by _handle_run_skill and read by
         # `_sandbox_rpc` to gate take_actions RPCs.
         # `_batch_counter` mints unique batch IDs for tagging trajectory rows.
         # `_vlm_call_count` is a monotonic counter set on `_current_outer_round`.
         self._recent_tool_results: list[ToolCallRecord] = []
-        self._consecutive_no_action_iters: int = 0
         self._consecutive_vlm_errors: int = 0
         self._sandbox_terminal_seen: bool = False
         self._sandbox_skill_id: str | None = None
@@ -1068,7 +1070,6 @@ class ContinualHarness(Agent):
             if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
                 self._execute_one(GameAction.RESET, source="auto_reset")
                 self._recent_tool_results = []
-                self._consecutive_no_action_iters = 0
                 continue
 
             # Prompt-evolution hook — boundary-gated by action_counter rather
@@ -1076,18 +1077,10 @@ class ContinualHarness(Agent):
             # still fire exactly once.
             self._maybe_evolve_prompt(latest_frame)
 
-            force = (
-                self._consecutive_no_action_iters
-                >= self.MAX_CONSECUTIVE_NO_ACTION_ITERS
-            )
-
-            actions_executed = self._vlm_loop_inner(latest_frame, force=force)
+            actions_executed = self._vlm_loop_inner(latest_frame)
 
             if actions_executed > 0:
-                self._consecutive_no_action_iters = 0
                 self._recent_tool_results = []
-            else:
-                self._consecutive_no_action_iters += 1
 
         self.cleanup()
 
@@ -1095,7 +1088,7 @@ class ContinualHarness(Agent):
     # Inner VLM dispatch — one VLM call per outer iteration.
     # ------------------------------------------------------------------
 
-    def _vlm_loop_inner(self, latest_frame: FrameData, *, force: bool) -> int:
+    def _vlm_loop_inner(self, latest_frame: FrameData) -> int:
         """Make one VLM call, dispatch every function call, return # actions executed.
 
         - `take_actions` calls execute their action list synchronously via
@@ -1133,8 +1126,8 @@ class ContinualHarness(Agent):
             skill_entries=[asdict(e) for e in self.skills.all_entries()],
         )
 
-        prompt = self._build_working_prompt(latest_frame, force_take_actions=force)
-        tools = [TAKE_ACTIONS_TOOL] if force else self._full_tool_list()
+        prompt = self._build_working_prompt(latest_frame)
+        tools = self._full_tool_list()
         self.vlm.set_tools(tools)
 
         # Keyframe-sample the image list before sending to the VLM. Most frames
@@ -1163,7 +1156,7 @@ class ContinualHarness(Agent):
         except Exception as exc:
             self._consecutive_vlm_errors += 1
             self._write_orchestrator_trace(
-                prompt=prompt, output={}, usage=None, tools=tools, force=force,
+                prompt=prompt, output={}, usage=None, tools=tools,
                 tool_calls=[], actions_executed=0, error=repr(exc),
             )
             logger.warning("VLM call failed: %s", exc)
@@ -1224,7 +1217,7 @@ class ContinualHarness(Agent):
             self.total_tokens += int(usage.get("total") or 0)
 
         self._write_orchestrator_trace(
-            prompt=prompt, output=output, usage=usage, tools=tools, force=force,
+            prompt=prompt, output=output, usage=usage, tools=tools,
             tool_calls=new_results, actions_executed=actions_executed, error=error,
         )
 
@@ -1241,7 +1234,7 @@ class ContinualHarness(Agent):
         tokens_total = int((usage or {}).get("total") or 0) if usage else 0
         tools_label = ", ".join(round_tool_log) if round_tool_log else "(no fcs)"
         logger.info(
-            "[%s] vlm#%d step=%d lvl=%d state=%s tokens=%d actions=%d tools=[%s]%s",
+            "[%s] vlm#%d step=%d lvl=%d state=%s tokens=%d actions=%d tools=[%s]",
             self.game_id,
             self._vlm_call_count,
             self.action_counter,
@@ -1250,7 +1243,6 @@ class ContinualHarness(Agent):
             tokens_total,
             actions_executed,
             tools_label,
-            " (FORCE)" if force else "",
         )
 
         return actions_executed
@@ -1444,9 +1436,7 @@ class ContinualHarness(Agent):
     # Working-prompt assembly.
     # ------------------------------------------------------------------
 
-    def _build_working_prompt(
-        self, latest_frame: FrameData, *, force_take_actions: bool
-    ) -> str:
+    def _build_working_prompt(self, latest_frame: FrameData) -> str:
         history_block = format_compact_history(
             self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT),
             frames=self.frames,
@@ -1464,8 +1454,6 @@ class ContinualHarness(Agent):
             memory_overview=memory_overview,
             skill_overview=skill_overview,
             subagent_overview=subagent_overview,
-            force_take_actions=force_take_actions,
-            no_action_iters=self._consecutive_no_action_iters,
         )
 
     # ------------------------------------------------------------------
@@ -1473,7 +1461,7 @@ class ContinualHarness(Agent):
     # ------------------------------------------------------------------
 
     def _full_tool_list(self) -> list[dict[str, Any]]:
-        """Unified action tool + analysis tools. Used in normal (non-force) mode."""
+        """Unified action tool + analysis tools — exposed every iteration."""
         tools: list[dict[str, Any]] = [TAKE_ACTIONS_TOOL]
         tools.extend(build_analysis_tools())  # get_recent_trajectory
         tools.append(PROCESS_MEMORY_TOOL)
@@ -1505,7 +1493,6 @@ class ContinualHarness(Agent):
         output: dict[str, Any],
         usage: dict[str, int | None] | None,
         tools: list[dict[str, Any]],
-        force: bool,
         tool_calls: list[ToolCallRecord],
         actions_executed: int,
         error: str | None = None,
@@ -1518,9 +1505,7 @@ class ContinualHarness(Agent):
                 "action_counter": self.action_counter,
                 "vlm_call": self._vlm_call_count,
                 "round": self._current_outer_round,
-                "tools_exposed": "take_actions_only" if force else "full",
-                "force_take_actions": force,
-                "consecutive_no_action_iters": self._consecutive_no_action_iters,
+                "tools_exposed": "full",
                 "input": {
                     "system_instruction": self._current_system_instruction,
                     "user_prompt": prompt,
