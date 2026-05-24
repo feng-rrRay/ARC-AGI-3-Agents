@@ -13,7 +13,7 @@ class ToolCallRecord:
     result: dict[str, Any] | str | None = None
     error: str | None = None
     # Number of engine actions this tool call drove inline (only nonzero for
-    # run_skill calls where the skill code invoked tools["take_actions"]).
+    # run_skill calls where the skill code invoked tools.take_actions().
     actions_taken_inline: int = 0
 
 

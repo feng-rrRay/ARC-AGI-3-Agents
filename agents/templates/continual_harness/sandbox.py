@@ -1042,7 +1042,7 @@ def _render_grid_impl(grid: Any) -> Any:
     Exposed to skill code as `render_grid(...)`. Output is pixel-identical
     to `helpers.grid_to_image` (same palette, same byte layout). Useful for
     rendering the post-action frame returned from a
-    `tools["take_actions"]` RPC, where the skill receives raw grid data
+    `tools.take_actions` RPC, where the skill receives raw grid data
     rather than pre-rendered images.
     """
     from PIL import Image as _PILImage
@@ -1220,8 +1220,14 @@ def _worker_main() -> int:
     safe_modules = _safe_modules()
     _install_audit_hook(allow_exec_events=1)
 
+    # Counts RPCs invoked by the skill so the post-exec no-output warning
+    # can distinguish "skill did literally nothing" from "skill drove the
+    # engine but skipped `result`".
+    rpc_invocations = [0]
+
     def _make_rpc_tool(method: str):
         def call(**kwargs):
+            rpc_invocations[0] += 1
             msg = json.dumps({"type": "rpc", "method": method, "args": kwargs}, default=str) + "\n"
             real_stdout.write(msg)
             real_stdout.flush()
@@ -1277,6 +1283,25 @@ def _worker_main() -> int:
         result_obj["error"] = "MemoryError"
     except Exception as exc:
         result_obj["error"] = f"{type(exc).__name__}: {exc}"
+
+    # No-output safeguard: if the skill ran cleanly but produced no result,
+    # no stdout, no stderr, AND made no engine RPC, AND the code contains a
+    # function def, it likely defined `def run(args): ...` without calling
+    # it. Surface a hint so the model can fix the pattern next turn.
+    if (
+        result_obj.get("success")
+        and "result" not in globals_dict
+        and not out_buf.getvalue()
+        and not err_buf.getvalue()
+        and rpc_invocations[0] == 0
+        and "def " in code
+    ):
+        err_buf.write(
+            "WARNING: skill produced no result, no stdout, and made no "
+            "engine calls. If you wrapped logic in `def run(args): ...`, "
+            "add `result = run(args)` after the def — nothing is invoked "
+            "automatically.\n"
+        )
 
     result_obj["stdout"] = out_buf.getvalue()[:STDOUT_CAP]
     result_obj["stderr"] = err_buf.getvalue()[:STDERR_CAP]

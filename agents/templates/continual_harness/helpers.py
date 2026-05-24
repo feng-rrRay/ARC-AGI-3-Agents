@@ -248,7 +248,7 @@ def parse_action_response(
 
 # --- Multi-action validation (unified take_actions tool) ---------------------
 # Used by both the orchestrator's take_actions dispatch and the sandbox RPC for
-# skill-driven tools["take_actions"] calls.
+# skill-driven tools.take_actions() calls.
 
 
 @dataclass(slots=True)

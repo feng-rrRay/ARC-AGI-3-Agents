@@ -181,7 +181,7 @@ class ContinualHarness(Agent):
          `take_actions(actions=[...])` call. All are dispatched in emission
          order. take_actions executes its action list synchronously.
       4. If any actions were executed (orchestrator OR via a skill's inline
-         tools["take_actions"] RPC), clear the carried tool-result block.
+         tools.take_actions RPC), clear the carried tool-result block.
          Otherwise carry results forward to the next iteration's prompt
          (multi-round thinking across iterations).
 
@@ -1094,7 +1094,7 @@ class ContinualHarness(Agent):
         - `take_actions` calls execute their action list synchronously via
           `_dispatch_take_actions`.
         - Analysis tool calls (process_*, run_skill, run_subagent, etc.) go
-          through `self.tool_router`. A skill that called tools["take_actions"]
+          through `self.tool_router`. A skill that called tools.take_actions()
           inside the sandbox contributes its inline action count via the
           `actions_taken_inline` field on the returned ToolCallRecord.
         - Stray legacy ACTION1..ACTION6 calls are rejected with an explicit
@@ -1392,7 +1392,7 @@ class ContinualHarness(Agent):
         return frame
 
     # ------------------------------------------------------------------
-    # Sandbox RPC dispatcher — invoked from a skill's tools["take_actions"].
+    # Sandbox RPC dispatcher — invoked from a skill's tools.take_actions().
     # ------------------------------------------------------------------
 
     def _sandbox_rpc(self, method: str, args: dict[str, Any]) -> dict[str, Any]:

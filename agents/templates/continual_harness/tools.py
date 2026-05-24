@@ -510,7 +510,7 @@ def is_action_tool(name: str) -> bool:
 
 # --- Single unified action tool ----------------------------------------------
 # Used by the orchestrator VLM (function call) AND by skills via the sandbox
-# `tools["take_actions"]` callback. Same name everywhere. The orchestrator's
+# `tools.take_actions` callback. Same name everywhere. The orchestrator's
 # tool surface exposes TAKE_ACTIONS_TOOL; the sandbox builds an equivalent
 # callable. See feedback-tool-unification memory.
 
@@ -536,7 +536,7 @@ TAKE_ACTIONS_TOOL: dict[str, Any] = {
         "Only extend the list when each step's outcome follows mechanically "
         "from the current frame.\n\n"
         "Skills may also drive the engine inline by calling "
-        "tools['take_actions'](actions=[...]) inside their code; that call "
+        "tools.take_actions(actions=[...]) inside their code; that call "
         "returns the resulting frame so the skill can react before the next "
         "step."
     ),

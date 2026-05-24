@@ -416,6 +416,65 @@ class TestSandboxDualAccess:
         assert out["success"] is True
         assert out["result"] == [1, 1, "ACTION1"]
 
+    def test_rpc_return_dual_access(self) -> None:
+        """tools.take_actions return value supports both attr and subscript."""
+
+        def fake_rpc(method: str, args: dict) -> dict:
+            return {
+                "ok": True,
+                "value": {
+                    "executed_count": 1,
+                    "last_frame": {"frame": [[0, 1]], "state": "ONGOING"},
+                    "terminal": False,
+                    "level_changed": False,
+                },
+            }
+
+        code = (
+            "res = tools.take_actions(actions=[{'name': 'ACTION1'}])\n"
+            "result = [\n"
+            "    res.executed_count,\n"
+            "    res['executed_count'],\n"
+            "    res.last_frame.state,\n"
+            "    res['last_frame']['state'],\n"
+            "]"
+        )
+        out = run_python_snippet(
+            code, state=_empty_state(), on_rpc=fake_rpc
+        )
+        assert out["success"] is True
+        assert out["result"] == [1, 1, "ONGOING", "ONGOING"]
+
+    def test_tools_attribute_access_works(self) -> None:
+        """tools.take_actions (attribute) is the correct access pattern."""
+
+        def fake_rpc(method: str, args: dict) -> dict:
+            return {"ok": True, "value": {"executed_count": 1, "terminal": False}}
+
+        out = run_python_snippet(
+            "res = tools.take_actions(actions=[{'name': 'ACTION1'}])\n"
+            "result = res.executed_count",
+            state=_empty_state(),
+            on_rpc=fake_rpc,
+        )
+        assert out["success"] is True
+        assert out["result"] == 1
+
+    def test_tools_subscript_access_fails(self) -> None:
+        """tools['take_actions'] (subscript) must fail — tools is a namespace."""
+
+        def fake_rpc(method: str, args: dict) -> dict:
+            return {"ok": True, "value": {"executed_count": 1, "terminal": False}}
+
+        out = run_python_snippet(
+            'res = tools["take_actions"](actions=[{"name": "ACTION1"}])\n'
+            "result = res",
+            state=_empty_state(),
+            on_rpc=fake_rpc,
+        )
+        assert out["success"] is False
+        assert "not subscriptable" in (out.get("error") or "")
+
     def test_missing_key_raises_attribute_error(self) -> None:
         state = SandboxState(latest_frame={"a": 1})
         out = run_python_snippet(

@@ -42,7 +42,7 @@ Full schemas accompany this prompt; the short orientation:
 
 - **run_skill(reasoning, id, args)** — dual-use. Executes a saved Python
   skill in a sandbox. A skill may compute analysis data (assign `result = ...`),
-  drive the engine inline (`tools["take_actions"](actions=[...])`), or both.
+  drive the engine inline (`tools.take_actions(actions=[...])`), or both.
   Use the engine-driving form for deterministic sub-routines (pathfinding,
   scanning loops); use the analysis form for one-off computations. The
   ## SKILL CODE RULES section below is the contract for the skill body.
@@ -64,19 +64,32 @@ across steps.
   `ImageOps`, `ImageChops`; helpers `render_grid(grid_2d)` and
   `render_grids(grids_3d)`. `import X` is allowed only for those names
   (and `PIL`).
-- `state` and `tools["take_actions"]` return values accept BOTH `obj.key`
+- `state` and `tools.take_actions(...)` return values accept BOTH `obj.key`
   and `obj["key"]` on string keys, recursively. `args` is a plain dict.
+  `tools` itself is attribute-access only (`tools.take_actions`, NOT
+  `tools["take_actions"]`).
 - `state` exposes `latest_frame`, `recent_trajectory`, `memory_entries`,
   `skill_entries`, `images` (pre-rendered PIL images for the current frame).
+- `state.latest_frame` fields: `frame` (list of 2D int grids — animation
+  sequence from the last action; `frame[-1]` is the current grid as
+  `list[list[int]]`), `state` (str: `"ONGOING"`/`"WIN"`/`"GAME_OVER"`),
+  `score`, `available_actions`, `game_id`. There is NO `grids` key —
+  use `frame`.
 - Banned at parse time: `setattr`, `delattr`, `eval`, `exec`, `open`,
   `compile`, `globals`, `locals`, `dir`, `vars`, `__import__`, dunder names,
   `_`-prefixed attributes, network/filesystem I/O. (`getattr`/`hasattr` are
   OK.)
-- `tools["take_actions"](actions=[...])` returns `{executed_count, last_frame,
+- `tools.take_actions(actions=[...])` returns `{executed_count, last_frame,
   terminal, level_changed, state, score, available_actions}`. Re-check
   `terminal` AND `level_changed` before sending another batch — a level
   transition makes any precomputed plan stale.
-- Assign `result = ...` to return analysis data (JSON-serialized, capped).
+- Execution model: the skill body runs ONCE as a top-level Python
+  script. Outputs are: `result = <json-serializable>` (returned to the
+  caller), `print(...)` (captured as stdout), and
+  `tools.take_actions(actions=[...])` (drives the engine).
+  Pitfall: `def run(args): ...` alone DEFINES a function and does
+  nothing — you must also CALL it (e.g. `result = run(args)`) or write
+  the logic at top level. Nothing is auto-invoked by name.
 - If a `run_skill` call errors because of a skill-code bug, EDIT the skill
   before re-running it; rerunning unchanged code reproduces the bug.
 
