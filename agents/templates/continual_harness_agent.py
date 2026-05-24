@@ -189,7 +189,7 @@ class ContinualHarness(Agent):
     the engine is driven from `main()`.
     """
 
-    MAX_ACTIONS = 1000
+    MAX_ACTIONS = 5000
     MODEL = "gemini-3.1-pro-preview"  # default; override via GEMINI_MODEL
     HISTORY_MAX_CHARS = 12000  # budget for the RECENT HISTORY block
     HISTORY_BATCH_WINDOW = 5  # last N batches shown in compact history
@@ -1416,11 +1416,13 @@ class ContinualHarness(Agent):
         level_changed = last.levels_completed != pre_level
         if terminal:
             self._sandbox_terminal_seen = True
+        frame_dump = _safe_frame_dump(last)
         return {
             "ok": executed > 0,
             "value": {
                 "executed_count": executed,
-                "last_frame": _safe_frame_dump(last),
+                "last_frame": frame_dump,
+                "frame": frame_dump,
                 "terminal": terminal,
                 "level_changed": level_changed,
                 "state": last.state.name,

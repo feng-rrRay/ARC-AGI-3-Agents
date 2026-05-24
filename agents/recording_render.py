@@ -135,6 +135,17 @@ class TraceEvent:
     evolution: PromptEvolutionEntry | None
     subagent_info: JsonObject | None
 
+    @property
+    def total_actions(self) -> int:
+        """Direct take_actions + run_skill inline actions."""
+        direct = self.actions_executed or 0
+        inline = sum(
+            c.actions_taken_inline
+            for c in self.calls
+            if c.actions_taken_inline is not None and c.actions_taken_inline > 0
+        )
+        return direct + inline
+
 
 @dataclass(frozen=True)
 class ActionPanel:
@@ -346,23 +357,21 @@ def parse_trace_events(path: str | Path) -> list[TraceEvent]:
 def group_into_panels(events: Sequence[TraceEvent]) -> list[ActionPanel]:
     """Bucket trace events into one panel per batch of action frames.
 
-    A panel closes when an orchestrator event has actions_executed > 0. Every
-    preceding event since the last close (no-action orchestrator rows, prompt-
-    evolution rows, subagent rows) belongs to the same panel and renders ahead
-    of the action-emitting one. A trailing run of no-action events at end-of-
-    file has no frames to attach to and is dropped.
+    A panel closes when an orchestrator event has total_actions > 0 (direct
+    take_actions and/or run_skill inline actions). Every preceding event since
+    the last close (no-action orchestrator rows, prompt-evolution rows,
+    subagent rows) belongs to the same panel and renders ahead of the
+    action-emitting one. A trailing run of no-action events at end-of-file
+    has no frames to attach to and is dropped.
     """
     panels: list[ActionPanel] = []
     buffer: list[TraceEvent] = []
     for event in events:
         buffer.append(event)
-        if (
-            event.kind == "orchestrator"
-            and event.actions_executed is not None
-            and event.actions_executed > 0
-        ):
+        total = event.total_actions
+        if event.kind == "orchestrator" and total > 0:
             frame_end = event.action_counter - 1
-            frame_start = frame_end - event.actions_executed + 1
+            frame_start = frame_end - total + 1
             panels.append(
                 ActionPanel(
                     frame_start=frame_start,
@@ -1159,11 +1168,11 @@ def _build_trace_event(raw: JsonObject, *, file_index: int) -> TraceEvent | None
         record_error = (
             _clean_string(record.get("error")) if isinstance(record, dict) else None
         )
-        actions_inline = (
-            _int_or_none(record.get("actions_taken_inline"))
-            if isinstance(record, dict)
-            else None
-        )
+        actions_inline = None
+        if isinstance(record, dict):
+            actions_inline = _int_or_none(record.get("actions_taken_inline"))
+            if not actions_inline and isinstance(result_value, dict):
+                actions_inline = _int_or_none(result_value.get("actions_taken_inline"))
         calls.append(
             CallEntry(
                 name=name,
@@ -1294,12 +1303,19 @@ def _format_trace_event(event: TraceEvent) -> list[str]:
 
 def _format_orchestrator_event(event: TraceEvent) -> list[str]:
     call_label = event.tools_exposed or "vlm"
+    direct = event.actions_executed or 0
+    total = event.total_actions
+    inline = total - direct
     suffix_bits: list[str] = []
-    if event.actions_executed is not None:
-        if event.actions_executed > 0:
-            suffix_bits.append(f"{event.actions_executed} actions")
+    if total > 0:
+        if inline > 0 and direct > 0:
+            suffix_bits.append(f"{total} actions ({direct} direct, {inline} skill)")
+        elif inline > 0:
+            suffix_bits.append(f"{inline} actions (skill)")
         else:
-            suffix_bits.append("no actions")
+            suffix_bits.append(f"{direct} actions")
+    elif event.actions_executed is not None:
+        suffix_bits.append("no actions")
     if event.force_take_actions:
         suffix_bits.append("force")
     suffix = f" [{', '.join(suffix_bits)}]" if suffix_bits else ""
@@ -1482,6 +1498,8 @@ def _format_run_skill(call: CallEntry) -> list[str]:
     head = f"- run_skill {skill_id}"
     if skill_name:
         head += f" ({skill_name})"
+    if call.actions_taken_inline is not None and call.actions_taken_inline > 0:
+        head += f" [{call.actions_taken_inline} actions]"
     head += _status_suffix(call)
     lines = [head]
     _append_detail(lines, "reasoning", args.get("reasoning"))
