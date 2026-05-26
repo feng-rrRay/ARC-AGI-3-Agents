@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 # --- Caps (parent-side; child also enforces via rlimit when available) -------
 
-CODE_MAX_CHARS = 8000
+CODE_MAX_CHARS = 32000
 ARGS_JSON_MAX_CHARS = 4000
 STDOUT_CAP = 5000
 STDERR_CAP = 5000

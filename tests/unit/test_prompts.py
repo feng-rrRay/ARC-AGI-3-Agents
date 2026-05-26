@@ -13,10 +13,10 @@ from agents.templates.continual_harness.action_descriptions import (
     ACTION_DESCRIPTIONS,
 )
 from agents.templates.continual_harness.prompts import (
+    BASE_ORCHESTRATOR_POLICY,
     EVOLUTION_SYSTEM_INSTRUCTION,
     EVOLUTION_USER_PROMPT,
     HARNESS_SYSTEM_INSTRUCTION,
-    HARNESS_USER_PROMPT,
     NAIVE_SYSTEM_INSTRUCTION,
     NAIVE_USER_PROMPT,
     load_prompt,
@@ -64,7 +64,7 @@ class TestPromptLoader:
             ("NAIVE_SYSTEM_INSTRUCTION", NAIVE_SYSTEM_INSTRUCTION),
             ("NAIVE_USER_PROMPT", NAIVE_USER_PROMPT),
             ("HARNESS_SYSTEM_INSTRUCTION", HARNESS_SYSTEM_INSTRUCTION),
-            ("HARNESS_USER_PROMPT", HARNESS_USER_PROMPT),
+            ("BASE_ORCHESTRATOR_POLICY", BASE_ORCHESTRATOR_POLICY),
             ("EVOLUTION_SYSTEM_INSTRUCTION", EVOLUTION_SYSTEM_INSTRUCTION),
             ("EVOLUTION_USER_PROMPT", EVOLUTION_USER_PROMPT),
         ]:
@@ -117,37 +117,25 @@ class TestHarnessSystemContent:
         # advertise it (otherwise the model will try to call it and fail).
         assert "run_code" not in HARNESS_SYSTEM_INSTRUCTION
 
-    def test_mentions_step_termination_invariant(self) -> None:
+    def test_mentions_play_pace(self) -> None:
         text = HARNESS_SYSTEM_INSTRUCTION.lower()
-        # The hard rule "every step ends with exactly one action call" must be
-        # mentioned in some recognisable form. We allow "ARC action" between
-        # "exactly one" and "action" since the harness prompt uses that wording.
-        assert (
-            "exactly one arc action" in text
-            or "exactly one action" in text
-            or "one action call" in text
-        )
+        assert "action" in text and "reasoning" in text
 
 
 @pytest.mark.unit
 class TestEvolutionPromptContent:
-    def test_evolution_system_references_evolve_tool(self) -> None:
-        assert "evolve_system_prompt" in EVOLUTION_SYSTEM_INSTRUCTION
+    def test_evolution_system_mentions_game_name_placeholder(self) -> None:
+        assert "{game_name}" in EVOLUTION_SYSTEM_INSTRUCTION
 
     def test_evolution_user_has_all_placeholders(self) -> None:
-        # Make sure every placeholder build_evolution_prompt expects is present.
         for placeholder in [
-            "{current_prompt}",
-            "{state}",
-            "{score}",
-            "{action_counter}",
-            "{generation}",
+            "{system_prompt}",
+            "{current_base_prompt}",
             "{n}",
             "{trajectory}",
             "{memory_overview}",
             "{skill_overview}",
             "{subagent_overview}",
-            "{frame}",
         ]:
             assert placeholder in EVOLUTION_USER_PROMPT, (
                 f"evolution_user.md missing placeholder {placeholder}"

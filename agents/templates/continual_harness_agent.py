@@ -34,6 +34,7 @@ from .continual_harness.prompt_evolution import (
     validate_evolved_prompt,
 )
 from .continual_harness.prompts import (
+    BASE_ORCHESTRATOR_POLICY,
     EVOLUTION_SYSTEM_INSTRUCTION,
     HARNESS_SYSTEM_INSTRUCTION,
 )
@@ -49,7 +50,6 @@ from .continual_harness.subagents import (
     format_subagent_overview,
 )
 from .continual_harness.tools import (
-    EVOLVE_SYSTEM_PROMPT_TOOL,
     PROCESS_MEMORY_TOOL,
     PROCESS_SKILL_TOOL,
     PROCESS_SUBAGENT_TOOL,
@@ -62,7 +62,6 @@ from .continual_harness.tools import (
     build_subagent_tools,
     extract_function_calls,
     is_action_tool,
-    is_evolve_prompt_call,
     is_subagent_return_call,
     is_take_actions_call,
     render_tool_results,
@@ -81,6 +80,27 @@ from .continual_harness.trajectory import (
 from .utils.vlm_backend import VLM
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_grid_delta(
+    pre_grid: list[list[int]] | None,
+    post_grid: list[list[int]] | None,
+) -> list[list[int]] | None:
+    """Compare two 2D grids and return changed cells as [[x, y, old, new], ...].
+
+    Returns None if either grid is missing. Caps at 50 entries to bound
+    JSONL row size.
+    """
+    if pre_grid is None or post_grid is None:
+        return None
+    delta: list[list[int]] = []
+    for y, (pre_row, post_row) in enumerate(zip(pre_grid, post_grid)):
+        for x, (old, new) in enumerate(zip(pre_row, post_row)):
+            if old != new:
+                delta.append([x, y, old, new])
+                if len(delta) >= 50:
+                    return delta
+    return delta if delta else None
 
 
 def _action_data_dict(action: GameAction) -> dict[str, Any]:
@@ -209,7 +229,7 @@ class ContinualHarness(Agent):
     # Prompt-evolution defaults; the actual frequency is read from
     # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
     # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
-    DEFAULT_PROMPT_EVOLVE_FREQUENCY = 25
+    DEFAULT_PROMPT_EVOLVE_FREQUENCY = 75
     PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
     EVOLUTION_TRAJECTORY_WINDOW = 25  # how many recent steps the meta-call sees
 
@@ -219,10 +239,10 @@ class ContinualHarness(Agent):
         self.model_name = os.getenv("GEMINI_MODEL", self.MODEL)
         super().__init__(*args, **kwargs)
 
-        # Prompt-evolution wiring: the active system instruction lives in a
-        # single .md file (run-local by default; --bootstrap-prompt opts into
-        # cross-run persistence). On first use the baseline is seeded into the
-        # file; every successful evolution rewrites it.
+        # Three-layer prompt architecture:
+        # 1. _system_instruction: fixed, never evolved (tool schemas, game context)
+        # 2. _current_base_prompt: evolved strategic guidance (rules, strategy)
+        # 3. Per-step user prompt: game state, history, tool results
         freq_raw = os.getenv(
             self.PROMPT_EVOLVE_FREQUENCY_ENV,
             str(self.DEFAULT_PROMPT_EVOLVE_FREQUENCY),
@@ -231,10 +251,17 @@ class ContinualHarness(Agent):
             self._prompt_evolve_frequency = max(0, int(freq_raw))
         except ValueError:
             self._prompt_evolve_frequency = self.DEFAULT_PROMPT_EVOLVE_FREQUENCY
-        self._prompt_file = PromptFile(
-            active_prompt_path(), baseline=HARNESS_SYSTEM_INSTRUCTION
+
+        # Fixed system instruction — NEVER evolved. {game_name} substituted here.
+        self._system_instruction: str = HARNESS_SYSTEM_INSTRUCTION.replace(
+            "{game_name}", self.game_id
         )
-        self._current_system_instruction: str = self._prompt_file.read()
+
+        # Evolvable base prompt — strategic guidance, rule discoveries.
+        self._base_prompt_file = PromptFile(
+            active_prompt_path(), baseline=BASE_ORCHESTRATOR_POLICY
+        )
+        self._current_base_prompt: str = self._base_prompt_file.read()
         self._prompt_generation: int = 0
         self._last_evolution_step: int = -1
         self.prompt_evolution = PromptEvolutionStore(active_prompt_evolution_path())
@@ -242,8 +269,9 @@ class ContinualHarness(Agent):
         self.vlm = VLM(
             self.model_name,
             backend="gemini",
-            system_instruction=self._current_system_instruction,
+            system_instruction=self._system_instruction,
         )
+        self.vlm.set_tools(self._full_tool_list())
         recorder = getattr(self, "recorder", None)
         guid = getattr(recorder, "guid", None)
         # JSONL artifacts share the recording stem when run-dir wiring is active.
@@ -692,6 +720,7 @@ class ContinualHarness(Agent):
             warning: str | None = None
             forced_return = False
             inner_round = 0
+            total_subagent_actions = 0
 
             for inner_round in range(1, self.MAX_SUBAGENT_ROUNDS_PER_CALL + 1):
                 round_records: list[ToolCallRecord] = []
@@ -699,6 +728,7 @@ class ContinualHarness(Agent):
                 usage: dict[str, int | None] | None = None
                 round_error: str | None = None
                 ret_call_args: dict[str, Any] | None = None
+                round_actions = 0
 
                 try:
                     response = sub_vlm.get_query(
@@ -710,32 +740,58 @@ class ContinualHarness(Agent):
                     usage = sub_vlm.extract_usage(response)
                     fcs = extract_function_calls(response)
 
-                    ret_call = next(
-                        (fc for fc in fcs if is_subagent_return_call(fc.name)),
-                        None,
-                    )
-                    if ret_call is not None:
-                        ret_call_args = ret_call.args
-                        final_answer = {
-                            "answer": str(ret_call.args.get("answer") or ""),
-                            "status": str(ret_call.args.get("status") or "success"),
-                            "reasoning": str(ret_call.args.get("reasoning") or ""),
-                        }
-                    else:
-                        for fc in fcs:
-                            if fc.name not in entry.allowed_tools:
+                    for fc in fcs:
+                        if is_subagent_return_call(fc.name):
+                            ret_call_args = fc.args
+                            final_answer = {
+                                "answer": str(fc.args.get("answer") or ""),
+                                "status": str(fc.args.get("status") or "success"),
+                                "reasoning": str(fc.args.get("reasoning") or ""),
+                            }
+                            break
+
+                        if is_take_actions_call(fc.name):
+                            if "take_actions" not in (entry.allowed_tools or []):
                                 round_records.append(
                                     ToolCallRecord(
                                         name=fc.name,
                                         args=fc.args,
-                                        error=(
-                                            f"tool {fc.name!r} not in allowed_tools "
-                                            f"{entry.allowed_tools}"
-                                        ),
+                                        error="take_actions not in allowed_tools",
                                     )
                                 )
                                 continue
-                            round_records.append(self.tool_router.execute(fc))
+                            executed = self._dispatch_take_actions(
+                                fc.args, source="subagent"
+                            )
+                            round_actions += executed
+                            round_records.append(
+                                ToolCallRecord(
+                                    name=fc.name,
+                                    args=fc.args,
+                                    result={"executed": executed},
+                                    actions_taken_inline=executed,
+                                )
+                            )
+                            if self.frames[-1].state in (
+                                GameState.WIN,
+                                GameState.GAME_OVER,
+                            ):
+                                break
+                            continue
+
+                        if fc.name not in (entry.allowed_tools or []):
+                            round_records.append(
+                                ToolCallRecord(
+                                    name=fc.name,
+                                    args=fc.args,
+                                    error=(
+                                        f"tool {fc.name!r} not in allowed_tools "
+                                        f"{entry.allowed_tools}"
+                                    ),
+                                )
+                            )
+                            continue
+                        round_records.append(self.tool_router.execute(fc))
                 except Exception as exc:
                     round_error = repr(exc)
                     last_error = round_error
@@ -790,11 +846,13 @@ class ContinualHarness(Agent):
                         self.total_output_tokens += int(usage.get("output") or 0)
                         self.total_tokens += int(usage.get("total") or 0)
 
+                total_subagent_actions += round_actions
                 round_step = {
                     "inner_round": inner_round,
                     "tool_calls": [asdict(r) for r in round_records],
                     "subagent_return": ret_call_args,
                     "error": round_error,
+                    "actions": round_actions,
                 }
                 if usage is not None:
                     round_step["usage"] = usage
@@ -803,13 +861,41 @@ class ContinualHarness(Agent):
 
                 if final_answer is not None:
                     break
+                if self.frames[-1].state in (GameState.WIN, GameState.GAME_OVER):
+                    break
                 if round_error is not None:
-                    # Network/VLM error — bail (no retry inside the subagent loop;
-                    # the orchestrator can decide whether to invoke again next round).
                     break
                 if not round_records:
                     last_error = "subagent produced no tool calls and did not return"
                     break
+
+                if round_actions > 0:
+                    latest = self.frames[-1]
+                    self._current_latest_frame = latest
+                    self._current_images = list(frame_to_images(latest))
+                    images = self._current_images
+                    payload = (
+                        images
+                        if len(images) > 1
+                        else (images[0] if images else None)
+                    )
+                    history = format_compact_history(
+                        self.trajectory.tail(self.SUBAGENT_HISTORY_WINDOW),
+                        max_chars=self.HISTORY_MAX_CHARS,
+                    )
+                    base_prompt = build_subagent_prompt(
+                        task=task,
+                        context=context,
+                        latest_frame=latest,
+                        memory_overview=format_memory_overview(
+                            self.memory.all_entries()
+                        ),
+                        skill_overview=format_skill_overview(
+                            self.skills.all_entries()
+                        ),
+                        compact_history=history,
+                    )
+
                 working_prompt = (
                     base_prompt + "\n\n" + render_tool_results(round_records)
                 )
@@ -853,6 +939,7 @@ class ContinualHarness(Agent):
                 "error": last_error,
                 "steps": subagent_steps,
                 "tool_calls": [asdict(r) for r in tool_calls_log],
+                "actions_taken_inline": total_subagent_actions,
             }
 
         handlers: dict[str, Any] = {
@@ -887,7 +974,7 @@ class ContinualHarness(Agent):
             "[%s] Prompt evolution: frequency=%d, baseline at %s, log at %s",
             self.name,
             self._prompt_evolve_frequency,
-            self._prompt_file.path,
+            self._base_prompt_file.path,
             self.prompt_evolution.path,
         )
 
@@ -905,47 +992,59 @@ class ContinualHarness(Agent):
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return latest_frame.state is GameState.WIN
 
-    def _evolve_system_prompt(self, latest_frame: FrameData) -> None:
-        """One meta-VLM call that may rewrite the agent's system instruction.
+    @staticmethod
+    def _extract_text(response: Any) -> str:
+        """Extract plain text from a Gemini response, stripping markdown fences."""
+        text = ""
+        for cand in getattr(response, "candidates", None) or []:
+            for part in getattr(getattr(cand, "content", None), "parts", []) or []:
+                t = getattr(part, "text", None)
+                if t:
+                    text += t
+        text = text.strip()
+        if text.startswith("```markdown"):
+            text = text[11:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip()
 
-        Spawns a fresh VLM with EVOLUTION_SYSTEM_INSTRUCTION + a single tool
-        (evolve_system_prompt). Single round, no retry. The proposal is
-        accepted only if `validate_evolved_prompt` returns ok=True; on accept,
-        the new text is written through `self._prompt_file` and `self.vlm`
-        picks it up on the next get_query call. Every attempt (accepted or
-        rejected) is appended to `self.prompt_evolution`.
+    def _evolve_system_prompt(self, latest_frame: FrameData) -> None:
+        """One meta-VLM call that may rewrite the agent's base prompt.
+
+        Spawns a fresh VLM with EVOLUTION_SYSTEM_INSTRUCTION. The model returns
+        the improved prompt as plain text. Accepted only if
+        `validate_evolved_prompt` returns ok=True; on accept, the new text is
+        written through `self._base_prompt_file`. Every attempt is logged.
         """
         self._prompt_generation += 1
         gen = self._prompt_generation
-        previous = self._current_system_instruction
+        previous = self._current_base_prompt
 
         trajectory_rows = self.trajectory.tail(self.EVOLUTION_TRAJECTORY_WINDOW)
         user_prompt = build_evolution_prompt(
-            current_prompt=previous,
-            latest_frame=latest_frame,
-            generation=gen,
-            action_counter=self.action_counter,
+            system_prompt=self._system_instruction,
+            current_base_prompt=previous,
             trajectory_rows=trajectory_rows,
             memory_overview=format_memory_overview(self.memory.all_entries()),
             skill_overview=format_skill_overview(self.skills.all_entries()),
             subagent_overview=format_subagent_overview(self.subagents.all_entries()),
         )
 
+        evolution_system = EVOLUTION_SYSTEM_INSTRUCTION.replace(
+            "{game_name}", self.game_id
+        )
         meta_vlm = VLM(
             self.model_name,
             backend="gemini",
-            system_instruction=EVOLUTION_SYSTEM_INSTRUCTION,
+            system_instruction=evolution_system,
         )
-        meta_vlm.set_tools([EVOLVE_SYSTEM_PROMPT_TOOL])
 
-        # This hook runs before choose_action refreshes `_current_images`, so
-        # render from latest_frame directly to avoid using a stale previous-step
-        # image payload.
         images = list(frame_to_images(latest_frame))
         payload: Any = images if len(images) > 1 else (images[0] if images else None)
 
         proposed = ""
-        reasoning = ""
         accepted = False
         validation_error: str | None = None
         usage: dict[str, int | None] | None = None
@@ -960,20 +1059,16 @@ class ContinualHarness(Agent):
             )
             output = serialize_response(response)
             usage = meta_vlm.extract_usage(response)
-            fcs = extract_function_calls(response)
-            call = next((fc for fc in fcs if is_evolve_prompt_call(fc.name)), None)
-            if call is None:
-                validation_error = "model did not call evolve_system_prompt"
+            proposed = self._extract_text(response)
+            if not proposed:
+                validation_error = "model returned empty text"
             else:
-                reasoning = str(call.args.get("reasoning") or "")
-                proposed = str(call.args.get("new_prompt") or "")
                 ok, err = validate_evolved_prompt(proposed)
                 accepted = ok
                 validation_error = err
                 if accepted:
-                    self._current_system_instruction = proposed
-                    self.vlm.set_system_instruction(proposed)
-                    self._prompt_file.write(proposed)
+                    self._current_base_prompt = proposed
+                    self._base_prompt_file.write(proposed)
         except Exception as exc:
             error = repr(exc)
             logger.warning("Prompt evolution gen=%d failed: %s", gen, exc)
@@ -988,10 +1083,10 @@ class ContinualHarness(Agent):
                 generation=gen,
                 action_counter=self.action_counter,
                 accepted=accepted,
-                reasoning=reasoning,
+                reasoning="",
                 proposed_prompt=proposed,
                 previous_prompt=previous,
-                new_prompt=self._current_system_instruction,
+                new_prompt=self._current_base_prompt,
                 validation_error=validation_error or error,
                 usage=usage,
                 timestamp=now_iso(),
@@ -1011,12 +1106,11 @@ class ContinualHarness(Agent):
                         "accepted": accepted,
                         "validation_error": validation_error,
                         "previous_len": len(previous),
-                        "new_len": len(self._current_system_instruction),
+                        "new_len": len(self._current_base_prompt),
                     },
                     "input": {
-                        "system_instruction": EVOLUTION_SYSTEM_INSTRUCTION,
+                        "system_instruction": evolution_system,
                         "user_prompt": user_prompt,
-                        "tools": [EVOLVE_SYSTEM_PROMPT_TOOL],
                         "images": [
                             {"width": img.width, "height": img.height, "mode": img.mode}
                             for img in images
@@ -1024,9 +1118,6 @@ class ContinualHarness(Agent):
                     },
                     "output": output,
                     "usage": usage,
-                    "chosen_action": None,
-                    "reasoning": reasoning,
-                    "tool_calls": [],
                     "error": error,
                 }
             )
@@ -1036,7 +1127,7 @@ class ContinualHarness(Agent):
                 self.name,
                 gen,
                 accepted,
-                len(self._current_system_instruction),
+                len(self._current_base_prompt),
                 len(previous),
                 validation_error or error,
             )
@@ -1072,6 +1163,8 @@ class ContinualHarness(Agent):
                 self._recent_tool_results = []
                 continue
 
+            pre_step_level = latest_frame.levels_completed
+
             # Prompt-evolution hook — boundary-gated by action_counter rather
             # than modulo so multi-action batches that straddle a boundary
             # still fire exactly once.
@@ -1081,6 +1174,12 @@ class ContinualHarness(Agent):
 
             if actions_executed > 0:
                 self._recent_tool_results = []
+
+            # Level-up evolution: consolidate discovered rules immediately
+            # after advancing to a new level.
+            post_frame = self.frames[-1]
+            if post_frame.levels_completed > pre_step_level:
+                self._evolve_on_level_up(post_frame)
 
         self.cleanup()
 
@@ -1128,7 +1227,6 @@ class ContinualHarness(Agent):
 
         prompt = self._build_working_prompt(latest_frame)
         tools = self._full_tool_list()
-        self.vlm.set_tools(tools)
 
         # Keyframe-sample the image list before sending to the VLM. Most frames
         # carry 1 grid (sample is a no-op). Long animation sequences (and the
@@ -1331,6 +1429,7 @@ class ContinualHarness(Agent):
     ) -> FrameData | None:
         pre = self.frames[-1]
         pre_state, pre_score = pre.state.name, pre.levels_completed
+        pre_grid = pre.frame[-1] if pre.frame else None
 
         frame = self.take_action(action)        # base class: arc_env.step + validate
         if frame is not None:
@@ -1340,6 +1439,8 @@ class ContinualHarness(Agent):
         post = frame if frame is not None else pre
         score_after = post.levels_completed
         state_after = post.state.name if frame is not None else "INVALID"
+
+        grid_delta = _compute_grid_delta(pre_grid, post.frame[-1] if post.frame else None)
 
         self.trajectory.append(
             StepRecord(
@@ -1360,6 +1461,7 @@ class ContinualHarness(Agent):
                 batch_rejected=batch_rejected,
                 skill_id=skill_id,
                 tool_calls=[],
+                grid_delta=grid_delta,
             )
         )
 
@@ -1456,6 +1558,7 @@ class ContinualHarness(Agent):
             memory_overview=memory_overview,
             skill_overview=skill_overview,
             subagent_overview=subagent_overview,
+            base_prompt=self._current_base_prompt,
         )
 
     # ------------------------------------------------------------------
@@ -1478,6 +1581,13 @@ class ContinualHarness(Agent):
             return
         gap = self.action_counter - self._last_evolution_step
         if gap < self._prompt_evolve_frequency:
+            return
+        self._last_evolution_step = self.action_counter
+        self._evolve_system_prompt(latest_frame)
+
+    def _evolve_on_level_up(self, latest_frame: FrameData) -> None:
+        """Trigger evolution unconditionally on level transition."""
+        if self._prompt_evolve_frequency <= 0:
             return
         self._last_evolution_step = self.action_counter
         self._evolve_system_prompt(latest_frame)
@@ -1509,7 +1619,8 @@ class ContinualHarness(Agent):
                 "round": self._current_outer_round,
                 "tools_exposed": "full",
                 "input": {
-                    "system_instruction": self._current_system_instruction,
+                    "system_instruction": self._system_instruction,
+                    "base_prompt": self._current_base_prompt,
                     "user_prompt": prompt,
                     "tools": tools,
                     # `images` reflects every grid rendered for the frame

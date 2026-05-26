@@ -8,24 +8,14 @@ from arcengine import FrameData, GameAction
 from .action_descriptions import ACTION_DESCRIPTIONS
 from .helpers import available_game_actions
 from .models import ToolCallRecord
-from .prompts import HARNESS_USER_PROMPT
-
-
-_HEX_CHARS = "0123456789abcdef"
 
 
 def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
-    """Render a 3D palette-indexed grid stack as compact hex text.
+    """Render a 3D grid stack as integer lists, one row per line.
 
-    Each cell value (an int in 0..15 mapping to the 16-colour ARC palette)
-    becomes one hex character; rows are space-free. This is ~3× denser than
-    the prior Python-list-repr format (~12 KB per 64×64 grid) at ~4 KB per
-    grid, which matters for multi-grid frames (animation sequences captured
-    during a single action). The model needs to know the format — see the
-    explanatory line in the system prompt and the per-frame header here.
-
-    Out-of-range cells (negative, >= 16, non-int) render as `?` so the
-    model can see corruption rather than crashing the render.
+    Output format matches ``state.latest_frame.frame`` exactly — each row is
+    a Python-style list of ints — so the model sees the same representation
+    in the prompt and in skill code.
     """
     lines: list[str] = []
     for i, block in enumerate(array_3d):
@@ -35,42 +25,13 @@ def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
             continue
         height = len(block)
         width = max((len(row) for row in block), default=0)
-        lines.append(f"Grid {i} ({height}x{width}, hex 0-f):")
+        lines.append(f"Grid {i} ({height}x{width}):")
         for row in block:
-            chars = []
-            for v in row:
-                try:
-                    iv = int(v)
-                except (TypeError, ValueError):
-                    chars.append("?")
-                    continue
-                if 0 <= iv < 16:
-                    chars.append(_HEX_CHARS[iv])
-                else:
-                    chars.append("?")
-            lines.append("  " + "".join(chars))
+            lines.append("  " + str(list(row)))
         lines.append("")
     return "\n".join(lines)
 
 
-def build_action_prompt(latest_frame: FrameData, extra_context: str = "") -> str:
-    """Legacy builder retained for any callers still on the old prompt shape.
-
-    The orchestrator no longer uses this — see `build_working_prompt` below.
-    """
-    prompt = HARNESS_USER_PROMPT
-    if extra_context.strip():
-        prompt = f"{extra_context.rstrip()}\n\n{prompt}"
-    return prompt
-
-
-# --- New orchestrator working-prompt builder ---------------------------------
-# Replaces the old `build_action_prompt` for orchestrator use. Assembles the
-# full per-step prompt directly from data, without placeholder substitution.
-# Layout intentionally mirrors PokeAgent._build_structured_prompt:
-#   [RECENT HISTORY] [TOOL RESULTS FROM PREVIOUS STEP] [LONG-TERM MEMORY]
-#   [SKILL LIBRARY] [SUBAGENT REGISTRY] [CURRENT STATE]
-#   [TURN instructions from harness_user.md]
 
 
 def _render_tool_results(records: Iterable[ToolCallRecord]) -> str:
@@ -117,13 +78,15 @@ def build_working_prompt(
     memory_overview: str,
     skill_overview: str,
     subagent_overview: str,
-    turn_block: str = HARNESS_USER_PROMPT,
+    base_prompt: str = "",
 ) -> str:
     """Assemble the per-VLM-call working prompt."""
     available = available_game_actions(latest_frame.available_actions)
     frame_text = pretty_print_3d(latest_frame.frame) or "(empty frame)"
 
     sections: list[str] = []
+    if base_prompt.strip():
+        sections.append(base_prompt.strip())
     sections.append(f"# Step: {action_counter}")
     sections.append(
         "## RECENT HISTORY (batch-grouped; call get_recent_trajectory for older detail)\n"
@@ -149,7 +112,11 @@ def build_working_prompt(
     )
     sections.append(state_block)
 
-    sections.append(turn_block.strip())
+    sections.append(
+        "## TURN\n"
+        "Decide your next move. Keep responses to at most 2 tool calls, "
+        "and predict each action's effect before committing."
+    )
     return "\n\n".join(sections)
 
 
@@ -199,7 +166,6 @@ def build_subagent_prompt(
 
     parts.append(
         "When you have completed your task, call "
-        "subagent_return(reasoning=..., answer=..., status=...). You cannot "
-        "commit ARC actions; only the orchestrator can."
+        "subagent_return(reasoning=..., answer=..., status=...)."
     )
     return "\n".join(parts)

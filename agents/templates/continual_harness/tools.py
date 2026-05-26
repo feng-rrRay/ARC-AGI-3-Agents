@@ -24,12 +24,7 @@ class FunctionCall:
 
 GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
     "name": "get_recent_trajectory",
-    "description": (
-        "Return the FULL step history (reasoning + tool calls + results) for "
-        "this game. The prompt already shows a compact view of the last few "
-        "batches; call this to reach further back, see older reasoning, or "
-        "inspect partial-execution detail."
-    ),
+    "description": "Retrieve full step history (reasoning + tool calls + results) beyond the compact view in the prompt. Use to look further back or inspect older reasoning.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -49,15 +44,7 @@ GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
 
 PROCESS_MEMORY_TOOL: dict[str, Any] = {
     "name": "process_memory",
-    "description": (
-        "Manage long-term memory for this game. Memory persists for the "
-        "current run by default, and across runs when --bootstrap-memory is "
-        "provided. The current index is auto-injected into every prompt "
-        "under ## LONG-TERM MEMORY (id + title + tags); you only need this "
-        "tool to mutate or to read full bodies. Operations: add (title, "
-        "body, tags?), edit (id, plus any of title/body/tags), delete (id), "
-        "search (query — substring over title/body/tags; returns full bodies)."
-    ),
+    "description": "Manage long-term memory (add/edit/delete/search). Store discovered rules, action effects, level mechanics. Memory index is auto-injected into every prompt; use search to read full bodies.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -99,14 +86,7 @@ PROCESS_MEMORY_TOOL: dict[str, Any] = {
 
 PROCESS_SKILL_TOOL: dict[str, Any] = {
     "name": "process_skill",
-    "description": (
-        "Manage saved Python skills (auto-injected under ## SKILLS). "
-        "Operations: add (name, description, code, tags?) — re-saving an "
-        "existing name updates that skill in place; edit (id-or-name + any "
-        "of name/description/code/tags); delete (id-or-name); search "
-        "(substring over name+description+code+tags). See ## SKILL CODE "
-        "RULES in the system prompt for the sandbox contract."
-    ),
+    "description": "Manage saved skills (add/edit/delete/search). Re-saving an existing name updates in place. Skills run in a subprocess sandbox with pre-loaded numpy/PIL/etc.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -129,7 +109,7 @@ PROCESS_SKILL_TOOL: dict[str, Any] = {
             },
             "code": {
                 "type": "string",
-                "description": "Python source. The body of run_skill. Required for add; optional for edit. Max 8000 chars.",
+                "description": "Python source. The body of run_skill. Required for add; optional for edit.",
             },
             "tags": {
                 "type": "array",
@@ -155,12 +135,7 @@ PROCESS_SKILL_TOOL: dict[str, Any] = {
 
 RUN_SKILL_TOOL: dict[str, Any] = {
     "name": "run_skill",
-    "description": (
-        "Execute a saved skill by id-or-name in the subprocess sandbox. "
-        "Returns {success, result, stdout, stderr, error?, "
-        "actions_taken_inline}. Skill code contract is in the system "
-        "prompt under ## SKILL CODE RULES. 30s wall-clock cap."
-    ),
+    "description": "Execute a saved skill by id-or-name in the subprocess sandbox. Returns {success, result, stdout, stderr, error?, actions_taken_inline}. 30s wall-clock cap. If it errors, edit the skill before re-running.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -207,7 +182,7 @@ RUN_CODE_TOOL: dict[str, Any] = {
             },
             "code": {
                 "type": "string",
-                "description": "Python source to execute in the sandbox. Required. Max 8000 chars.",
+                "description": "Python source to execute in the sandbox. Required.",
             },
             "args": {
                 "type": "object",
@@ -230,27 +205,14 @@ SUBAGENT_TOOL_ENUM: frozenset[str] = frozenset(
         "process_memory",
         "process_skill",
         "run_skill",
+        "take_actions",
     }
 )
 
 
 PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
     "name": "process_subagent",
-    "description": (
-        "Manage the subagent registry. A subagent is a focused inner agent "
-        "registered with a system prompt (instructions) + an allowlist of "
-        "tools it can call during its bounded inner loop. The orchestrator "
-        "invokes one via run_subagent(id, task). Subagents cannot directly "
-        "commit ARC actions and cannot invoke other subagents — they return "
-        "text the orchestrator may use to inform its own take_actions call. "
-        "The current registry is auto-injected under ## SUBAGENT REGISTRY "
-        "(id + name + allowed_tools + first description line). Operations: "
-        "add (name, description, instructions, allowed_tools, tags?), edit "
-        "(id + any of name/description/instructions/allowed_tools/tags), "
-        "delete (id), search (substring over "
-        "name+description+instructions+tags). If allowed_tools is omitted "
-        "on add, it defaults to get_recent_trajectory."
-    ),
+    "description": "Manage the subagent registry (add/edit/delete/search). A subagent is a focused inner agent with a system prompt and an allowlist of tools. Subagent index is auto-injected into every prompt.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -283,9 +245,9 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
                 },
                 "description": "Tools the subagent may call (subset of "
                 "get_recent_trajectory/process_memory/process_skill/"
-                "run_skill). Optional for add/edit; omitted on add defaults "
-                "to get_recent_trajectory. Empty list = subagent that only "
-                "reasons and returns.",
+                "run_skill/take_actions). Optional for add/edit; omitted on "
+                "add defaults to get_recent_trajectory. Empty list = subagent "
+                "that only reasons and returns.",
             },
             "tags": {
                 "type": "array",
@@ -308,17 +270,7 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
 
 RUN_SUBAGENT_TOOL: dict[str, Any] = {
     "name": "run_subagent",
-    "description": (
-        "Invoke a registered subagent on a single task. The subagent runs "
-        "its own bounded inner loop (up to MAX_SUBAGENT_ROUNDS_PER_CALL=20) "
-        "using only the tools in its allowlist, then calls "
-        "subagent_return(answer, status) to terminate. Returns {success, "
-        "result, rounds_used, id, name, version, warning?, error?, steps}. "
-        "Mutations the subagent makes to memory / skills via its allowed "
-        "tools persist immediately. The subagent CANNOT directly commit "
-        "ARC actions — the orchestrator still owns take_actions. Counts "
-        "against MAX_SUBAGENT_CALLS_PER_STEP=1 per outer iteration."
-    ),
+    "description": "Invoke a registered subagent on a task. Runs a bounded inner loop (up to 20 rounds) using its allowed tools. Mutations to memory/skills persist immediately. Max 1 per step.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -384,72 +336,6 @@ def is_subagent_return_call(name: str) -> bool:
     """True iff `name` is the terminator the inner loop watches for."""
     return name == SUBAGENT_RETURN_NAME
 
-
-# --- Prompt-evolution tool ---------------------------------------------------
-# Exposed ONLY to the meta-VLM call inside ContinualHarness._evolve_system_prompt.
-# Never appears in the orchestrator's tool list, never in any subagent allowlist.
-EVOLVE_PROMPT_NAME = "evolve_system_prompt"
-EVOLVE_SYSTEM_PROMPT_TOOL: dict[str, Any] = {
-    "name": EVOLVE_PROMPT_NAME,
-    "description": (
-        "Replace the agent's system instruction with an improved version. The "
-        "new prompt must be 200-6000 characters; proposals outside that range "
-        "are rejected and the agent keeps using the previous prompt."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "reasoning": {
-                "type": "string",
-                "description": (
-                    "What you saw in the trajectory and what you're changing "
-                    "in the prompt. Required."
-                ),
-            },
-            "new_prompt": {
-                "type": "string",
-                "description": (
-                    "The full replacement system instruction (200-6000 chars). "
-                    "Required."
-                ),
-            },
-        },
-        "required": ["reasoning", "new_prompt"],
-    },
-}
-
-
-def is_evolve_prompt_call(name: str) -> bool:
-    """True iff `name` is the prompt-evolution terminator the meta-call watches for."""
-    return name == EVOLVE_PROMPT_NAME
-
-
-# Maps a SUBAGENT_TOOL_ENUM name to the concrete tool spec the orchestrator
-# already defines. Keeping this lookup in one place avoids drift between the
-# allowlist enum and the actual spec shapes shown to the subagent VLM.
-_SUBAGENT_TOOL_SPECS: dict[str, dict[str, Any]] = {
-    "get_recent_trajectory": GET_RECENT_TRAJECTORY_TOOL,
-    "process_memory": PROCESS_MEMORY_TOOL,
-    "process_skill": PROCESS_SKILL_TOOL,
-    "run_skill": RUN_SKILL_TOOL,
-    # "run_code": RUN_CODE_TOOL — disabled (see SUBAGENT_TOOL_ENUM note).
-}
-
-
-def build_subagent_tools(allowed: list[str]) -> list[dict[str, Any]]:
-    """Tool list for a subagent's inner loop = allowlist + subagent_return.
-
-    Unknown names are skipped silently; the store has already validated them at
-    registration time. subagent_return is always appended last so the model
-    can always terminate even if `allowed` is empty.
-    """
-    out: list[dict[str, Any]] = []
-    for name in allowed or []:
-        spec = _SUBAGENT_TOOL_SPECS.get(name)
-        if spec is not None:
-            out.append(spec)
-    out.append(SUBAGENT_RETURN_TOOL)
-    return out
 
 
 def build_analysis_tools() -> list[dict[str, Any]]:
@@ -518,28 +404,7 @@ TAKE_ACTIONS = "take_actions"
 
 TAKE_ACTIONS_TOOL: dict[str, Any] = {
     "name": TAKE_ACTIONS,
-    "description": (
-        "Advance the game by executing a list of one or more actions in order. "
-        "Each action runs synchronously; after each one the harness records "
-        "the resulting frame. If a step becomes invalid mid-sequence because "
-        "the world changed (level transition, available_actions changed, or "
-        "the game ended), the remaining steps are skipped and you'll see a "
-        "partial-execution block in the next prompt's history.\n\n"
-        "Action key: ACTION1 = Up/W · ACTION2 = Down/S · ACTION3 = Left/A · "
-        "ACTION4 = Right/D · ACTION5 = Enter/Space/Delete · ACTION6 = Click "
-        "(requires x, y in 0..63) · ACTION7 = Undo/Back. The current frame's "
-        "prompt lists which of these are actually available this turn — "
-        "calling an unavailable action will be rejected.\n\n"
-        "Guideline: keep the list SHORT — typically 1-4 actions, and prefer "
-        "1 when the next state is hard to predict. Long sequences are risky: "
-        "a single wrong assumption mid-batch wastes every action after it. "
-        "Only extend the list when each step's outcome follows mechanically "
-        "from the current frame.\n\n"
-        "Skills may also drive the engine inline by calling "
-        "tools.take_actions(actions=[...]) inside their code; that call "
-        "returns the resulting frame so the skill can react before the next "
-        "step."
-    ),
+    "description": "Advance the game by executing a list of actions in order. Each runs synchronously; if a step becomes invalid mid-sequence (level transition, game ended), the remainder is skipped. Keep lists short (1-4, prefer 1).",
     "parameters": {
         "type": "object",
         "properties": {
@@ -590,6 +455,34 @@ TAKE_ACTIONS_TOOL: dict[str, Any] = {
 def is_take_actions_call(name: str) -> bool:
     """True iff `name` is the unified action-commit tool."""
     return name == TAKE_ACTIONS
+
+
+# Maps a SUBAGENT_TOOL_ENUM name to the concrete tool spec the orchestrator
+# already defines. Keeping this lookup in one place avoids drift between the
+# allowlist enum and the actual spec shapes shown to the subagent VLM.
+_SUBAGENT_TOOL_SPECS: dict[str, dict[str, Any]] = {
+    "get_recent_trajectory": GET_RECENT_TRAJECTORY_TOOL,
+    "process_memory": PROCESS_MEMORY_TOOL,
+    "process_skill": PROCESS_SKILL_TOOL,
+    "run_skill": RUN_SKILL_TOOL,
+    "take_actions": TAKE_ACTIONS_TOOL,
+}
+
+
+def build_subagent_tools(allowed: list[str]) -> list[dict[str, Any]]:
+    """Tool list for a subagent's inner loop = allowlist + subagent_return.
+
+    Unknown names are skipped silently; the store has already validated them at
+    registration time. subagent_return is always appended last so the model
+    can always terminate even if `allowed` is empty.
+    """
+    out: list[dict[str, Any]] = []
+    for name in allowed or []:
+        spec = _SUBAGENT_TOOL_SPECS.get(name)
+        if spec is not None:
+            out.append(spec)
+    out.append(SUBAGENT_RETURN_TOOL)
+    return out
 
 
 # --- Router -------------------------------------------------------------------

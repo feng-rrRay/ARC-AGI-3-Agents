@@ -1484,7 +1484,6 @@ def _format_process_skill(call: CallEntry) -> list[str]:
     _append_detail(lines, "reasoning", args.get("reasoning"))
     if op in {"add", "edit"}:
         _append_detail(lines, "description", args.get("description"))
-        _append_detail(lines, "code", args.get("code"))
     if op == "search":
         _append_detail(lines, "query", args.get("query"))
     _append_detail(lines, "error", call.error)
@@ -1503,10 +1502,6 @@ def _format_run_skill(call: CallEntry) -> list[str]:
     head += _status_suffix(call)
     lines = [head]
     _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "args", args.get("args"))
-    _append_detail(lines, "result", result.get("result"))
-    _append_detail(lines, "stdout", result.get("stdout"))
-    _append_detail(lines, "stderr", result.get("stderr"))
     _append_detail(lines, "error", call.error or result.get("error"))
     return lines
 
@@ -1593,11 +1588,6 @@ def _format_run_code(call: CallEntry) -> list[str]:
     head = "- run_code" + _status_suffix(call)
     lines = [head]
     _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "code", args.get("code"))
-    _append_detail(lines, "args", args.get("args"))
-    _append_detail(lines, "result", result.get("result"))
-    _append_detail(lines, "stdout", result.get("stdout"))
-    _append_detail(lines, "stderr", result.get("stderr"))
     _append_detail(lines, "error", call.error or result.get("error"))
     return lines
 

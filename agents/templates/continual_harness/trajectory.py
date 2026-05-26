@@ -454,6 +454,14 @@ def format_full_history(
                 f"{(rec.get('score') or 0) + (rec.get('score_delta') or 0)} "
                 f"action={_short_action(rec)}"
             )
+            gd = rec.get("grid_delta")
+            if gd:
+                shown = gd[:10]
+                parts = [f"({c[0]},{c[1]}) {c[2]}→{c[3]}" for c in shown]
+                more = f" +{len(gd) - 10} more" if len(gd) > 10 else ""
+                block_lines.append(
+                    f"    grid: {len(gd)} cells changed — {', '.join(parts)}{more}"
+                )
             if rec.get("reasoning") and rec is not first:
                 block_lines.append(f"    why: {rec['reasoning']}")
             for call in rec.get("tool_calls", []) or []:

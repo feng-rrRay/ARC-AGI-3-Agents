@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
-from arcengine import FrameData, GameState
+from arcengine import FrameData, GameState  # noqa: F401 — used by other test files
 
 from agents.templates.continual_harness.prompt_evolution import (
     PROMPT_MAX_CHARS,
@@ -214,20 +214,10 @@ class TestActivePromptEvolutionPath:
 
 @pytest.mark.unit
 class TestBuildEvolutionPrompt:
-    def _frame(self) -> FrameData:
-        return FrameData(
-            game_id="evolve-test",
-            frame=[[[1, 2], [3, 4]]],
-            state=GameState.NOT_FINISHED,
-            levels_completed=2,
-        )
-
     def test_substitutes_all_placeholders(self) -> None:
         text = build_evolution_prompt(
-            current_prompt="CURRENT PROMPT BODY",
-            latest_frame=self._frame(),
-            generation=3,
-            action_counter=75,
+            system_prompt="FIXED SYSTEM PROMPT BODY",
+            current_base_prompt="CURRENT BASE PROMPT BODY",
             trajectory_rows=[
                 {
                     "action_counter": 1,
@@ -238,41 +228,20 @@ class TestBuildEvolutionPrompt:
                     "tool_calls": [],
                 }
             ],
-            memory_overview="## LONG-TERM MEMORY (0 entries)\nEmpty.",
-            skill_overview="## SKILLS (0 saved)\nNo skills yet.",
-            subagent_overview="## SUBAGENTS (0 saved)\nNo subagents yet.",
         )
-        # All blocks present:
-        assert "CURRENT PROMPT BODY" in text
-        assert "state=NOT_FINISHED" in text
-        assert "score=2" in text
-        assert "action_counter=75" in text
-        assert "generation=3" in text
-        # Trajectory rendered via format_full_history:
+        assert "FIXED SYSTEM PROMPT BODY" in text
+        assert "CURRENT BASE PROMPT BODY" in text
         assert "ACTION1" in text
         assert "trying up" in text
-        # Overviews:
-        assert "LONG-TERM MEMORY" in text
-        assert "SKILLS" in text
-        assert "SUBAGENTS" in text
-        # Frame rendering:
-        assert "Grid 0:" in text
-        # Final task line preserved:
-        assert "evolve_system_prompt" in text
+        assert "IMPROVED BASE PROMPT:" in text
 
     def test_handles_empty_trajectory(self) -> None:
         text = build_evolution_prompt(
-            current_prompt="x" * 250,
-            latest_frame=self._frame(),
-            generation=1,
-            action_counter=25,
+            system_prompt="fixed system prompt",
+            current_base_prompt="x" * 250,
             trajectory_rows=[],
-            memory_overview="(none)",
-            skill_overview="(none)",
-            subagent_overview="(none)",
         )
-        # build_evolution_prompt should not raise on empty trajectory.
-        assert "No previous actions recorded." in text or "n=0" not in text  # graceful
+        assert "IMPROVED BASE PROMPT:" in text
 
 
 @pytest.mark.unit
@@ -283,12 +252,12 @@ class TestPromptEvolutionFrequencyParsing:
     fixture just to exercise this codepath.
     """
 
-    def test_default_is_25(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_default_is_75(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY", raising=False)
         # Default in the class — verified via direct attribute access.
         from agents.templates.continual_harness_agent import ContinualHarness
 
-        assert ContinualHarness.DEFAULT_PROMPT_EVOLVE_FREQUENCY == 25
+        assert ContinualHarness.DEFAULT_PROMPT_EVOLVE_FREQUENCY == 75
 
     def test_zero_disables(self) -> None:
         # The hook condition `self._prompt_evolve_frequency > 0` ensures 0 disables.

@@ -45,3 +45,4 @@ class StepRecord:
     skill_id: str | None = None
     score_delta: int | None = None
     state_after: str | None = None
+    grid_delta: list[list[int]] | None = None
