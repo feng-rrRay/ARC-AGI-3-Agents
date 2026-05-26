@@ -10,7 +10,6 @@ import pytest
 from arcengine import ActionInput, FrameData, FrameDataRaw, GameAction, GameState
 
 from agents.agent import Agent
-from agents.templates.continual_harness.context import build_action_prompt
 from agents.templates.continual_harness.helpers import (
     available_game_actions,
     build_action_tools,
@@ -127,68 +126,11 @@ class TestContinualHarnessParsing:
 
 @pytest.mark.unit
 class TestContinualHarnessPrompts:
-    def test_system_prompt_holds_context_block(self) -> None:
-        # CONTEXT moved out of the per-turn user prompt and into the system
-        # instruction; the harness flavour preserves the original WIN/INT<0,63>
-        # framing while adding tool-model + strategy sections.
-        assert "# CONTEXT" in HARNESS_SYSTEM_INSTRUCTION
-        assert "WIN and avoid GAME_OVER" in HARNESS_SYSTEM_INSTRUCTION
-        assert "INT<0,63>" in HARNESS_SYSTEM_INSTRUCTION
+    def test_system_prompt_holds_game_context(self) -> None:
+        assert "{game_name}" in HARNESS_SYSTEM_INSTRUCTION
+        assert "take_actions" in HARNESS_SYSTEM_INSTRUCTION
+        assert "run_skill" in HARNESS_SYSTEM_INSTRUCTION
 
-    def test_user_prompt_matches_llm_shape_and_includes_digit_frame(self) -> None:
-        frame = FrameData(
-            game_id="prompt-test",
-            frame=[[[1, 2], [3, 4]]],
-            state=GameState.NOT_FINISHED,
-            levels_completed=1,
-            win_levels=3,
-        )
-
-        prompt = build_action_prompt(frame)
-
-        # CONTEXT and Available Actions are no longer in the user prompt.
-        assert "# CONTEXT:" not in prompt
-        assert "# Available Actions:" not in prompt
-        # State/Score/Frame block copied verbatim from LLM.build_func_resp_prompt.
-        assert "# State:\nNOT_FINISHED" in prompt
-        assert "# Score:\n1" in prompt
-        assert "# Frame:" in prompt
-        assert "Grid 0:" in prompt
-        assert "  [1, 2]" in prompt
-        assert "  [3, 4]" in prompt
-        # Previous-action block — our only addition (no message history).
-        assert "# Previous Action:\nRESET" in prompt
-        assert "# Previous Action Data:" in prompt
-        # Final TURN line copied verbatim from LLM.build_user_prompt.
-        assert "# TURN:\nCall exactly one action." in prompt
-
-    def test_user_prompt_uses_frame_action_input(self) -> None:
-        frame = FrameData(
-            game_id="prompt-test",
-            frame=[[[1]]],
-            state=GameState.NOT_FINISHED,
-            action_input=ActionInput(
-                id=GameAction.ACTION6,
-                data={"x": 12, "y": 34},
-                reasoning="clicking the target",
-            ),
-        )
-
-        prompt = build_action_prompt(frame)
-
-        assert "# Previous Action:\nACTION6" in prompt
-        assert "# Previous Action Data:\n{'x': 12, 'y': 34}" in prompt
-
-    def test_extra_context_is_injected_above_turn_line(self) -> None:
-        frame = FrameData(
-            game_id="ec-test", frame=[[[0]]], state=GameState.NOT_FINISHED
-        )
-        prompt = build_action_prompt(
-            frame, extra_context="## SHORT-TERM HISTORY\n[1] action=ACTION1"
-        )
-        assert "## SHORT-TERM HISTORY" in prompt
-        assert prompt.index("## SHORT-TERM HISTORY") < prompt.index("# TURN:")
-        assert "# TURN:\nCall exactly one action." in prompt
 
 
 class _ActionStampEnv:

@@ -8,11 +8,11 @@ from __future__ import annotations
 
 ACTION_DESCRIPTIONS: dict[str, str] = {
     "RESET": "Start or restart a game. Must be called first when NOT_PLAYED or after GAME_OVER to play again.",
-    "ACTION1": "Send this simple input action (1, W, Up).",
-    "ACTION2": "Send this simple input action (2, S, Down).",
-    "ACTION3": "Send this simple input action (3, A, Left).",
-    "ACTION4": "Send this simple input action (4, D, Right).",
-    "ACTION5": "Send this simple input action (5, Enter, Spacebar, Delete).",
-    "ACTION6": "Send this complex input action (6, Click, Point).",
-    "ACTION7": "Send this simple input action (7, Undo, Back).",
+    "ACTION1": "(1, W, Up).",
+    "ACTION2": "(2, S, Down).",
+    "ACTION3": "(3, A, Left).",
+    "ACTION4": "(4, D, Right).",
+    "ACTION5": "(5, Enter, Spacebar, Delete).",
+    "ACTION6": "(6, Click, Point).",
+    "ACTION7": "(7, Undo, Back).",
 }

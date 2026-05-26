@@ -17,7 +17,8 @@ TRAJECTORY_SUFFIX = ".trajectory.jsonl"
 PROMPT_EVOLUTION_NAME = "prompt_evolution.jsonl"
 VIDEO_SUFFIXES = {".gif", ".mp4"}
 RenderFormat = Literal["gif", "mp4"]
-CallKind = Literal["action", "analysis", "evolution"]
+CallKind = Literal["action_batch", "action_rejected", "analysis", "evolution"]
+EventKind = Literal["orchestrator", "subagent", "evolution"]
 
 # ARC-AGI 16-colour palette indexed by grid values 0..15.
 ARC_PALETTE: tuple[tuple[int, int, int, int], ...] = (
@@ -49,9 +50,19 @@ _ACTION_NAMES: dict[int, str] = {
     6: "ACTION6",
     7: "ACTION7",
 }
-_ACTION_LOG_RE = re.compile(
-    r"\|\s+INFO\s+\|\s+.+?\s+-\s+(?P<action>RESET|ACTION[1-7]): "
-    r"count (?P<count>\d+),"
+# Action labels can be parsed from two log formats:
+#  - Legacy:    "| INFO | <prefix> - ACTION1: count 7, ..."
+#  - Continual: "[<game-id>] step=7 ACTION1[(args)]? src=vlm ..."
+# Try both so renders of older runs keep working.
+_ACTION_LOG_PATTERNS = (
+    re.compile(
+        r"\|\s+INFO\s+\|\s+.+?\s+-\s+(?P<action>RESET|ACTION[1-7]): "
+        r"count (?P<count>\d+),"
+    ),
+    re.compile(
+        r"\[[^\]]+\]\s+step=(?P<count>\d+)\s+"
+        r"(?P<action>RESET|ACTION[1-7](?:\([^)]*\))?)(?:\s|$)"
+    ),
 )
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -88,16 +99,8 @@ class CallEntry:
     executed: bool
     result: JsonObject | None = None
     error: str | None = None
-
-
-@dataclass(frozen=True)
-class RoundEntry:
-    round: int
-    tools_exposed: str | None
-    reasoning: str | None
-    chosen_action: str | None
-    error: str | None
-    calls: tuple[CallEntry, ...]
+    actions_committed: int | None = None  # set on take_actions calls
+    actions_taken_inline: int | None = None  # set on run_skill calls
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,56 @@ class PromptEvolutionEntry:
     accepted: bool
     reasoning: str | None
     validation_error: str | None
+
+
+@dataclass(frozen=True)
+class TraceEvent:
+    """One row from the trace JSONL, normalized for the renderer.
+
+    Each VLM call writes one event (orchestrator). Subagent inner rounds and
+    prompt-evolution attempts write their own events; both appear in file
+    order BEFORE the orchestrator event that triggered them, so file-order
+    iteration is sufficient for grouping.
+    """
+
+    file_index: int
+    vlm_call: int | None
+    round: int | None
+    action_counter: int
+    tools_exposed: str | None
+    kind: EventKind
+    actions_executed: int | None
+    force_take_actions: bool
+    reasoning: str | None
+    error: str | None
+    calls: tuple[CallEntry, ...]
+    evolution: PromptEvolutionEntry | None
+    subagent_info: JsonObject | None
+
+    @property
+    def total_actions(self) -> int:
+        """Direct take_actions + run_skill inline actions."""
+        direct = self.actions_executed or 0
+        inline = sum(
+            c.actions_taken_inline
+            for c in self.calls
+            if c.actions_taken_inline is not None and c.actions_taken_inline > 0
+        )
+        return direct + inline
+
+
+@dataclass(frozen=True)
+class ActionPanel:
+    """The right-side panel that a contiguous batch of action frames shares.
+
+    `events` holds every TraceEvent that contributed to those frames in file
+    order — typically zero or more no-action / evolution / subagent events
+    followed by exactly one action-emitting orchestrator event.
+    """
+
+    frame_start: int  # inclusive recording-frame index
+    frame_end: int    # inclusive recording-frame index
+    events: tuple[TraceEvent, ...]
 
 
 @dataclass(frozen=True)
@@ -123,6 +176,7 @@ class RenderSummary:
     trajectory_step_count: int = 0
     prompt_evolution_log: Path | None = None
     prompt_evolution_count: int = 0
+    panel_count: int = 0
 
 
 def discover_recording_paths(path: str | Path) -> list[Path]:
@@ -177,16 +231,22 @@ def load_recording_frames(path: str | Path) -> list[RecordingFrame]:
 
 
 def parse_action_log(path: str | Path) -> dict[int, str]:
-    """Parse action labels from a run log keyed by Agent action count."""
+    """Parse action labels from a run log keyed by Agent action count.
+
+    Supports both the legacy `<game> - ACTION1: count N, ...` line format and
+    the continual-harness `[<game>] step=N ACTION1[(args)]? src=...` format.
+    """
     log_path = Path(path)
     labels: dict[int, str] = {}
 
     with log_path.open("r", encoding="utf-8") as file:
         for line in file:
-            match = _ACTION_LOG_RE.search(line)
-            if match is None:
-                continue
-            labels[int(match.group("count"))] = match.group("action")
+            for pattern in _ACTION_LOG_PATTERNS:
+                match = pattern.search(line)
+                if match is None:
+                    continue
+                labels[int(match.group("count"))] = match.group("action")
+                break
 
     return labels
 
@@ -272,29 +332,55 @@ def find_prompt_evolution_log(recording_path: str | Path) -> Path | None:
     return candidate if candidate.exists() else None
 
 
-def parse_trace_log(path: str | Path) -> dict[int, list[RoundEntry]]:
-    """Parse VLM trace rounds per action_counter from a trace JSONL file."""
+def parse_trace_events(path: str | Path) -> list[TraceEvent]:
+    """Parse all VLM trace events into a single ordered list.
+
+    File order is preserved because the continual-harness scaffold relies on it
+    for grouping: evolution / subagent rows always appear immediately before
+    the orchestrator row that triggered them.
+    """
     trace_path = Path(path)
-    rounds_by_step: dict[int, list[RoundEntry]] = {}
+    events: list[TraceEvent] = []
 
     with trace_path.open("r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, start=1):
             stripped = line.strip()
             if not stripped:
                 continue
+            raw = _load_json_object(stripped, trace_path, line_number)
+            event = _build_trace_event(raw, file_index=len(events))
+            if event is not None:
+                events.append(event)
+    return events
 
-            event = _load_json_object(stripped, trace_path, line_number)
-            action_counter = _int_or_none(event.get("action_counter"))
-            if action_counter is None:
-                continue
 
-            rounds_by_step.setdefault(action_counter, []).append(
-                _build_round_entry(event)
+def group_into_panels(events: Sequence[TraceEvent]) -> list[ActionPanel]:
+    """Bucket trace events into one panel per batch of action frames.
+
+    A panel closes when an orchestrator event has total_actions > 0 (direct
+    take_actions and/or run_skill inline actions). Every preceding event since
+    the last close (no-action orchestrator rows, prompt-evolution rows,
+    subagent rows) belongs to the same panel and renders ahead of the
+    action-emitting one. A trailing run of no-action events at end-of-file
+    has no frames to attach to and is dropped.
+    """
+    panels: list[ActionPanel] = []
+    buffer: list[TraceEvent] = []
+    for event in events:
+        buffer.append(event)
+        total = event.total_actions
+        if event.kind == "orchestrator" and total > 0:
+            frame_end = event.action_counter - 1
+            frame_start = frame_end - total + 1
+            panels.append(
+                ActionPanel(
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    events=tuple(buffer),
+                )
             )
-
-    for rounds in rounds_by_step.values():
-        rounds.sort(key=lambda entry: entry.round)
-    return rounds_by_step
+            buffer = []
+    return panels
 
 
 def parse_trajectory_log(path: str | Path) -> dict[int, list[JsonObject]]:
@@ -695,6 +781,7 @@ def render_recording_file(
     reasoning_traces: dict[int, str] = {}
     trajectory_step_count = 0
     prompt_evolution_count = 0
+    panel_count = 0
 
     if reasoning:
         resolved_trace_log = Path(trace_log) if trace_log is not None else None
@@ -715,30 +802,22 @@ def render_recording_file(
             resolved_prompt_evolution_log or find_prompt_evolution_log(recording)
         )
 
-        rounds_by_step: dict[int, list[RoundEntry]] = (
-            parse_trace_log(resolved_trace_log) if resolved_trace_log is not None else {}
+        events = (
+            parse_trace_events(resolved_trace_log)
+            if resolved_trace_log is not None
+            else []
         )
-        trajectory_by_step: dict[int, list[JsonObject]] = (
-            parse_trajectory_log(resolved_trajectory_log)
-            if resolved_trajectory_log is not None
-            else {}
-        )
-        prompt_evolution_by_step: dict[int, PromptEvolutionEntry] = (
-            parse_prompt_evolution_log(resolved_prompt_evolution_log)
-            if resolved_prompt_evolution_log is not None
-            else {}
-        )
+        panels = group_into_panels(events)
+        panel_count = len(panels)
+        reasoning_traces = build_panel_reasoning_traces(panels)
 
-        trajectory_step_count = len(trajectory_by_step)
-        prompt_evolution_count = len(prompt_evolution_by_step)
-
-        if trajectory_by_step:
-            rounds_by_step = enrich_rounds_with_trajectory(
-                rounds_by_step, trajectory_by_step
+        if resolved_trajectory_log is not None:
+            trajectory_step_count = len(parse_trajectory_log(resolved_trajectory_log))
+        if resolved_prompt_evolution_log is not None:
+            prompt_evolution_count = len(
+                parse_prompt_evolution_log(resolved_prompt_evolution_log)
             )
-        reasoning_traces = build_reasoning_traces(
-            rounds_by_step, prompt_evolution_by_step
-        )
+
         frames = apply_reasoning_traces(frames, reasoning_traces)
 
     attached_reasoning_count = sum(1 for frame in frames if frame.reasoning_trace)
@@ -766,6 +845,7 @@ def render_recording_file(
         trajectory_step_count=trajectory_step_count,
         prompt_evolution_log=resolved_prompt_evolution_log,
         prompt_evolution_count=prompt_evolution_count,
+        panel_count=panel_count,
     )
 
 
@@ -901,13 +981,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if summary.trace_log is not None and summary.reasoning_trace_count:
             print(
                 f"Loaded {summary.reasoning_trace_count} reasoning traces "
+                f"({summary.panel_count} batched VLM panels) "
                 f"from {summary.trace_log} "
                 f"({summary.attached_reasoning_count} attached to recording frames)"
             )
         if summary.trajectory_log is not None and summary.trajectory_step_count:
             print(
-                f"Enriched panel with {summary.trajectory_step_count} trajectory "
-                f"steps from {summary.trajectory_log}"
+                f"Found {summary.trajectory_step_count} trajectory steps "
+                f"in {summary.trajectory_log}"
             )
         if (
             summary.prompt_evolution_log is not None
@@ -1017,47 +1098,146 @@ def _trace_mentions_agent(trace_path: Path, agent_hint: str) -> bool:
     return False
 
 
-def _build_round_entry(event: JsonObject) -> RoundEntry:
-    round_value = _int_or_none(event.get("round")) or 0
-    tools_exposed = _clean_string(event.get("tools_exposed"))
-    reasoning = _clean_string(event.get("reasoning"))
-    chosen_action = _clean_string(event.get("chosen_action"))
-    error = _clean_string(event.get("error"))
+def _build_trace_event(raw: JsonObject, *, file_index: int) -> TraceEvent | None:
+    action_counter = _int_or_none(raw.get("action_counter"))
+    if action_counter is None:
+        return None
 
+    tools_exposed = _clean_string(raw.get("tools_exposed"))
+    kind: EventKind
+    if tools_exposed == "evolution":
+        kind = "evolution"
+    elif tools_exposed == "subagent":
+        kind = "subagent"
+    else:
+        kind = "orchestrator"
+
+    reasoning = _clean_string(raw.get("reasoning"))
+    error = _clean_string(raw.get("error"))
+    actions_executed = _int_or_none(raw.get("actions_executed"))
+    force = bool(raw.get("force_take_actions"))
+
+    # output.function_calls is the raw list the model emitted (in order). The
+    # trace's own `tool_calls` field holds executed analysis results in the
+    # same order, skipping take_actions (which never produces an analysis
+    # record). Walk them in parallel so each analysis call carries its result.
+    emitted = _output_function_calls(raw)
+    executed_records = _executed_tool_call_records(raw)
+    tc_index = 0
     calls: list[CallEntry] = []
-    for raw_call in _output_function_calls(event):
-        name = _clean_string(raw_call.get("name"))
+    for fc in emitted:
+        name = _clean_string(fc.get("name"))
         if name is None:
             continue
-        args = raw_call.get("args") if isinstance(raw_call.get("args"), dict) else {}
-        kind, executed = _classify_call(name, chosen_action, tools_exposed)
+        args = fc.get("args") if isinstance(fc.get("args"), dict) else {}
+        if name == "take_actions":
+            calls.append(
+                CallEntry(
+                    name=name,
+                    kind="action_batch",
+                    args=cast(JsonObject, args),
+                    executed=(actions_executed or 0) > 0,
+                    actions_committed=actions_executed,
+                )
+            )
+            continue
+        if _is_action_name(name):
+            calls.append(
+                CallEntry(
+                    name=name,
+                    kind="action_rejected",
+                    args=cast(JsonObject, args),
+                    executed=False,
+                )
+            )
+            continue
+        if name == "evolve_system_prompt":
+            calls.append(
+                CallEntry(
+                    name=name,
+                    kind="evolution",
+                    args=cast(JsonObject, args),
+                    executed=True,
+                )
+            )
+            continue
+
+        record = executed_records[tc_index] if tc_index < len(executed_records) else None
+        tc_index += 1
+        result_value = record.get("result") if isinstance(record, dict) else None
+        record_error = (
+            _clean_string(record.get("error")) if isinstance(record, dict) else None
+        )
+        actions_inline = None
+        if isinstance(record, dict):
+            actions_inline = _int_or_none(record.get("actions_taken_inline"))
+            if not actions_inline and isinstance(result_value, dict):
+                actions_inline = _int_or_none(result_value.get("actions_taken_inline"))
         calls.append(
             CallEntry(
                 name=name,
-                kind=kind,
+                kind="analysis",
                 args=cast(JsonObject, args),
-                executed=executed,
+                executed=record is not None,
+                result=cast(JsonObject, result_value)
+                if isinstance(result_value, dict)
+                else None,
+                error=record_error,
+                actions_taken_inline=actions_inline,
             )
         )
 
-    return RoundEntry(
-        round=round_value,
+    # Rejected per-action tools also land in the trace's tool_calls list. Pull
+    # any leftover records (with an error) so the panel surfaces them too.
+    while tc_index < len(executed_records):
+        record = executed_records[tc_index]
+        tc_index += 1
+        rec_name = _clean_string(record.get("name"))
+        if rec_name is None:
+            continue
+        if any(c.name == rec_name and c.kind == "action_rejected" for c in calls):
+            continue
+        calls.append(
+            CallEntry(
+                name=rec_name,
+                kind="analysis",
+                args=cast(JsonObject, record.get("args") or {}),
+                executed=True,
+                error=_clean_string(record.get("error")),
+            )
+        )
+
+    evolution_entry: PromptEvolutionEntry | None = None
+    evolution_raw = raw.get("evolution")
+    if kind == "evolution" and isinstance(evolution_raw, dict):
+        generation = _int_or_none(evolution_raw.get("generation")) or 0
+        evolution_entry = PromptEvolutionEntry(
+            generation=generation,
+            accepted=bool(evolution_raw.get("accepted")),
+            reasoning=reasoning,
+            validation_error=_clean_string(evolution_raw.get("validation_error")),
+        )
+
+    subagent_info: JsonObject | None = None
+    subagent_raw = raw.get("subagent")
+    if kind == "subagent" and isinstance(subagent_raw, dict):
+        subagent_info = cast(JsonObject, subagent_raw)
+
+    return TraceEvent(
+        file_index=file_index,
+        vlm_call=_int_or_none(raw.get("vlm_call")),
+        round=_int_or_none(raw.get("round")),
+        action_counter=action_counter,
         tools_exposed=tools_exposed,
+        kind=kind,
+        actions_executed=actions_executed,
+        force_take_actions=force,
         reasoning=reasoning,
-        chosen_action=chosen_action,
         error=error,
         calls=tuple(calls),
+        evolution=evolution_entry,
+        subagent_info=subagent_info,
     )
-
-
-def _classify_call(
-    name: str, chosen_action: str | None, tools_exposed: str | None
-) -> tuple[CallKind, bool]:
-    if _is_action_name(name):
-        return "action", chosen_action is not None and name == chosen_action
-    if name == "evolve_system_prompt" or tools_exposed == "evolution":
-        return "evolution", True
-    return "analysis", chosen_action is None
 
 
 def _output_function_calls(event: JsonObject) -> list[JsonObject]:
@@ -1072,116 +1252,164 @@ def _output_function_calls(event: JsonObject) -> list[JsonObject]:
     ]
 
 
-def enrich_rounds_with_trajectory(
-    rounds_by_step: dict[int, list[RoundEntry]],
-    trajectory_by_step: dict[int, list[JsonObject]],
-) -> dict[int, list[RoundEntry]]:
-    """Attach execution results from trajectory to matching analysis calls."""
-    enriched: dict[int, list[RoundEntry]] = {}
-    for action_counter, rounds in rounds_by_step.items():
-        traj_queue = list(trajectory_by_step.get(action_counter, []))
-        enriched[action_counter] = [
-            _enrich_round_calls(round_entry, traj_queue) for round_entry in rounds
-        ]
-    return enriched
+def _executed_tool_call_records(event: JsonObject) -> list[JsonObject]:
+    records = event.get("tool_calls")
+    if not isinstance(records, list):
+        return []
+    return [cast(JsonObject, r) for r in records if isinstance(r, dict)]
 
 
-def _enrich_round_calls(
-    round_entry: RoundEntry, traj_queue: list[JsonObject]
-) -> RoundEntry:
-    new_calls: list[CallEntry] = []
-    for call in round_entry.calls:
-        if call.kind != "analysis" or not call.executed or not traj_queue:
-            new_calls.append(call)
-            continue
-        next_traj = traj_queue.pop(0)
-        if _clean_string(next_traj.get("name")) != call.name:
-            traj_queue.insert(0, next_traj)
-            new_calls.append(call)
-            continue
-        result = next_traj.get("result") if isinstance(next_traj.get("result"), dict) else None
-        new_calls.append(
-            replace(
-                call,
-                result=cast(JsonObject, result) if result is not None else None,
-                error=_clean_string(next_traj.get("error")),
-            )
-        )
-    return replace(round_entry, calls=tuple(new_calls))
-
-
-def build_reasoning_traces(
-    rounds_by_step: dict[int, list[RoundEntry]],
-    prompt_evolution_by_step: dict[int, PromptEvolutionEntry] | None = None,
-) -> dict[int, str]:
-    """Format the right-side panel text for each action_counter."""
-    evolution = prompt_evolution_by_step or {}
-    all_steps = set(rounds_by_step) | set(evolution)
+def build_panel_reasoning_traces(panels: Sequence[ActionPanel]) -> dict[int, str]:
+    """Map every frame index covered by a panel to that panel's rendered text."""
     output: dict[int, str] = {}
-    for action_counter in sorted(all_steps):
-        text = _format_step_panel(
-            action_counter,
-            rounds_by_step.get(action_counter, []),
-            evolution.get(action_counter),
-        )
-        if text is not None:
-            output[action_counter] = text
+    for panel in panels:
+        text = _format_action_panel(panel)
+        if text is None:
+            continue
+        for frame_index in range(panel.frame_start, panel.frame_end + 1):
+            output[frame_index] = text
     return output
 
 
-def _format_step_panel(
-    action_counter: int,
-    rounds: Sequence[RoundEntry],
-    evolution: PromptEvolutionEntry | None,
-) -> str | None:
-    if not rounds and evolution is None:
+def _format_action_panel(panel: ActionPanel) -> str | None:
+    if not panel.events:
         return None
 
-    chosen = next(
-        (entry.chosen_action for entry in rounds if entry.chosen_action), None
-    )
-    header_bits = [f"step={action_counter:03d}"]
-    if chosen is not None:
-        header_bits.append(f"action={chosen}")
-    if rounds:
-        header_bits.append(f"rounds={len(rounds)}")
+    closing = panel.events[-1]
+    actions = closing.actions_executed or 0
+    vlm_calls = sum(1 for e in panel.events if e.kind == "orchestrator")
+    if panel.frame_start == panel.frame_end:
+        frames_label = f"frame={panel.frame_start:03d}"
+    else:
+        frames_label = f"frames={panel.frame_start:03d}-{panel.frame_end:03d}"
 
-    lines: list[str] = ["VLM reasoning", " ".join(header_bits)]
+    header = [frames_label, f"vlm_calls={vlm_calls}", f"actions={actions}"]
+    if closing.force_take_actions:
+        header.append("(force)")
 
-    if evolution is not None:
-        accepted = "accepted" if evolution.accepted else "rejected"
-        lines.extend(
-            ("", f"Prompt evolution gen={evolution.generation} [{accepted}]")
-        )
-        if evolution.validation_error is not None:
-            lines.append(
-                "validation_error: "
-                + _truncate(_compact_whitespace(evolution.validation_error), 220)
-            )
-
-    for round_entry in rounds:
-        suffix = (
-            f" ({round_entry.tools_exposed})" if round_entry.tools_exposed else ""
-        )
-        lines.extend(("", f"R{round_entry.round}{suffix}"))
-        if round_entry.reasoning is not None:
-            lines.append(_compact_whitespace(round_entry.reasoning))
-        if round_entry.error is not None:
-            lines.append(
-                "error: " + _truncate(_compact_whitespace(round_entry.error), 220)
-            )
-        for call in round_entry.calls:
-            lines.extend(_format_call_lines(call))
-
+    lines: list[str] = ["VLM reasoning", " ".join(header)]
+    for event in panel.events:
+        lines.extend(_format_trace_event(event))
     return "\n".join(lines)
 
 
+def _format_trace_event(event: TraceEvent) -> list[str]:
+    if event.kind == "evolution":
+        return _format_evolution_event(event)
+    if event.kind == "subagent":
+        return _format_subagent_event(event)
+    return _format_orchestrator_event(event)
+
+
+def _format_orchestrator_event(event: TraceEvent) -> list[str]:
+    call_label = event.tools_exposed or "vlm"
+    direct = event.actions_executed or 0
+    total = event.total_actions
+    inline = total - direct
+    suffix_bits: list[str] = []
+    if total > 0:
+        if inline > 0 and direct > 0:
+            suffix_bits.append(f"{total} actions ({direct} direct, {inline} skill)")
+        elif inline > 0:
+            suffix_bits.append(f"{inline} actions (skill)")
+        else:
+            suffix_bits.append(f"{direct} actions")
+    elif event.actions_executed is not None:
+        suffix_bits.append("no actions")
+    if event.force_take_actions:
+        suffix_bits.append("force")
+    suffix = f" [{', '.join(suffix_bits)}]" if suffix_bits else ""
+
+    vlm_label = f"V{event.vlm_call}" if event.vlm_call is not None else "V?"
+    lines: list[str] = ["", f"{vlm_label} ({call_label}){suffix}"]
+    if event.reasoning:
+        lines.append(_compact_whitespace(event.reasoning))
+    if event.error:
+        lines.append("error: " + _truncate(_compact_whitespace(event.error), 220))
+    for call in event.calls:
+        lines.extend(_format_call_lines(call))
+    return lines
+
+
+def _format_evolution_event(event: TraceEvent) -> list[str]:
+    entry = event.evolution
+    if entry is None:
+        return ["", "Prompt evolution"]
+    accepted = "accepted" if entry.accepted else "rejected"
+    lines = ["", f"Prompt evolution gen={entry.generation} [{accepted}]"]
+    if entry.reasoning:
+        lines.append(_compact_whitespace(entry.reasoning))
+    if entry.validation_error is not None:
+        lines.append(
+            "validation_error: "
+            + _truncate(_compact_whitespace(entry.validation_error), 220)
+        )
+    return lines
+
+
+def _format_subagent_event(event: TraceEvent) -> list[str]:
+    info = event.subagent_info or {}
+    name = _clean_string(info.get("name")) or "?"
+    inner_round = _int_or_none(info.get("inner_round"))
+    inner_max = _int_or_none(info.get("max_inner_rounds"))
+    round_label = ""
+    if inner_round is not None and inner_max is not None:
+        round_label = f" round {inner_round}/{inner_max}"
+    elif inner_round is not None:
+        round_label = f" round {inner_round}"
+
+    lines = ["", f"subagent {name}{round_label}"]
+    if event.error:
+        lines.append("error: " + _truncate(_compact_whitespace(event.error), 220))
+    for call in event.calls:
+        lines.extend(_format_call_lines(call))
+    return lines
+
+
 def _format_call_lines(call: CallEntry) -> list[str]:
-    if call.kind == "action":
-        return [f"> {call.name}"]
+    if call.kind == "action_batch":
+        return _format_take_actions(call)
+    if call.kind == "action_rejected":
+        suffix = f" [rejected: {call.error}]" if call.error else " [rejected]"
+        return [f"> {call.name}{suffix}"]
 
     formatter = _CALL_FORMATTERS.get(call.name, _format_generic_call)
     return formatter(call)
+
+
+def _format_take_actions(call: CallEntry) -> list[str]:
+    actions_label = _format_action_specs(call.args.get("actions"))
+    committed = call.actions_committed
+    head = f"> take_actions {actions_label}"
+    if committed is not None:
+        head += f" = {committed}"
+    if call.error:
+        head += " [error]"
+    lines = [head]
+    _append_detail(lines, "reasoning", call.args.get("reasoning"))
+    if call.error:
+        _append_detail(lines, "error", call.error)
+    return lines
+
+
+def _format_action_specs(specs: Any) -> str:
+    """Render a take_actions `actions` arg as a compact [A1,A6(12,30),...] label."""
+    if not isinstance(specs, list):
+        return "[?]"
+    parts: list[str] = []
+    for item in specs:
+        if not isinstance(item, dict):
+            parts.append("?")
+            continue
+        name = str(item.get("name") or "?")
+        short = name
+        if name.startswith("ACTION") and name[6:].isdigit():
+            short = f"A{name[6:]}"
+        if "x" in item and "y" in item:
+            parts.append(f"{short}({item['x']},{item['y']})")
+        else:
+            parts.append(short)
+    return "[" + ",".join(parts) + "]"
 
 
 def _status_suffix(call: CallEntry) -> str:
@@ -1256,7 +1484,6 @@ def _format_process_skill(call: CallEntry) -> list[str]:
     _append_detail(lines, "reasoning", args.get("reasoning"))
     if op in {"add", "edit"}:
         _append_detail(lines, "description", args.get("description"))
-        _append_detail(lines, "code", args.get("code"))
     if op == "search":
         _append_detail(lines, "query", args.get("query"))
     _append_detail(lines, "error", call.error)
@@ -1270,13 +1497,11 @@ def _format_run_skill(call: CallEntry) -> list[str]:
     head = f"- run_skill {skill_id}"
     if skill_name:
         head += f" ({skill_name})"
+    if call.actions_taken_inline is not None and call.actions_taken_inline > 0:
+        head += f" [{call.actions_taken_inline} actions]"
     head += _status_suffix(call)
     lines = [head]
     _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "args", args.get("args"))
-    _append_detail(lines, "result", result.get("result"))
-    _append_detail(lines, "stdout", result.get("stdout"))
-    _append_detail(lines, "stderr", result.get("stderr"))
     _append_detail(lines, "error", call.error or result.get("error"))
     return lines
 
@@ -1363,11 +1588,6 @@ def _format_run_code(call: CallEntry) -> list[str]:
     head = "- run_code" + _status_suffix(call)
     lines = [head]
     _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "code", args.get("code"))
-    _append_detail(lines, "args", args.get("args"))
-    _append_detail(lines, "result", result.get("result"))
-    _append_detail(lines, "stdout", result.get("stdout"))
-    _append_detail(lines, "stderr", result.get("stderr"))
     _append_detail(lines, "error", call.error or result.get("error"))
     return lines
 
@@ -1397,6 +1617,7 @@ _CALL_FORMATTERS: dict[str, Any] = {
     "get_recent_trajectory": _format_get_recent_trajectory,
     "run_code": _format_run_code,
     "evolve_system_prompt": _format_evolve_system_prompt,
+    "take_actions": _format_take_actions,
 }
 
 
@@ -1496,21 +1717,32 @@ def _draw_panel_text(
         draw.text((x, y + line_index * line_height), line, fill=fill, font=font)
 
 
-_ROUND_HEADER_RE = re.compile(r"^R\d+( \([^()]+\))?$")
+_VLM_HEADER_RE = re.compile(r"^V[\d?]+ \([^()]+\)(?: \[[^\]]+\])?$")
+_SUBAGENT_HEADER_RE = re.compile(r"^subagent ")
 
 
 def _panel_line_color(line_index: int, line: str) -> tuple[int, int, int, int]:
     if line_index == 0 and line == "VLM reasoning":
         return (255, 255, 255, 255)
-    if line.startswith("step=") or line.startswith("Prompt evolution"):
+    if (
+        line.startswith("step=")
+        or line.startswith("frame=")
+        or line.startswith("frames=")
+        or line.startswith("Prompt evolution")
+    ):
         return (188, 207, 255, 255)
-    if _ROUND_HEADER_RE.match(line):
+    if _VLM_HEADER_RE.match(line) or _SUBAGENT_HEADER_RE.match(line):
         return (148, 199, 247, 255)
     if line.startswith("> "):
         return (255, 196, 138, 255)
-    if "[skipped]" in line:
+    if "[skipped]" in line or "[no actions]" in line:
         return (140, 144, 152, 255)
-    if "[error]" in line or line.startswith("error:") or line.startswith("validation_error:"):
+    if (
+        "[error]" in line
+        or "[rejected" in line
+        or line.startswith("error:")
+        or line.startswith("validation_error:")
+    ):
         return (240, 130, 130, 255)
     return (226, 232, 240, 255)
 

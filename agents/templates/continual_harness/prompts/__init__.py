@@ -30,7 +30,11 @@ NAIVE_USER_PROMPT: str = _read("naive_user.md")
 # surface (memory / skills / subagents / run_code) and the orchestrator's
 # behaviour rules. Consumed by continual_harness_agent.py.
 HARNESS_SYSTEM_INSTRUCTION: str = _read("harness_system.md")
-HARNESS_USER_PROMPT: str = _read("harness_user.md")
+
+# Base orchestrator policy — initial evolvable strategic guidance. This is
+# the starting point for prompt evolution; the meta-call rewrites this text
+# while the system instruction (HARNESS_SYSTEM_INSTRUCTION) stays fixed.
+BASE_ORCHESTRATOR_POLICY: str = _read("base_orchestrator_policy.md")
 
 # Evolution prompts — meta-prompt used by ContinualHarness's prompt-evolution
 # step. Only loaded when --prompt-evolve-frequency > 0.
@@ -42,7 +46,7 @@ __all__ = [
     "NAIVE_SYSTEM_INSTRUCTION",
     "NAIVE_USER_PROMPT",
     "HARNESS_SYSTEM_INSTRUCTION",
-    "HARNESS_USER_PROMPT",
+    "BASE_ORCHESTRATOR_POLICY",
     "EVOLUTION_SYSTEM_INSTRUCTION",
     "EVOLUTION_USER_PROMPT",
     "load_prompt",

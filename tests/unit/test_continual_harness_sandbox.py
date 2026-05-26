@@ -11,6 +11,7 @@ from agents.templates.continual_harness.sandbox import (
     RESULT_CAP,
     STDOUT_CAP,
     SandboxState,
+    _validate_code,
     run_python_snippet,
 )
 
@@ -172,6 +173,53 @@ class TestSandboxSafety:
 
 
 @pytest.mark.unit
+class TestSandboxImportWhitelist:
+    """The AST validator allows `import X` only when X is pre-loaded; the
+    audit hook still blocks dangerous root modules at runtime as a backstop.
+    """
+
+    def test_validator_accepts_import_numpy_as_np(self) -> None:
+        assert _validate_code("import numpy as np\nresult = 0") is None
+
+    def test_validator_accepts_from_collections_import(self) -> None:
+        assert (
+            _validate_code("from collections import Counter\nresult = 0") is None
+        )
+
+    def test_validator_accepts_from_pil_import(self) -> None:
+        assert (
+            _validate_code("from PIL import Image, ImageDraw\nresult = 0") is None
+        )
+
+    def test_validator_accepts_multi_module_import(self) -> None:
+        assert _validate_code("import numpy, collections\nresult = 0") is None
+
+    def test_validator_rejects_import_os(self) -> None:
+        err = _validate_code("import os")
+        assert err is not None and "not allowed" in err
+
+    def test_validator_rejects_from_os_import(self) -> None:
+        err = _validate_code("from os import path")
+        assert err is not None and "not allowed" in err
+
+    def test_validator_rejects_mixed_safe_and_unsafe(self) -> None:
+        err = _validate_code("import numpy, os")
+        assert err is not None and "not allowed" in err
+
+    def test_validator_rejects_relative_import(self) -> None:
+        err = _validate_code("from . import x")
+        assert err is not None and "relative" in err
+
+    def test_runtime_import_numpy_succeeds_end_to_end(self) -> None:
+        out = run_python_snippet(
+            "import numpy as np\nresult = int(np.array([1, 2, 3]).sum())",
+            state=_empty_state(),
+        )
+        assert out["success"] is True
+        assert out["result"] == 6
+
+
+@pytest.mark.unit
 class TestSandboxModules:
     def test_whitelisted_math_works(self) -> None:
         out = run_python_snippet("result = math.sqrt(16)", state=_empty_state())
@@ -283,3 +331,159 @@ class TestSandboxErrorPaths:
         out = run_python_snippet("result = 1", state=_empty_state())
         assert out["success"] is False
         assert "did not emit JSON" in (out.get("error") or "")
+
+
+@pytest.mark.unit
+class TestSandboxReflection:
+    """Fix A — `getattr`/`hasattr` are public; `heapq` is pre-loaded."""
+
+    def test_getattr_allowed_at_parse(self) -> None:
+        assert _validate_code('x = getattr(state, "latest_frame", None)') is None
+
+    def test_hasattr_allowed_at_parse(self) -> None:
+        assert _validate_code('x = hasattr(state, "latest_frame")') is None
+
+    def test_getattr_with_dunder_string_still_rejected(self) -> None:
+        # The dunder-string check fires before getattr is involved.
+        err = _validate_code('x = getattr(o, "__class__")')
+        assert err is not None and "dunder strings" in err
+
+    def test_setattr_still_rejected(self) -> None:
+        err = _validate_code('setattr(o, "x", 1)')
+        assert err is not None and "setattr" in err
+
+    def test_getattr_runs_end_to_end(self) -> None:
+        state = SandboxState(latest_frame={"state": "NOT_FINISHED"})
+        out = run_python_snippet(
+            'result = [hasattr(state, "latest_frame"), '
+            'getattr(state, "missing", "fallback")]',
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"] == [True, "fallback"]
+
+    def test_heapq_import_allowed(self) -> None:
+        assert _validate_code("import heapq") is None
+        assert _validate_code("from heapq import heappush, heappop") is None
+
+    def test_heapq_runs_end_to_end(self) -> None:
+        out = run_python_snippet(
+            "import heapq\nh = []\n"
+            "for v in (5, 1, 3, 2, 4):\n    heapq.heappush(h, v)\n"
+            "result = [heapq.heappop(h) for _ in range(len(h))]",
+            state=_empty_state(),
+        )
+        assert out["success"] is True
+        assert out["result"] == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.unit
+class TestSandboxDualAccess:
+    """Fix C — state and RPC return values accept both attr and subscript."""
+
+    def test_state_top_level_attr_and_subscript(self) -> None:
+        state = SandboxState(latest_frame={"a": 1, "b": 2})
+        out = run_python_snippet(
+            "result = [state.latest_frame, state['latest_frame']]",
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"][0] == {"a": 1, "b": 2}
+        assert out["result"][1] == {"a": 1, "b": 2}
+
+    def test_state_nested_dict_dual_access(self) -> None:
+        state = SandboxState(latest_frame={"frame": [[0, 1], [2, 3]]})
+        out = run_python_snippet(
+            "result = [state.latest_frame.frame, "
+            "state['latest_frame']['frame'], "
+            "state.latest_frame['frame'], "
+            "state['latest_frame'].frame]",
+            state=state,
+        )
+        assert out["success"] is True
+        first = out["result"][0]
+        assert all(part == first for part in out["result"])
+
+    def test_dict_inside_list_is_also_wrapped(self) -> None:
+        state = SandboxState(
+            recent_trajectory=[{"step": 1, "action": "ACTION1"}]
+        )
+        out = run_python_snippet(
+            "row = state.recent_trajectory[0]\n"
+            "result = [row.step, row['step'], row.action]",
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"] == [1, 1, "ACTION1"]
+
+    def test_rpc_return_dual_access(self) -> None:
+        """tools.take_actions return value supports both attr and subscript."""
+
+        def fake_rpc(method: str, args: dict) -> dict:
+            return {
+                "ok": True,
+                "value": {
+                    "executed_count": 1,
+                    "last_frame": {"frame": [[0, 1]], "state": "ONGOING"},
+                    "terminal": False,
+                    "level_changed": False,
+                },
+            }
+
+        code = (
+            "res = tools.take_actions(actions=[{'name': 'ACTION1'}])\n"
+            "result = [\n"
+            "    res.executed_count,\n"
+            "    res['executed_count'],\n"
+            "    res.last_frame.state,\n"
+            "    res['last_frame']['state'],\n"
+            "]"
+        )
+        out = run_python_snippet(
+            code, state=_empty_state(), on_rpc=fake_rpc
+        )
+        assert out["success"] is True
+        assert out["result"] == [1, 1, "ONGOING", "ONGOING"]
+
+    def test_tools_attribute_access_works(self) -> None:
+        """tools.take_actions (attribute) is the correct access pattern."""
+
+        def fake_rpc(method: str, args: dict) -> dict:
+            return {"ok": True, "value": {"executed_count": 1, "terminal": False}}
+
+        out = run_python_snippet(
+            "res = tools.take_actions(actions=[{'name': 'ACTION1'}])\n"
+            "result = res.executed_count",
+            state=_empty_state(),
+            on_rpc=fake_rpc,
+        )
+        assert out["success"] is True
+        assert out["result"] == 1
+
+    def test_tools_subscript_access_fails(self) -> None:
+        """tools['take_actions'] (subscript) must fail — tools is a namespace."""
+
+        def fake_rpc(method: str, args: dict) -> dict:
+            return {"ok": True, "value": {"executed_count": 1, "terminal": False}}
+
+        out = run_python_snippet(
+            'res = tools["take_actions"](actions=[{"name": "ACTION1"}])\n'
+            "result = res",
+            state=_empty_state(),
+            on_rpc=fake_rpc,
+        )
+        assert out["success"] is False
+        assert "not subscriptable" in (out.get("error") or "")
+
+    def test_missing_key_raises_attribute_error(self) -> None:
+        state = SandboxState(latest_frame={"a": 1})
+        out = run_python_snippet(
+            "try:\n"
+            "    _ = state.latest_frame.nonexistent\n"
+            "    result = 'no-error'\n"
+            "except AttributeError:\n"
+            "    result = 'attribute-error'\n",
+            state=state,
+        )
+        assert out["success"] is True
+        assert out["result"] == "attribute-error"

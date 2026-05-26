@@ -100,11 +100,21 @@ class TestSkillStoreCRUD:
         with pytest.raises(ValueError):
             store.add("has space", "desc", "result = 1")
 
-    def test_add_rejects_duplicate_name(self, tmp_path: Path) -> None:
+    def test_add_with_existing_name_upserts(self, tmp_path: Path) -> None:
+        """Same-name `add` updates the existing entry in place."""
         store = _store(tmp_path)
-        store.add("find_player", "desc1", "result = 1")
-        with pytest.raises(ValueError, match="already in use"):
-            store.add("find_player", "desc2", "result = 2")
+        first = store.add("find_player", "desc1", "result = 1")
+        second = store.add(
+            "find_player", "desc2", "result = 2", tags=["geo"]
+        )
+        # Same id; bumped version; fresh code/description/tags.
+        assert second.id == first.id
+        assert second.version == first.version + 1
+        assert second.description == "desc2"
+        assert second.code == "result = 2"
+        assert second.tags == ["geo"]
+        # Store still has only one entry.
+        assert len(store.all_entries()) == 1
 
     def test_add_rejects_empty_code(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -227,7 +237,11 @@ class TestFormatSkillOverview:
             tags=["geo", "analysis"],
         )
         out = format_skill_overview(store.all_entries())
-        assert "[skill_001] find_player (geo, analysis)" in out
+        # The overview labels both id and name explicitly so the model
+        # cannot conflate them when calling run_skill / process_skill.
+        assert "id=skill_001" in out
+        assert "name=find_player" in out
+        assert "tags=geo,analysis" in out
         assert "Locate the player cell" in out  # first line of description IS shown
         assert "SECRET_CODE_PATTERN" not in out  # code never leaks into overview
 
@@ -269,3 +283,75 @@ class TestStoreRobustness:
         store = SkillStore(path, game_id="g")
         new = store.add("after_seed", "d", "result = 2")
         assert new.id == "skill_011"
+
+
+@pytest.mark.unit
+class TestGetByIdOrName:
+    """Covers the lookup-side fix for the model confusing skill id and name."""
+
+    def test_returns_entry_by_canonical_id(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        store.add("eval_python", "Run arithmetic", "result = 1+1")
+        entry = store.get_by_id_or_name("skill_001")
+        assert entry is not None
+        assert entry.id == "skill_001"
+        assert entry.name == "eval_python"
+
+    def test_returns_entry_by_exact_name(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        store.add("eval_python", "Run arithmetic", "result = 1+1")
+        entry = store.get_by_id_or_name("eval_python")
+        assert entry is not None
+        assert entry.id == "skill_001"
+
+    def test_name_lookup_is_case_insensitive(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        store.add("Eval_Python", "Run arithmetic", "result = 1+1")
+        assert store.get_by_id_or_name("EVAL_PYTHON") is not None
+        assert store.get_by_id_or_name("eval_python") is not None
+
+    def test_unknown_key_returns_none(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        store.add("eval_python", "Run arithmetic", "result = 1+1")
+        assert store.get_by_id_or_name("missing") is None
+        assert store.get_by_id_or_name("") is None
+
+    def test_id_match_wins_over_name_match(self, tmp_path: Path) -> None:
+        # Pathological but possible after hand-editing: an entry's name
+        # collides with another entry's id. The id match should win.
+        path = tmp_path / "skills.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "next_id": 3,
+                    "entries": [
+                        {
+                            "id": "skill_001",
+                            "game_id": "g",
+                            "name": "alpha",
+                            "description": "d",
+                            "code": "result = 0",
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        },
+                        {
+                            "id": "skill_002",
+                            "game_id": "g",
+                            "name": "skill_001",  # collision
+                            "description": "d",
+                            "code": "result = 0",
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        },
+                    ],
+                }
+            )
+        )
+        store = SkillStore(path, game_id="g")
+        hit = store.get_by_id_or_name("skill_001")
+        assert hit is not None
+        assert hit.id == "skill_001"  # id match, not the name collision

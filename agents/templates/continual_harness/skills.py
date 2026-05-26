@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 NAME_MAX_CHARS = 100
 DESCRIPTION_MAX_CHARS = 500
-CODE_MAX_CHARS = 8000
-MAX_SKILLS = 50
+CODE_MAX_CHARS = 32000
+MAX_SKILLS = 200
 SEARCH_MAX_MATCHES = 10
 
 
@@ -144,6 +144,27 @@ class SkillStore:
                 return entry
         return None
 
+    def get_by_id_or_name(self, key: str) -> SkillEntry | None:
+        """Resolve a skill by its canonical id (skill_NNN) or its unique name.
+
+        Models frequently confuse the bracketed id shown in the overview with
+        the human-readable name; accepting either avoids burning a turn on a
+        retry. Name lookup is case-insensitive. Returns the FIRST match in
+        store order — names are unique by add() invariants, but for legacy
+        files we still favour id matches.
+        """
+        if not key:
+            return None
+        entries = self.all_entries()
+        for entry in entries:
+            if entry.id == key:
+                return entry
+        needle = key.lower()
+        for entry in entries:
+            if entry.name.lower() == needle:
+                return entry
+        return None
+
     def add(
         self,
         name: str,
@@ -151,6 +172,15 @@ class SkillStore:
         code: str,
         tags: list[str] | None = None,
     ) -> SkillEntry:
+        """Add a skill, or upsert if `name` already exists.
+
+        Models routinely re-save the same skill name with revised code to mark
+        progress on a hypothesis. Treating that as a hard error caused two
+        failure modes: silent variant churn (`solve_foo_v2..v28`) and, once
+        the cap hit, every further `add` failing while the model believed it
+        had saved. Same-name `add` now routes to `edit`, returning the
+        updated entry; new names still allocate a new id.
+        """
         name = (name or "").strip()
         if not _VALID_NAME.match(name):
             raise ValueError(
@@ -164,14 +194,27 @@ class SkillStore:
             raise ValueError(f"code exceeds {CODE_MAX_CHARS} chars")
         with self._lock:
             state = self._load()
-            if len(state["entries"]) >= MAX_SKILLS:
+            existing_id: str | None = None
+            for e in state["entries"]:
+                if e.get("name") == name:
+                    existing_id = e.get("id")
+                    break
+            if existing_id is None and len(state["entries"]) >= MAX_SKILLS:
                 raise ValueError(
                     f"skills full ({MAX_SKILLS} entries); delete or edit one first"
                 )
-            if any(e.get("name") == name for e in state["entries"]):
-                raise ValueError(
-                    f"skill name {name!r} already in use; use edit instead"
-                )
+            if existing_id is not None:
+                # Upsert: re-saving an existing name updates that skill in
+                # place, bumping its version.
+                for entry in state["entries"]:
+                    if entry.get("id") == existing_id:
+                        entry["description"] = description
+                        entry["code"] = code
+                        entry["tags"] = list(tags or [])
+                        entry["version"] = int(entry.get("version", 1)) + 1
+                        entry["updated_at"] = self._now()
+                        self._save(state)
+                        return SkillEntry(**entry)
             now = self._now()
             entry = SkillEntry(
                 id=f"skill_{state['next_id']:03d}",
@@ -276,20 +319,22 @@ class SkillStore:
 
 
 def format_skill_overview(entries: list[SkillEntry]) -> str:
-    """Compact index for auto-injection. Shows id + name + tags + first description line."""
+    """Compact index for auto-injection. Labels both `id` and `name` so the
+    model can address a skill by either when calling run_skill / process_skill.
+    """
     if not entries:
         return (
             "## SKILLS (0 saved)\n"
             'No skills saved yet. Use process_skill(operation="add", name=..., '
             "description=..., code=...) to save reusable analysis snippets, "
-            "then run_skill(id) to execute one."
+            "then run_skill(id_or_name) to execute one."
         )
     rows = [f"## SKILLS ({len(entries)} saved)"]
     for e in entries:
-        tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
+        tag_str = f" tags={','.join(e.tags)}" if e.tags else ""
         first_line = (
             (e.description or "").splitlines()[0][:120] if e.description else ""
         )
         sep = " — " if first_line else ""
-        rows.append(f"[{e.id}] {e.name}{tag_str}{sep}{first_line}")
+        rows.append(f"- id={e.id} name={e.name}{tag_str}{sep}{first_line}")
     return "\n".join(rows)

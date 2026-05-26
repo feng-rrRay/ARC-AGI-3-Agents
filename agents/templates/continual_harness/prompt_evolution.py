@@ -25,10 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from arcengine import FrameData
-
 from ._locks import lock_for_path
-from .context import pretty_print_3d
 from .prompts import EVOLUTION_USER_PROMPT
 from .trajectory import format_full_history
 
@@ -37,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # Bounds match the validator and the meta-prompt's stated contract.
 PROMPT_MIN_CHARS = 200
-PROMPT_MAX_CHARS = 6000
+PROMPT_MAX_CHARS = 12000
 
 BOOTSTRAP_PROMPT_ENV = "CONTINUAL_HARNESS_BOOTSTRAP_PROMPT"
 RUN_PROMPT_PATH_ENV = "RUN_PROMPT_PATH"
@@ -181,38 +178,29 @@ class PromptEvolutionStore:
 
 def build_evolution_prompt(
     *,
-    current_prompt: str,
-    latest_frame: FrameData,
-    generation: int,
-    action_counter: int,
+    system_prompt: str,
+    current_base_prompt: str,
     trajectory_rows: list[dict[str, Any]],
-    memory_overview: str,
-    skill_overview: str,
-    subagent_overview: str,
+    memory_overview: str = "",
+    skill_overview: str = "",
+    subagent_overview: str = "",
 ) -> str:
     """Assemble the meta-call user prompt from the EVOLUTION_USER_PROMPT template.
 
     `trajectory_rows` are the raw dicts returned by `TrajectoryStore.tail(n)`;
     we render them with `format_full_history` so the meta-call sees reasoning
-    + tool calls (not the one-line compact format used in the orchestrator).
+    + tool calls + grid deltas.
     """
-    trajectory_text = format_full_history(trajectory_rows, max_chars=8000)
-    frame_text = (
-        pretty_print_3d(latest_frame.frame) if latest_frame.frame else "(no frame)"
-    )
+    trajectory_text = format_full_history(trajectory_rows, max_chars=50000)
 
     return EVOLUTION_USER_PROMPT.format(
-        current_prompt=current_prompt,
-        state=latest_frame.state.name,
-        score=latest_frame.levels_completed,
-        action_counter=action_counter,
-        generation=generation,
+        system_prompt=system_prompt,
+        current_base_prompt=current_base_prompt,
         n=len(trajectory_rows),
         trajectory=trajectory_text,
         memory_overview=memory_overview,
         skill_overview=skill_overview,
         subagent_overview=subagent_overview,
-        frame=frame_text,
     )
 
 
