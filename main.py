@@ -51,7 +51,7 @@ HEADERS = {
     "Accept": "application/json",
 }
 PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
-DEFAULT_PROMPT_EVOLVE_FREQUENCY = 25
+DEFAULT_PROMPT_EVOLVE_FREQUENCY = 75
 
 
 def _parse_prompt_evolve_frequency(value: str | int) -> int:

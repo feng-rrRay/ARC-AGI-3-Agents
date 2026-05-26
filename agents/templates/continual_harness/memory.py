@@ -238,3 +238,15 @@ def format_memory_overview(entries: list[MemoryEntry]) -> str:
         tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
         rows.append(f"[{e.id}] {e.title}{tag_str}")
     return "\n".join(rows)
+
+
+def format_memory_full(entries: list[MemoryEntry]) -> str:
+    """Full memory dump with bodies, for the evolution meta-call."""
+    if not entries:
+        return "## LONG-TERM MEMORY (0 entries)\nNo memories saved yet."
+    rows = [f"## LONG-TERM MEMORY ({len(entries)} entries)"]
+    for e in entries:
+        tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
+        rows.append(f"### [{e.id}] {e.title}{tag_str}")
+        rows.append(e.body)
+    return "\n".join(rows)

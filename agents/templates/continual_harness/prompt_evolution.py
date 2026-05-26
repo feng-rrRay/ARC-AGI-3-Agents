@@ -191,7 +191,7 @@ def build_evolution_prompt(
     we render them with `format_full_history` so the meta-call sees reasoning
     + tool calls + grid deltas.
     """
-    trajectory_text = format_full_history(trajectory_rows, max_chars=8000)
+    trajectory_text = format_full_history(trajectory_rows, max_chars=50000)
 
     return EVOLUTION_USER_PROMPT.format(
         system_prompt=system_prompt,

@@ -20,6 +20,7 @@ from .continual_harness.helpers import (
 from .continual_harness.memory import (
     MemoryStore,
     active_memory_path,
+    format_memory_full,
     format_memory_overview,
 )
 from .continual_harness.models import StepRecord, ToolCallRecord
@@ -231,7 +232,6 @@ class ContinualHarness(Agent):
     # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
     DEFAULT_PROMPT_EVOLVE_FREQUENCY = 75
     PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
-    EVOLUTION_TRAJECTORY_WINDOW = 25  # how many recent steps the meta-call sees
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Must resolve model_name BEFORE super().__init__(): Agent.__init__
@@ -994,21 +994,27 @@ class ContinualHarness(Agent):
 
     @staticmethod
     def _extract_text(response: Any) -> str:
-        """Extract plain text from a Gemini response, stripping markdown fences."""
-        text = ""
-        for cand in getattr(response, "candidates", None) or []:
-            for part in getattr(getattr(cand, "content", None), "parts", []) or []:
-                t = getattr(part, "text", None)
-                if t:
-                    text += t
-        text = text.strip()
-        if text.startswith("```markdown"):
-            text = text[11:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        return text.strip()
+        """Extract plain text from a Gemini response or string.
+
+        When no tools are set, the VLM backend returns a plain string. When
+        tools are set, it returns a response object with candidates/parts.
+        Handles preamble text before markdown fences.
+        """
+        import re
+        if isinstance(response, str):
+            text = response.strip()
+        else:
+            text = ""
+            for cand in getattr(response, "candidates", None) or []:
+                for part in getattr(getattr(cand, "content", None), "parts", []) or []:
+                    t = getattr(part, "text", None)
+                    if t:
+                        text += t
+            text = text.strip()
+        m = re.search(r"```(?:markdown)?\s*\n(.*?)```", text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        return text
 
     def _evolve_system_prompt(self, latest_frame: FrameData) -> None:
         """One meta-VLM call that may rewrite the agent's base prompt.
@@ -1022,12 +1028,13 @@ class ContinualHarness(Agent):
         gen = self._prompt_generation
         previous = self._current_base_prompt
 
-        trajectory_rows = self.trajectory.tail(self.EVOLUTION_TRAJECTORY_WINDOW)
+        steps_since = max(1, self.action_counter - max(self._last_evolution_step, 0))
+        trajectory_rows = self.trajectory.tail(steps_since)
         user_prompt = build_evolution_prompt(
             system_prompt=self._system_instruction,
             current_base_prompt=previous,
             trajectory_rows=trajectory_rows,
-            memory_overview=format_memory_overview(self.memory.all_entries()),
+            memory_overview=format_memory_full(self.memory.all_entries()),
             skill_overview=format_skill_overview(self.skills.all_entries()),
             subagent_overview=format_subagent_overview(self.subagents.all_entries()),
         )
