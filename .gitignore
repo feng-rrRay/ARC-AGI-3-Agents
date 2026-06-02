@@ -5,17 +5,22 @@ logs/
 *.env
 !.env-example
 arc_api_key.sh
+.venv/
+*.egg-info/
 
 # Cache
 .ruff_cache/
 .mypy_cache/
 **/__pycache__/
+.pytest_cache/
 
 # IDE settings
 .vscode/
 CLAUDE.md
 AGENTS.md
 .claude/
+.agents/
+.codex/
 
 # Recordings
 recordings/
