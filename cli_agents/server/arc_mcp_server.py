@@ -48,7 +48,12 @@ def _post(path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_game_state() -> list[Any]:
+def get_game_state():
+    # NOTE: intentionally no return annotation. With a `-> list[...]` annotation,
+    # FastMCP builds a structured-output schema and JSON-serializes the return
+    # value, which fails on the MCPImage object ("Unable to serialize unknown
+    # type: Image"). Omitting the annotation keeps FastMCP on the content-
+    # conversion path that turns [dict, Image] into a text block + an image block.
     """Get the current ARC game state.
 
     Returns the grid as a labelled text description plus a rendered PNG image
@@ -59,7 +64,7 @@ def get_game_state() -> list[Any]:
       - state_text: multi-layer integer grid rendered as labelled text rows
       - available_actions: list of valid action names (and whether each needs x,y)
       - state: current game state (NOT_PLAYED / NOT_FINISHED / WIN / GAME_OVER)
-      - levels_completed, budget_remaining, guid
+      - levels_completed, guid
       - A PNG image of the grid (the next content block)
     """
     result = _post("/mcp/get_game_state")
@@ -71,10 +76,9 @@ def get_game_state() -> list[Any]:
         )
         img_bytes = base64.b64decode(b64)
         logger.info(
-            "get_game_state: state=%s levels=%s budget=%s image=%dKB",
+            "get_game_state: state=%s levels=%s image=%dKB",
             result.get("state"),
             result.get("levels_completed"),
-            result.get("budget_remaining"),
             len(img_bytes) // 1024,
         )
         return [result, MCPImage(data=img_bytes, format="png")]

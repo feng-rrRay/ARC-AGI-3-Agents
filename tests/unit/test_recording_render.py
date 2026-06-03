@@ -16,6 +16,7 @@ from agents.recording_render import (
     export_mp4,
     find_actions_log,
     find_trace_log,
+    find_trajectory_log,
     grid_to_image,
     load_recording_frames,
     main,
@@ -216,6 +217,44 @@ def test_discover_recording_paths_accepts_run_directory(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_discover_recording_paths_accepts_flat_hermes_recording(tmp_path: Path) -> None:
+    game_dir = tmp_path / "logs" / "hermes-1" / "ls20"
+    recordings_dir = game_dir / "recordings"
+    recordings_dir.mkdir(parents=True)
+    recording = recordings_dir / "ls20-guid.jsonl"
+    trajectory = game_dir / "logs" / "trajectory.jsonl"
+    recording.write_text("", encoding="utf-8")
+    trajectory.parent.mkdir()
+    trajectory.write_text("", encoding="utf-8")
+
+    assert discover_recording_paths(game_dir) == [recording]
+
+
+@pytest.mark.unit
+def test_discover_recording_paths_accepts_nested_hermes_recording(tmp_path: Path) -> None:
+    game_dir = tmp_path / "logs" / "hermes-1" / "ls20"
+    scorecard_dir = game_dir / "recordings" / "card-id"
+    scorecard_dir.mkdir(parents=True)
+    recording = scorecard_dir / "ls20-guid.jsonl"
+    recording.write_text("", encoding="utf-8")
+
+    assert discover_recording_paths(game_dir) == [recording]
+
+
+@pytest.mark.unit
+def test_discover_recording_paths_accepts_top_level_hermes_run(tmp_path: Path) -> None:
+    hermes_dir = tmp_path / "logs" / "hermes-1"
+    first = hermes_dir / "ls20" / "recordings" / "ls20-guid.jsonl"
+    second = hermes_dir / "ft09" / "recordings" / "ft09-guid.jsonl"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_text("", encoding="utf-8")
+    second.write_text("", encoding="utf-8")
+
+    assert discover_recording_paths(hermes_dir) == [second, first]
+
+
+@pytest.mark.unit
 def test_output_path_for_recording_uses_output_directory_for_multiple() -> None:
     recording = Path("recordings/test.agent.guid.recording.jsonl")
 
@@ -386,6 +425,18 @@ def test_find_actions_log_uses_run_dir_layout(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_find_actions_log_uses_hermes_game_dir_layout(tmp_path: Path) -> None:
+    game_dir = tmp_path / "logs" / "hermes-1" / "ls20"
+    recording = game_dir / "recordings" / "ls20-guid.jsonl"
+    log = game_dir / "logs" / "hermes.log"
+    recording.parent.mkdir(parents=True)
+    log.parent.mkdir()
+    log.write_text("hermes log\n", encoding="utf-8")
+
+    assert find_actions_log(recording, logs_dir=tmp_path / "logs") == log
+
+
+@pytest.mark.unit
 def test_find_trace_log_uses_run_dir_layout(tmp_path: Path) -> None:
     run_dir = tmp_path / "logs" / "run-1"
     recording = run_dir / "recordings" / "test.agent.guid.recording.jsonl"
@@ -395,3 +446,15 @@ def test_find_trace_log_uses_run_dir_layout(tmp_path: Path) -> None:
     trace.write_text("{}\n", encoding="utf-8")
 
     assert find_trace_log(recording, logs_dir=tmp_path / "logs") == trace
+
+
+@pytest.mark.unit
+def test_find_trajectory_log_uses_hermes_game_dir_layout(tmp_path: Path) -> None:
+    game_dir = tmp_path / "logs" / "hermes-1" / "ls20"
+    recording = game_dir / "recordings" / "card-id" / "ls20-guid.jsonl"
+    trajectory = game_dir / "logs" / "trajectory.jsonl"
+    recording.parent.mkdir(parents=True)
+    trajectory.parent.mkdir()
+    trajectory.write_text("{}\n", encoding="utf-8")
+
+    assert find_trajectory_log(recording) == trajectory

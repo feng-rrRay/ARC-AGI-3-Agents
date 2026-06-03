@@ -29,6 +29,24 @@ export ARC_API_KEY="your_api_key_here"
 uv run main.py --agent=random --game=ls20
 ```
 
+## Launching the Hermes Agent
+
+Hermes evaluation uses the `hermes-eval` optional dependencies and runs Hermes in a Docker container built from `.devcontainer/hermes-agent/`. Make sure Docker is available, `ARC_API_KEY` is set, and your model API key is set, for example `GEMINI_API_KEY`.
+
+Build the Hermes container image on the first run:
+
+```bash
+uv run --extra hermes-eval python run_cli.py --game ls20 --build
+```
+
+After the image is built, launch Hermes without rebuilding:
+
+```bash
+uv run --extra hermes-eval python run_cli.py --game ls20
+```
+
+By default Hermes receives only the ARC MCP tools (`get_game_state` and `take_actions`). To expose the full Hermes built-in toolset, pass `--toolset full`. Logs are written under `logs/hermes-<timestamp>/<game>/`; gameplay recordings are exposed directly under that run's `recordings/` directory.
+
 For more information, see the [documentation](https://three.arcprize.org/docs#quick-start) or the [tutorial video](https://youtu.be/xEVg9dcJMkw).
 
 ## Changelog

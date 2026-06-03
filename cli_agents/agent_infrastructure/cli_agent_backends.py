@@ -30,6 +30,8 @@ class CliSessionMetrics:
     auth_fatal_error: bool = False
     is_error: bool = False
     last_error: str = ""
+    session_id: str = ""          # Hermes session id (for resume across relaunches)
+    tool_count: int = 0           # number of MCP tools the agent loaded
 
 
 @dataclass
@@ -148,6 +150,7 @@ class HermesCliBackend:
         api_key_env: str = "GEMINI_API_KEY",
         max_turns: int = 90,
         resume_session_id: str = "",
+        toolset: str = "min",
     ) -> list[str]:
         """Return the full `docker run` command list."""
         wrapper_cmd = [
@@ -161,9 +164,16 @@ class HermesCliBackend:
             "--provider",       provider,
             "--api-key-env",    api_key_env,
             "--max-turns",      str(max_turns),
+            "--toolset",        toolset,
         ]
         if resume_session_id:
             wrapper_cmd += ["--resume-session-id", resume_session_id]
+
+        # Docker bind-mount sources MUST be absolute paths; a relative source is
+        # interpreted as a (invalid) named volume. Resolve all three.
+        mem_src     = Path(hermes_memory_dir).resolve()
+        scratch_src = Path(scratch_dir).resolve()
+        proj_src    = Path(project_root).resolve()
 
         docker_cmd = [
             "docker", "run", "--rm",
@@ -172,9 +182,9 @@ class HermesCliBackend:
             "--security-opt=seccomp=unconfined",
             "--network=bridge",
             "--add-host=host.docker.internal:host-gateway",
-            "-v", f"{hermes_memory_dir}:{self.AGENT_MEMORY_PATH}",
-            "-v", f"{scratch_dir}:{self.WORKSPACE_PATH}",
-            "-v", f"{project_root}:{self.PROJECT_ROOT_PATH}:ro",
+            "-v", f"{mem_src}:{self.AGENT_MEMORY_PATH}",
+            "-v", f"{scratch_src}:{self.WORKSPACE_PATH}",
+            "-v", f"{proj_src}:{self.PROJECT_ROOT_PATH}:ro",
             "-w", self.WORKSPACE_PATH,
             "-e", f"MCP_PORT={mcp_port}",
             "-e", f"GAME_SERVER_PORT={game_port}",
@@ -185,6 +195,8 @@ class HermesCliBackend:
             "-e", f"HERMES_PROVIDER={provider}",
             "-e", f"HERMES_API_KEY_ENV={api_key_env}",
             "-e", f"HERMES_MAX_TURNS={max_turns}",
+            "-e", f"HERMES_TOOLSET={toolset}",
+            "-e", "PYTHONUNBUFFERED=1",
         ]
 
         # Pass through Gemini / Google API keys (never ARC keys)
@@ -206,6 +218,11 @@ class HermesCliBackend:
     # Stream reader — phase-1: tee to log; phase-2 adds JSONL event parsing
     # ---------------------------------------------------------------------------
 
+    # JSONL event types worth persisting to the trajectory file.
+    _TRAJECTORY_EVENT_TYPES = {
+        "system", "thinking", "tool_use", "tool_result", "result", "error",
+    }
+
     def run_stream_reader(
         self,
         stdout_pipe: io.RawIOBase,
@@ -213,13 +230,13 @@ class HermesCliBackend:
         log_file: io.TextIOWrapper | None,
         metrics: CliSessionMetrics | None,
         server_url: str | None = None,
+        trajectory_file: io.TextIOWrapper | None = None,
     ) -> None:
-        """Read container stdout; tee to log_file; parse JSONL events."""
+        """Read container stdout; tee raw lines to log_file; parse JSONL events,
+        update metrics, and append structured events to trajectory_file."""
         try:
             buffered = io.BufferedReader(stdout_pipe)  # type: ignore[arg-type]
             for raw_line in buffered:
-                if stop_event.is_set():
-                    break
                 line = raw_line.decode("utf-8", errors="replace")
                 if log_file:
                     log_file.write(line)
@@ -227,12 +244,18 @@ class HermesCliBackend:
                 stripped = line.strip()
                 if not stripped:
                     continue
-                # Phase-1: best-effort JSONL parse for the result event only
                 try:
                     event = json.loads(stripped)
                 except json.JSONDecodeError:
                     continue
                 self._handle_stream_event(event, metrics)
+                if (
+                    trajectory_file is not None
+                    and isinstance(event, dict)
+                    and event.get("type") in self._TRAJECTORY_EVENT_TYPES
+                ):
+                    trajectory_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    trajectory_file.flush()
         except Exception as exc:
             logger.debug("stream reader exited: %s", exc)
 
@@ -240,7 +263,15 @@ class HermesCliBackend:
         self, event: dict[str, Any], metrics: CliSessionMetrics | None
     ) -> None:
         etype = event.get("type", "")
-        if etype == "result" and metrics:
+        if etype == "system" and metrics:
+            sid = event.get("session_id")
+            if sid:
+                metrics.session_id = str(sid)
+            metrics.tool_count = len(event.get("tools") or [])
+        elif etype == "result" and metrics:
+            sid = event.get("session_id")
+            if sid:
+                metrics.session_id = str(sid)
             metrics.total_cost_usd += float(event.get("total_cost_usd") or 0)
             metrics.total_turns    += int(event.get("num_turns") or 0)
             metrics.is_error        = bool(event.get("is_error"))

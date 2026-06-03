@@ -183,19 +183,34 @@ def discover_recording_paths(path: str | Path) -> list[Path]:
     """Return recording files from a single file or a run/recordings directory."""
     input_path = Path(path)
     if input_path.is_file():
-        if not input_path.name.endswith(RECORDING_SUFFIX):
-            raise ValueError(f"Input file must end with {RECORDING_SUFFIX}: {input_path}")
+        if not _is_recording_jsonl(input_path):
+            raise ValueError(
+                "Input file must be a recording JSONL file "
+                f"({RECORDING_SUFFIX} or Hermes *.jsonl): {input_path}"
+            )
         return [input_path]
 
     if not input_path.is_dir():
         raise FileNotFoundError(f"No such recording file or run directory: {input_path}")
 
     recordings_dir = input_path / "recordings"
-    search_dir = recordings_dir if recordings_dir.is_dir() else input_path
-    recordings = sorted(search_dir.glob(f"*{RECORDING_SUFFIX}"))
+    search_dirs = [recordings_dir] if recordings_dir.is_dir() else [input_path]
+    if not recordings_dir.is_dir():
+        search_dirs.extend(sorted(input_path.glob("*/recordings")))
+
+    recordings = sorted(
+        {
+            recording
+            for search_dir in search_dirs
+            for recording in _recordings_in_dir(search_dir)
+        }
+    )
     if not recordings:
-        detail = f"{recordings_dir} or {input_path}" if search_dir != input_path else input_path
-        raise ValueError(f"No *{RECORDING_SUFFIX} files found in {detail}")
+        detail = f"{recordings_dir} or {input_path}" if recordings_dir.is_dir() else input_path
+        raise ValueError(
+            f"No recording JSONL files found in {detail} "
+            f"({RECORDING_SUFFIX} or Hermes *.jsonl)"
+        )
     return recordings
 
 
@@ -853,14 +868,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Render ARC-AGI recording JSONL files to GIF or MP4. "
-            "Input may be one .recording.jsonl file or a run directory "
-            "containing recordings/."
+            "Input may be one .recording.jsonl/Hermes .jsonl file or a run "
+            "directory containing recordings/."
         )
     )
     parser.add_argument(
         "input",
         type=Path,
-        help="Path to a .recording.jsonl file or run folder such as logs/<run-id>.",
+        help=(
+            "Path to a recording JSONL file or run folder such as logs/<run-id> "
+            "or logs/<hermes-run>/<game-id>."
+        ),
     )
     parser.add_argument(
         "-o",
@@ -910,7 +928,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Optional .trajectory.jsonl file used to enrich the panel with the "
             "results of executed analysis tools. Defaults to the sibling "
-            "artifacts/*.trajectory.jsonl."
+            "artifacts/*.trajectory.jsonl or Hermes logs/trajectory.jsonl."
         ),
     )
     parser.add_argument(
@@ -1055,12 +1073,54 @@ def _recording_agent_hint(recording_path: Path) -> str | None:
     return stem or None
 
 
+def _is_recording_jsonl(path: Path) -> bool:
+    name = path.name
+    if name.endswith(RECORDING_SUFFIX):
+        return True
+    if path.suffix != ".jsonl":
+        return False
+    if (
+        name.endswith(TRACE_SUFFIX)
+        or name.endswith(TRAJECTORY_SUFFIX)
+        or name == TRAJECTORY_SUFFIX.removeprefix(".")
+        or name == PROMPT_EVOLUTION_NAME
+    ):
+        return False
+    return True
+
+
+def _recordings_in_dir(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
+
+    recordings = [
+        candidate
+        for candidate in sorted(path.iterdir())
+        if candidate.is_file() and _is_recording_jsonl(candidate)
+    ]
+    for child in sorted(path.iterdir()):
+        if not child.is_dir():
+            continue
+        recordings.extend(
+            candidate
+            for candidate in sorted(child.iterdir())
+            if candidate.is_file() and _is_recording_jsonl(candidate)
+        )
+    return recordings
+
+
 def _run_log_for_recording(recording_path: Path) -> Path | None:
     run_dir = _run_dir_for_recording(recording_path)
     if run_dir is None:
         return None
-    run_log = run_dir / "run.log"
-    return run_log if run_log.exists() else None
+    for candidate in (
+        run_dir / "run.log",
+        run_dir / "logs" / "hermes.log",
+        run_dir / "hermes_memory" / "logs" / "agent.log",
+    ):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _artifact_companion_for_recording(
@@ -1072,17 +1132,21 @@ def _artifact_companion_for_recording(
     stem = recording_path.name
     if stem.endswith(RECORDING_SUFFIX):
         stem = stem[: -len(RECORDING_SUFFIX)]
-    candidate = run_dir / "artifacts" / f"{stem}{suffix}"
-    return candidate if candidate.exists() else None
+    candidates = [run_dir / "artifacts" / f"{stem}{suffix}"]
+    if suffix == TRAJECTORY_SUFFIX:
+        candidates.append(run_dir / "logs" / "trajectory.jsonl")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _run_dir_for_recording(recording_path: Path) -> Path | None:
-    if recording_path.parent.name != "recordings":
-        return None
-    run_dir = recording_path.parent.parent
-    if run_dir == recording_path.parent or run_dir.parent.name != "logs":
-        return None
-    return run_dir
+    if recording_path.parent.name == "recordings":
+        return recording_path.parent.parent
+    if recording_path.parent.parent.name == "recordings":
+        return recording_path.parent.parent.parent
+    return None
 
 
 def _trace_mentions_agent(trace_path: Path, agent_hint: str) -> bool:
