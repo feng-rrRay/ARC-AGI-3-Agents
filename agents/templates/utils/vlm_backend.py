@@ -176,16 +176,11 @@ class GeminiBackend(VLMBackend):
         return self._types.GenerateContentConfig(**cfg)
 
     def _prepare_image(self, img: ImageInput) -> Image.Image:
-        # Upscale 4x with NEAREST to preserve crisp pixel boundaries — each cell
-        # becomes a 4x4 block of identical colour rather than getting smoothed.
         if isinstance(img, np.ndarray):
-            image = Image.fromarray(img)
-        elif isinstance(img, Image.Image):
-            image = img
-        else:
-            raise ValueError(f"Unsupported image type: {type(img)}")
-        w, h = image.size
-        return image.resize((w * 4, h * 4), Image.Resampling.NEAREST)
+            return Image.fromarray(img)
+        if isinstance(img, Image.Image):
+            return img
+        raise ValueError(f"Unsupported image type: {type(img)}")
 
     def _generate(self, contents: list[Any]) -> Any:
         # Retry transient/quota errors with exponential backoff; surface other errors immediately.

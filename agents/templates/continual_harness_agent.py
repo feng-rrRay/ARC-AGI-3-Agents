@@ -13,10 +13,16 @@ from ..agent import Agent
 from ..recorder import Recorder
 from ..run_artifacts import RUN_DIR_ENV, RUN_RECORDINGS_DIR_ENV, game_artifacts
 from ..tracing import trace_agent_session
-from .continual_harness.context import build_subagent_prompt, build_working_prompt
+from .continual_harness.context import (
+    build_observation_section,
+    build_subagent_prompt,
+    build_working_prompt,
+    current_state_rendered_grid,
+)
 from .continual_harness.helpers import (
     available_game_actions,
     frame_to_images,
+    grid_to_image,
     validate_action_sequence,
 )
 from .continual_harness.memory import (
@@ -25,7 +31,12 @@ from .continual_harness.memory import (
     format_memory_full,
     format_memory_overview,
 )
-from .continual_harness.models import StepRecord, ToolCallRecord
+from .continual_harness.models import (
+    PendingActionObservation,
+    RenderedGrid,
+    StepRecord,
+    ToolCallRecord,
+)
 from .continual_harness.prompt_evolution import (
     PromptEvolutionRecord,
     PromptEvolutionStore,
@@ -116,30 +127,6 @@ def _action_data_dict(action: GameAction) -> dict[str, Any]:
     return {k: v for k, v in dump().items() if k != "game_id"}
 
 
-def _sample_keyframes(items: list[Any], k: int) -> list[Any]:
-    """Pick up to k items from `items`, biased toward keyframes.
-
-    For animation sequences shorter than or equal to k, returns everything
-    unchanged. For longer sequences, returns the first item, the last item,
-    and k-2 evenly-spaced intermediates. Duplicate indices are collapsed,
-    so the result may be shorter than k if k > len(items).
-    """
-    n = len(items)
-    if n <= k:
-        return list(items)
-    if k <= 1:
-        return [items[-1]]
-    seen: set[int] = set()
-    indices: list[int] = []
-    for i in range(k):
-        idx = round(i * (n - 1) / (k - 1))
-        if idx not in seen:
-            seen.add(idx)
-            indices.append(idx)
-    indices.sort()
-    return [items[i] for i in indices]
-
-
 def _format_action_list(specs: Any) -> str:
     """Render a take_actions `actions` list as a compact log-friendly string.
 
@@ -223,12 +210,6 @@ class ContinualHarness(Agent):
     SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
     RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
     SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
-    # Max number of grid-image attachments per orchestrator VLM call. Frames
-    # with more grids than this (e.g., long animation sequences or the 118-grid
-    # level-transition case) get keyframe-sampled: first + last + evenly-spaced
-    # middles. Skills are unaffected — they still see every grid via
-    # `state.images` (capped by sandbox.MAX_IMAGES=16 independently).
-    MAX_VLM_PAYLOAD_IMAGES = 8
     # Prompt-evolution defaults; the actual frequency is read from
     # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
     # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
@@ -563,12 +544,15 @@ class ContinualHarness(Agent):
         # Cross-iteration state for the new VLM-call-driven loop.
         # `_recent_tool_results` carries forward analysis-tool outputs from one
         # outer iteration to the next (PokeAgent-style — cleared on action).
+        # `_pending_observations` carries action transition/result frames from
+        # executed actions into the next successful orchestrator VLM prompt.
         # `_consecutive_vlm_errors` is bookkeeping for hard failure detection.
         # `_sandbox_*` state is set per-skill by _handle_run_skill and read by
         # `_sandbox_rpc` to gate take_actions RPCs.
         # `_batch_counter` mints unique batch IDs for tagging trajectory rows.
         # `_vlm_call_count` is a monotonic counter set on `_current_outer_round`.
         self._recent_tool_results: list[ToolCallRecord] = []
+        self._pending_observations: list[PendingActionObservation] = []
         self._consecutive_vlm_errors: int = 0
         self._sandbox_terminal_seen: bool = False
         self._sandbox_skill_id: str | None = None
@@ -1257,23 +1241,17 @@ class ContinualHarness(Agent):
             skill_entries=[asdict(e) for e in self.skills.all_entries()],
         )
 
-        prompt = self._build_working_prompt(latest_frame)
+        prompt, rendered_grids = self._build_working_prompt(latest_frame)
         tools = self._full_tool_list()
 
-        # Keyframe-sample the image list before sending to the VLM. Most frames
-        # carry 1 grid (sample is a no-op). Long animation sequences (and the
-        # pathological 118-grid level-transition case) get reduced to at most
-        # MAX_VLM_PAYLOAD_IMAGES = first + last + evenly-spaced middles —
-        # enough to read the animation's success/failure signal without
-        # multipart-payload bloat. Skills still see every grid via
-        # `self._current_images` → `state.images` in the sandbox.
-        vlm_images = _sample_keyframes(
-            self._current_images, self.MAX_VLM_PAYLOAD_IMAGES
-        )
+        # The orchestrator image payload mirrors the grids rendered in the
+        # prompt text, in order. Skills still see every grid from the current
+        # latest_frame via `self._current_images` -> `state.images`.
+        vlm_images = [grid_to_image(item.grid) for item in rendered_grids]
         payload: Any = (
             vlm_images
             if len(vlm_images) > 1
-            else (vlm_images[0] if vlm_images else None)
+            else (vlm_images[0] if vlm_images else [])
         )
 
         output: dict[str, Any] = {}
@@ -1287,11 +1265,16 @@ class ContinualHarness(Agent):
             self._consecutive_vlm_errors += 1
             self._write_orchestrator_trace(
                 prompt=prompt, output={}, usage=None, tools=tools,
-                tool_calls=[], actions_executed=0, error=repr(exc),
+                tool_calls=[], actions_executed=0, rendered_grids=rendered_grids,
+                error=repr(exc),
             )
             logger.warning("VLM call failed: %s", exc)
             return 0
         self._consecutive_vlm_errors = 0
+        # Observations shown in this prompt have now been delivered. Clear
+        # before dispatching the response so any actions emitted by this query
+        # become the next prompt's observations.
+        self._pending_observations = []
 
         fcs = extract_function_calls(response)
         actions_executed = 0
@@ -1348,7 +1331,8 @@ class ContinualHarness(Agent):
 
         self._write_orchestrator_trace(
             prompt=prompt, output=output, usage=usage, tools=tools,
-            tool_calls=new_results, actions_executed=actions_executed, error=error,
+            tool_calls=new_results, actions_executed=actions_executed,
+            rendered_grids=rendered_grids, error=error,
         )
 
         # Carry analysis results to the next iteration's prompt. Cap to avoid
@@ -1459,6 +1443,7 @@ class ContinualHarness(Agent):
         batch_rejected: list[dict[str, Any]] | None = None,
         skill_id: str | None = None,
     ) -> FrameData | None:
+        pre_frame_index = len(self.frames) - 1
         pre = self.frames[-1]
         pre_state, pre_score = pre.state.name, pre.levels_completed
         pre_grid = pre.frame[-1] if pre.frame else None
@@ -1466,6 +1451,7 @@ class ContinualHarness(Agent):
         frame = self.take_action(action)        # base class: arc_env.step + validate
         if frame is not None:
             self.append_frame(frame)            # base class: also calls recorder.record
+        post_frame_index = len(self.frames) - 1
         self.action_counter += 1                # mirror base Agent.main() semantics
 
         post = frame if frame is not None else pre
@@ -1494,6 +1480,20 @@ class ContinualHarness(Agent):
                 skill_id=skill_id,
                 tool_calls=[],
                 grid_delta=grid_delta,
+            )
+        )
+        self._pending_observations.append(
+            PendingActionObservation(
+                action_counter=self.action_counter - 1,
+                action_name=action.name,
+                action_data=_action_data_dict(action),
+                source=source,
+                batch_id=batch_id,
+                batch_position=batch_position,
+                batch_total=batch_total,
+                pre_frame_index=pre_frame_index,
+                post_frame_index=post_frame_index,
+                valid_frame=frame is not None,
             )
         )
 
@@ -1572,17 +1572,27 @@ class ContinualHarness(Agent):
     # Working-prompt assembly.
     # ------------------------------------------------------------------
 
-    def _build_working_prompt(self, latest_frame: FrameData) -> str:
+    def _build_working_prompt(
+        self, latest_frame: FrameData
+    ) -> tuple[str, list[RenderedGrid]]:
         history_block = format_compact_history(
             self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT),
             frames=self.frames,
             max_chars=self.HISTORY_MAX_CHARS,
             max_batches=self.HISTORY_BATCH_WINDOW,
         )
+        observation_block, observation_grids = build_observation_section(
+            self._pending_observations,
+            self.frames,
+        )
         memory_overview = format_memory_overview(self.memory.all_entries())
         skill_overview = format_skill_overview(self.skills.all_entries())
         subagent_overview = format_subagent_overview(self.subagents.all_entries())
-        return build_working_prompt(
+        current_grid = current_state_rendered_grid(latest_frame)
+        rendered_grids = list(observation_grids)
+        if current_grid is not None:
+            rendered_grids.append(current_grid)
+        prompt = build_working_prompt(
             latest_frame,
             action_counter=self.action_counter,
             recent_tool_results=self._recent_tool_results,
@@ -1590,8 +1600,10 @@ class ContinualHarness(Agent):
             memory_overview=memory_overview,
             skill_overview=skill_overview,
             subagent_overview=subagent_overview,
+            observation_block=observation_block,
             base_prompt=self._current_base_prompt,
         )
+        return prompt, rendered_grids
 
     # ------------------------------------------------------------------
     # Tool list, prompt-evolution gate, batch IDs, trace writer.
@@ -1639,6 +1651,7 @@ class ContinualHarness(Agent):
         tools: list[dict[str, Any]],
         tool_calls: list[ToolCallRecord],
         actions_executed: int,
+        rendered_grids: list[RenderedGrid],
         error: str | None = None,
     ) -> None:
         self.trace.write(
@@ -1655,20 +1668,18 @@ class ContinualHarness(Agent):
                     "base_prompt": self._current_base_prompt,
                     "user_prompt": prompt,
                     "tools": tools,
-                    # `images` reflects every grid rendered for the frame
-                    # (post-skill-cap), so traces show the full set the
-                    # orchestrator had access to. `images_attached_count` is
-                    # how many were actually sent in this VLM call after
-                    # keyframe-sampling at MAX_VLM_PAYLOAD_IMAGES.
+                    # `images` mirrors the grids rendered in this prompt, in
+                    # prompt order. The PNG payload is built from the same
+                    # RenderedGrid list.
                     "images": [
-                        {"width": img.width, "height": img.height, "mode": img.mode}
-                        for img in self._current_images
+                        {
+                            "label": item.label,
+                            "width": len(item.grid[0]) if item.grid else 0,
+                            "height": len(item.grid),
+                        }
+                        for item in rendered_grids
                     ],
-                    "images_attached_count": len(
-                        _sample_keyframes(
-                            self._current_images, self.MAX_VLM_PAYLOAD_IMAGES
-                        )
-                    ),
+                    "images_attached_count": len(rendered_grids),
                 },
                 "output": output,
                 "usage": usage,

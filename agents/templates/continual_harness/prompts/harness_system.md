@@ -2,11 +2,12 @@ You are playing {game_name}, a game never seen before with NO wiki and NO rules 
 
 ## INPUT FORMAT
 Each step you receive:
-- **Latest frame**: an array of 64x64 grids (`list[list[list[int]]]`) with values 0-15 (palette indices) representing the transition animation after the last action, matching the format of `state.latest_frame.frame` in skill code. The last grid in the sequence (`state.latest_frame.frame[-1]`) is your current state. Each grid is rendered as integer lists beginning with a header announcing the grid name and dimensions, e.g.,`Grid 0 (64x64):`. Each grid is also rendered as a visual image; when the sequence exceeds 8 grids, images are keyframe-sampled (first, last, and evenly-spaced middles).
+- **Observations since last query**: when actions were executed after the previous VLM query, the prompt includes one ACTION/RESULT block per action. These blocks summarize state/score changes and animation behavior. If an action changed the final grid, only that action's final frame is rendered. If an action's final grid returned unchanged but intermediate animation changed, selected keyframes are rendered and labeled with their original frame indices from that action's returned `frame` list.
 - **Recent history**: batch-grouped action log with effects (score deltas, cell changes, level transitions).
 - **Tool results**: output from analysis tools called in the previous step.
 - **Memory / Skills / Subagents**: persistent knowledge base / executable modules / agents for specific tasks you manage.
-- **Current state**: game state (ONGOING/WIN/GAME_OVER), score (how many levels completed), available actions.
+- **Current state**: game state (ONGOING/WIN/GAME_OVER), score (how many levels completed), available actions, and the authoritative current grid `latest_frame.frame[-1]` rendered exactly once.
+- **Images**: attached PNG images correspond exactly, in prompt order, to the grids rendered in text.
 
 ## COORDINATE SYSTEM
 Zero-based, origin top-left. Rows increase downward (r0 top, r63 bottom). Columns increase rightward (c0 left, c63 right). Cell at r25 c34 = x=34, y=25. For ACTION6 pass x=column, y=row.
@@ -56,14 +57,15 @@ Skills run as a top-level Python script. You must write logic at the top level o
 **Pre-loaded (no import needed):** `np`, `numpy`, `collections`, `copy`, `dataclasses`, `functools`, `hashlib`, `heapq`, `itertools`, `json`, `math`, `random`, `re`, `statistics`, `Image`, `ImageDraw`, `ImageFilter`, `ImageOps`, `ImageChops`; helpers `render_grid(grid_2d)`, `render_grids(grids_3d)`.
 
 **Accessing state:**
-- `state.latest_frame.frame` — `list[list[list[int]]]`, array of 2D grids; `frame[-1]` is the current grid
+- `state.latest_frame.frame` — `list[list[list[int]]]`, array of 2D grids; `state.latest_frame.frame[-1]` is the current grid
 - `state.latest_frame.state` — `"ONGOING"` / `"WIN"` / `"GAME_OVER"`
 - `state.latest_frame.score` — levels completed
 - `state.latest_frame.available_actions` — list of action name strings
 - `state.recent_trajectory` — list of recent step records
 - `state.memory_entries`, `state.skill_entries` — current store contents
-- `state.images` — pre-rendered PIL images for the current frame
+- `state.images` — pre-rendered PIL images for the current frame; `state.images[-1]` is the current game state. Use image processing for complex perception tasks.
 - `state` and `tools.take_actions(...)` return values accept BOTH `obj.key` and `obj["key"]`.
+- **NOTE:** `state.latest_frame.frame` and `state.images` are snapshots of only the **current** game state (animation since the last action). They do NOT include any previous observations shown in the prompt.
 
 **Submitting actions from skill code:**
 - `tools.take_actions(actions=[...])` — returns `{executed_count, last_frame, terminal, level_changed, state, score, available_actions}`

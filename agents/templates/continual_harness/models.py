@@ -18,6 +18,30 @@ class ToolCallRecord:
 
 
 @dataclass(slots=True)
+class PendingActionObservation:
+    """One action result awaiting display in the next working prompt."""
+
+    action_counter: int
+    action_name: str
+    action_data: dict[str, Any] = field(default_factory=dict)
+    source: str = "vlm"
+    batch_id: str | None = None
+    batch_position: int | None = None
+    batch_total: int | None = None
+    pre_frame_index: int = 0
+    post_frame_index: int = 0
+    valid_frame: bool = True
+
+
+@dataclass(slots=True)
+class RenderedGrid:
+    """A grid rendered in the prompt, used to attach matching PNG images."""
+
+    label: str
+    grid: list[list[int]]
+
+
+@dataclass(slots=True)
 class StepRecord:
     """One executed game action. Append-only; one row per take_action() call."""
 

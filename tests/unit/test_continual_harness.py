@@ -8,13 +8,19 @@ from typing import Any
 import numpy as np
 import pytest
 from arcengine import ActionInput, FrameData, FrameDataRaw, GameAction, GameState
+from PIL import Image
 
 from agents.agent import Agent
+from agents.templates.continual_harness.context import (
+    build_observation_section,
+    build_working_prompt,
+)
 from agents.templates.continual_harness.helpers import (
     available_game_actions,
     build_action_tools,
     parse_action_response,
 )
+from agents.templates.continual_harness.models import PendingActionObservation
 from agents.templates.continual_harness.prompts import HARNESS_SYSTEM_INSTRUCTION
 from agents.templates.continual_harness.trace import (
     TraceWriter,
@@ -130,6 +136,116 @@ class TestContinualHarnessPrompts:
         assert "{game_name}" in HARNESS_SYSTEM_INSTRUCTION
         assert "take_actions" in HARNESS_SYSTEM_INSTRUCTION
         assert "run_skill" in HARNESS_SYSTEM_INSTRUCTION
+
+    def test_working_prompt_current_state_renders_only_final_grid(self) -> None:
+        frame = FrameData(
+            game_id="prompt-test",
+            frame=[[[7]], [[2]]],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            win_levels=1,
+            action_input=ActionInput(),
+            available_actions=[1],
+        )
+
+        prompt = build_working_prompt(
+            frame,
+            action_counter=0,
+            recent_tool_results=[],
+            history_block="No previous actions recorded.",
+            memory_overview="",
+            skill_overview="",
+            subagent_overview="",
+        )
+
+        assert "## OBSERVATIONS SINCE LAST QUERY" not in prompt
+        assert "current grid (latest_frame.frame[-1]):" in prompt
+        assert "Grid current_state_frame (1x1):\n  [2]" in prompt
+        assert "  [7]" not in prompt
+
+    def test_observation_final_change_renders_only_action_final_grid(self) -> None:
+        frames = [
+            FrameData(
+                game_id="prompt-test",
+                frame=[[[0, 0]]],
+                state=GameState.NOT_FINISHED,
+                levels_completed=0,
+                win_levels=1,
+                action_input=ActionInput(),
+                available_actions=[1],
+            ),
+            FrameData(
+                game_id="prompt-test",
+                frame=[[[1, 0]], [[2, 0]]],
+                state=GameState.NOT_FINISHED,
+                levels_completed=0,
+                win_levels=1,
+                action_input=ActionInput(),
+                available_actions=[1],
+            ),
+        ]
+        obs = PendingActionObservation(
+            action_counter=0,
+            action_name="ACTION1",
+            pre_frame_index=0,
+            post_frame_index=1,
+        )
+
+        section, grids = build_observation_section([obs], frames)
+
+        assert "final_grid_changed=yes" in section
+        assert "ANIMATION SUMMARY: frame_count=2" in section
+        assert "RENDERED GRIDS: frame indices [1]" in section
+        assert "Grid action_step_0_frame_1" in section
+        assert "Grid action_step_0_frame_0" not in section
+        assert [(g.label, g.grid) for g in grids] == [
+            ("action_step_0_frame_1", [[2, 0]])
+        ]
+
+    def test_observation_transient_animation_renders_keyframes(self) -> None:
+        frames = [
+            FrameData(
+                game_id="prompt-test",
+                frame=[[[0, 0], [0, 0]]],
+                state=GameState.NOT_FINISHED,
+                levels_completed=0,
+                win_levels=1,
+                action_input=ActionInput(),
+                available_actions=[5],
+            ),
+            FrameData(
+                game_id="prompt-test",
+                frame=[
+                    [[0, 0], [0, 0]],
+                    [[9, 0], [0, 0]],
+                    [[9, 9], [0, 0]],
+                    [[0, 0], [0, 0]],
+                ],
+                state=GameState.NOT_FINISHED,
+                levels_completed=0,
+                win_levels=1,
+                action_input=ActionInput(),
+                available_actions=[5],
+            ),
+        ]
+        obs = PendingActionObservation(
+            action_counter=3,
+            action_name="ACTION5",
+            pre_frame_index=0,
+            post_frame_index=1,
+        )
+
+        section, grids = build_observation_section([obs], frames)
+
+        assert "final_grid_changed=no" in section
+        assert "transient_animation=yes" in section
+        assert "changed_frames=1-2 (2/4)" in section
+        assert "RENDERED GRIDS: frame indices [1, 2]" in section
+        assert [g.label for g in grids] == [
+            "action_step_3_frame_1",
+            "action_step_3_frame_2",
+        ]
+        assert "Grid action_step_3_frame_3" not in section
 
 
 
@@ -257,6 +373,18 @@ class TestVLMBackendRouting:
 
         with pytest.raises(ValueError, match="Gemini API key is missing"):
             GeminiBackend("gemini-2.5-pro")
+
+    def test_gemini_prepare_image_does_not_upscale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_fake_gemini(monkeypatch)
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        backend = GeminiBackend("gemini-2.5-pro")
+        image = Image.new("RGBA", (64, 64))
+
+        prepared = backend._prepare_image(image)
+
+        assert prepared.size == (64, 64)
 
 
 @pytest.mark.unit
