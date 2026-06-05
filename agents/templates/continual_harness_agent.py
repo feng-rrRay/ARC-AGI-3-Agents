@@ -15,6 +15,7 @@ from ..run_artifacts import RUN_DIR_ENV, RUN_RECORDINGS_DIR_ENV, game_artifacts
 from ..tracing import trace_agent_session
 from .continual_harness.context import (
     build_observation_section,
+    build_plan_objectives_prompt,
     build_subagent_prompt,
     build_working_prompt,
     current_state_rendered_grid,
@@ -47,10 +48,17 @@ from .continual_harness.prompt_evolution import (
     now_iso,
     validate_evolved_prompt,
 )
+from .continual_harness.objectives import (
+    DirectObjectiveManager,
+    active_objectives_path,
+    coerce_objective_specs,
+    format_objectives_section,
+)
 from .continual_harness.prompts import (
     BASE_ORCHESTRATOR_POLICY,
     EVOLUTION_SYSTEM_INSTRUCTION,
     HARNESS_SYSTEM_INSTRUCTION,
+    PLAN_OBJECTIVES_SYSTEM_INSTRUCTION,
 )
 from .continual_harness.sandbox import SandboxState, run_python_snippet
 from .continual_harness.skills import (
@@ -64,11 +72,15 @@ from .continual_harness.subagents import (
     format_subagent_overview,
 )
 from .continual_harness.tools import (
+    COMPLETE_DIRECT_OBJECTIVE_TOOL,
+    GET_RECENT_TRAJECTORY_TOOL,
     PROCESS_MEMORY_TOOL,
     PROCESS_SKILL_TOOL,
     PROCESS_SUBAGENT_TOOL,
+    REPLAN_OBJECTIVES_TOOL,
     RUN_SKILL_TOOL,
     RUN_SUBAGENT_TOOL,
+    SUBMIT_OBJECTIVES_TOOL,
     TAKE_ACTIONS,
     TAKE_ACTIONS_TOOL,
     ContinualToolRouter,
@@ -76,6 +88,7 @@ from .continual_harness.tools import (
     build_subagent_tools,
     extract_function_calls,
     is_action_tool,
+    is_submit_objectives_call,
     is_subagent_return_call,
     is_take_actions_call,
     render_tool_results,
@@ -217,6 +230,17 @@ class ContinualHarness(Agent):
     # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
     DEFAULT_PROMPT_EVOLVE_FREQUENCY = 75
     PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
+    # Objective system. The built-in planner refills the queue with
+    # OBJECTIVES_PER_REPLAN fresh goals (replacing any stale active ones)
+    # whenever the active count drops to OBJECTIVES_LOW_WATERMARK or below;
+    # OBJECTIVES_REPLAN_MIN_GAP bounds auto-replans so a failing planner can't
+    # thrash. Disable the whole system with OBJECTIVES_ENABLED=0.
+    OBJECTIVES_PER_REPLAN = 3
+    OBJECTIVES_LOW_WATERMARK = 1
+    OBJECTIVES_REPLAN_MIN_GAP = 3
+    OBJECTIVES_COMPLETED_SHOWN = 5
+    MAX_PLANNER_ROUNDS = 3
+    OBJECTIVES_ENABLED_ENV = "OBJECTIVES_ENABLED"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Must resolve model_name BEFORE super().__init__(): Agent.__init__
@@ -236,6 +260,11 @@ class ContinualHarness(Agent):
             self._prompt_evolve_frequency = max(0, int(freq_raw))
         except ValueError:
             self._prompt_evolve_frequency = self.DEFAULT_PROMPT_EVOLVE_FREQUENCY
+
+        # Objective-system toggle. Resolved here (before _full_tool_list runs in
+        # the VLM setup below) so the two objective tools are gated correctly;
+        # the queue manager itself is created further down.
+        self._objectives_enabled = os.getenv(self.OBJECTIVES_ENABLED_ENV, "1") != "0"
 
         # Fixed system instruction — NEVER evolved. {game_name} substituted here.
         self._system_instruction: str = HARNESS_SYSTEM_INSTRUCTION.replace(
@@ -561,6 +590,16 @@ class ContinualHarness(Agent):
         self._sandbox_skill_id: str | None = None
         self._batch_counter: int = 0
         self._vlm_call_count: int = 0
+
+        # Objective system — a maintained queue of near-term goals, auto-refilled
+        # by a built-in planner (see _run_plan_objectives). Backed per-game at
+        # logs/<run_id>/<game_id>/objectives.json. (_objectives_enabled is set
+        # earlier in __init__ so _full_tool_list can gate the objective tools.)
+        self.objectives = DirectObjectiveManager(
+            active_objectives_path(self.game_id), game_id=self.game_id
+        )
+        # action_counter of the last auto/manual replan, for the anti-thrash gap.
+        self._last_objective_replan_step: int = -(10**9)
 
         def _handle_process_subagent(args: dict[str, Any]) -> dict[str, Any]:
             op = (args.get("operation") or "").strip().lower()
@@ -936,6 +975,47 @@ class ContinualHarness(Agent):
                 "actions_taken_inline": total_subagent_actions,
             }
 
+        def _handle_replan_objectives(args: dict[str, Any]) -> dict[str, Any]:
+            if not self._objectives_enabled:
+                return {"success": False, "error": "objective system disabled"}
+            if self._current_latest_frame is None:
+                return {
+                    "success": False,
+                    "error": "replan_objectives invoked before frame stash; refusing",
+                }
+            guidance = str(args.get("guidance") or "")
+            # Record the attempt so the auto-trigger doesn't immediately re-fire.
+            self._last_objective_replan_step = self.action_counter
+            return self._run_plan_objectives(
+                self._current_latest_frame, guidance=guidance
+            )
+
+        def _handle_complete_direct_objective(args: dict[str, Any]) -> dict[str, Any]:
+            if not self._objectives_enabled:
+                return {"success": False, "error": "objective system disabled"}
+            done = self.objectives.complete_current()
+            if done is None:
+                return {"success": False, "error": "no active objective to complete"}
+            nxt = self.objectives.current()
+            all_objs = self.objectives.all_objectives()
+            logger.info(
+                "[%s] ✅ completed objective %s; %d active remain",
+                self.game_id,
+                done.id,
+                self.objectives.active_count(),
+            )
+            return {
+                "success": True,
+                "completed": {"id": done.id, "description": done.description},
+                "next_objective": (
+                    {"id": nxt.id, "description": nxt.description, "hint": nxt.hint}
+                    if nxt is not None
+                    else None
+                ),
+                "active_count": self.objectives.active_count(),
+                "completed_count": sum(1 for o in all_objs if o.completed),
+            }
+
         handlers: dict[str, Any] = {
             "get_recent_trajectory": _handle_get_recent_trajectory,
             "process_memory": _handle_process_memory,
@@ -943,6 +1023,8 @@ class ContinualHarness(Agent):
             "run_skill": _handle_run_skill,
             "process_subagent": _handle_process_subagent,
             "run_subagent": _handle_run_subagent,
+            "replan_objectives": _handle_replan_objectives,
+            "complete_direct_objective": _handle_complete_direct_objective,
         }
         self.tool_router = ContinualToolRouter(handlers)
 
@@ -963,6 +1045,13 @@ class ContinualHarness(Agent):
             self.name,
             self.subagents.path,
             len(self.subagents.all_entries()),
+        )
+        logger.info(
+            "[%s] Objectives enabled: %s (%s, %d existing)",
+            self.name,
+            self._objectives_enabled,
+            self.objectives.path,
+            len(self.objectives.all_objectives()),
         )
         logger.info(
             "[%s] Prompt evolution: frequency=%d, baseline at %s, log at %s",
@@ -1195,6 +1284,11 @@ class ContinualHarness(Agent):
             # than modulo so multi-action batches that straddle a boundary
             # still fire exactly once.
             self._maybe_evolve_prompt(latest_frame)
+
+            # Objective hook — refill the queue before building the prompt so the
+            # CURRENT OBJECTIVE section is never empty (also bootstraps the first
+            # 3 objectives on the opening step).
+            self._maybe_replan_objectives(latest_frame)
 
             actions_executed = self._vlm_loop_inner(latest_frame)
 
@@ -1598,6 +1692,13 @@ class ContinualHarness(Agent):
         memory_overview = format_memory_overview(self.memory.all_entries())
         skill_overview = format_skill_overview(self.skills.all_entries())
         subagent_overview = format_subagent_overview(self.subagents.all_entries())
+        objectives_block = (
+            format_objectives_section(
+                self.objectives, self.OBJECTIVES_COMPLETED_SHOWN
+            )
+            if self._objectives_enabled
+            else ""
+        )
         current_grid = current_state_rendered_grid(latest_frame)
         rendered_grids = list(observation_grids)
         if current_grid is not None:
@@ -1611,6 +1712,7 @@ class ContinualHarness(Agent):
             skill_overview=skill_overview,
             subagent_overview=subagent_overview,
             observation_block=observation_block,
+            objectives_block=objectives_block,
             base_prompt=self._current_base_prompt,
         )
         return prompt, rendered_grids
@@ -1626,6 +1728,10 @@ class ContinualHarness(Agent):
         tools.append(PROCESS_MEMORY_TOOL)
         tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL])
         tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])
+        if self._objectives_enabled:
+            tools.extend(
+                [REPLAN_OBJECTIVES_TOOL, COMPLETE_DIRECT_OBJECTIVE_TOOL]
+            )
         return tools
 
     def _maybe_evolve_prompt(self, latest_frame: FrameData) -> None:
@@ -1655,6 +1761,188 @@ class ContinualHarness(Agent):
         self._last_game_over_evolution_step = self.action_counter
         self._last_evolution_step = self.action_counter
         self._evolve_system_prompt(latest_frame)
+
+    # ------------------------------------------------------------------
+    # Objective system — auto-trigger gate + built-in planner subagent.
+    # ------------------------------------------------------------------
+
+    def _maybe_replan_objectives(self, latest_frame: FrameData) -> None:
+        """Auto-refill the objective queue when it runs low (boundary-gated).
+
+        Fires at game start (active_count == 0) and whenever the active queue
+        drops to OBJECTIVES_LOW_WATERMARK or below. Always-replace: the planner
+        discards any stale active objectives and proposes 3 fresh ones. The
+        MIN_GAP guard prevents thrash if the planner repeatedly fails to submit.
+        """
+        if not self._objectives_enabled:
+            return
+        if self.objectives.active_count() > self.OBJECTIVES_LOW_WATERMARK:
+            return
+        gap = self.action_counter - self._last_objective_replan_step
+        if gap < self.OBJECTIVES_REPLAN_MIN_GAP:
+            return
+        self._last_objective_replan_step = self.action_counter
+        self._run_plan_objectives(latest_frame)
+
+    def _run_plan_objectives(
+        self, latest_frame: FrameData, *, guidance: str = ""
+    ) -> dict[str, Any]:
+        """Built-in objective planner: one bounded sub-VLM loop that proposes 3 goals.
+
+        Spawns a fresh VLM with PLAN_OBJECTIVES_SYSTEM_INSTRUCTION + a
+        submit_objectives return tool (plus read-only get_recent_trajectory). On
+        submit_objectives the active queue is replaced with the proposed goals.
+        Mirrors the trace/token plumbing of _evolve_system_prompt and the
+        return-tool watch of _handle_run_subagent.
+        """
+        system = PLAN_OBJECTIVES_SYSTEM_INSTRUCTION.replace("{game_name}", self.game_id)
+        planner_vlm = VLM(self.model_name, backend="gemini", system_instruction=system)
+        planner_vlm.set_tools([GET_RECENT_TRAJECTORY_TOOL, SUBMIT_OBJECTIVES_TOOL])
+
+        compact_history = format_compact_history(
+            self.trajectory.tail(self.SUBAGENT_HISTORY_WINDOW),
+            max_chars=self.HISTORY_MAX_CHARS,
+        )
+        user_prompt = build_plan_objectives_prompt(
+            latest_frame=latest_frame,
+            active_descriptions=[o.description for o in self.objectives.active()],
+            completed_descriptions=[
+                o.description
+                for o in self.objectives.recent_completed(
+                    self.OBJECTIVES_COMPLETED_SHOWN
+                )
+            ],
+            memory_overview=format_memory_overview(self.memory.all_entries()),
+            compact_history=compact_history,
+            guidance=guidance,
+        )
+        images = list(frame_to_images(latest_frame))
+        payload: Any = images if len(images) > 1 else (images[0] if images else None)
+
+        created: list[Any] = []
+        submitted = False
+        last_error: str | None = None
+        rounds_used = 0
+        working_prompt = user_prompt
+
+        for rnd in range(1, self.MAX_PLANNER_ROUNDS + 1):
+            rounds_used = rnd
+            round_records: list[ToolCallRecord] = []
+            output: dict[str, Any] = {}
+            usage: dict[str, int | None] | None = None
+            round_error: str | None = None
+            submit_args: dict[str, Any] | None = None
+            try:
+                response = planner_vlm.get_query(
+                    payload,
+                    working_prompt,
+                    module_name=f"{self.name}.plan_objectives",
+                )
+                output = serialize_response(response)
+                usage = planner_vlm.extract_usage(response)
+                for fc in extract_function_calls(response):
+                    if is_submit_objectives_call(fc.name):
+                        submit_args = fc.args
+                        specs = coerce_objective_specs(
+                            fc.args.get("objectives")
+                            if isinstance(fc.args, dict)
+                            else None
+                        )
+                        if specs:
+                            created = self.objectives.replace_active(
+                                specs[: self.OBJECTIVES_PER_REPLAN]
+                            )
+                            submitted = True
+                        else:
+                            round_error = (
+                                "submit_objectives called with no valid objectives"
+                            )
+                        break
+                    if fc.name == "get_recent_trajectory":
+                        round_records.append(self.tool_router.execute(fc))
+                    else:
+                        round_records.append(
+                            ToolCallRecord(
+                                name=fc.name,
+                                args=fc.args,
+                                error=f"tool {fc.name!r} not available to the planner",
+                            )
+                        )
+            except Exception as exc:
+                round_error = repr(exc)
+                last_error = round_error
+                logger.warning(
+                    "[%s] objective planner round %d/%d failed: %s",
+                    self.game_id,
+                    rnd,
+                    self.MAX_PLANNER_ROUNDS,
+                    exc,
+                )
+            finally:
+                self.trace.write(
+                    {
+                        "agent": self.name,
+                        "model": self.model_name,
+                        "game_id": self.game_id,
+                        "action_counter": self.action_counter,
+                        "round": self._current_outer_round,
+                        "tools_exposed": "plan_objectives",
+                        "plan_objectives": {
+                            "round": rnd,
+                            "max_rounds": self.MAX_PLANNER_ROUNDS,
+                            "submitted": submitted,
+                            "guidance": guidance,
+                        },
+                        "input": {
+                            "system_instruction": system,
+                            "user_prompt": working_prompt,
+                            "images": [
+                                {
+                                    "width": img.width,
+                                    "height": img.height,
+                                    "mode": img.mode,
+                                }
+                                for img in images
+                            ],
+                        },
+                        "output": output,
+                        "usage": usage,
+                        "submit_objectives": submit_args,
+                        "tool_calls": [asdict(r) for r in round_records],
+                        "error": round_error,
+                    }
+                )
+                if usage is not None:
+                    self.total_calls += 1
+                    self.total_prompt_tokens += int(usage.get("prompt") or 0)
+                    self.total_output_tokens += int(usage.get("output") or 0)
+                    self.total_tokens += int(usage.get("total") or 0)
+
+            if submitted or round_error is not None:
+                break
+            if not round_records:
+                last_error = "planner produced no tool calls and did not submit"
+                break
+            working_prompt = user_prompt + "\n\n" + render_tool_results(round_records)
+
+        logger.info(
+            "[%s] objective replan: submitted=%s created=%d rounds=%d",
+            self.game_id,
+            submitted,
+            len(created),
+            rounds_used,
+        )
+        return {
+            "success": submitted,
+            "objectives": [
+                {"id": o.id, "description": o.description, "hint": o.hint}
+                for o in created
+            ],
+            "rounds_used": rounds_used,
+            "error": (
+                None if submitted else (last_error or "planner did not submit objectives")
+            ),
+        }
 
     def _mint_batch_id(self) -> str:
         self._batch_counter += 1

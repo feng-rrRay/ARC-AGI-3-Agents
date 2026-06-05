@@ -26,6 +26,7 @@ from agents.run_artifacts import (
     game_artifacts,
     seed_game_from_bootstrap,
     snapshot_memory,
+    snapshot_objectives,
     snapshot_prompt,
     snapshot_skills,
     snapshot_subagents,
@@ -101,6 +102,7 @@ def finalize_run_artifacts(
         snapshot_memory(ga.memory_path, ga.memory_final_path)
         snapshot_skills(ga.skills_path, ga.skills_final_path)
         snapshot_subagents(ga.subagents_path, ga.subagents_final_path)
+        snapshot_objectives(ga.objectives_path, ga.objectives_final_path)
         snapshot_prompt(
             ga.prompt_path, ga.prompt_final_path, baseline=BASE_ORCHESTRATOR_POLICY
         )

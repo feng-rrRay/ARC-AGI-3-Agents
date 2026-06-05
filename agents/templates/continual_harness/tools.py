@@ -337,6 +337,104 @@ def is_subagent_return_call(name: str) -> bool:
     return name == SUBAGENT_RETURN_NAME
 
 
+# --- Objective system --------------------------------------------------------
+# Two orchestrator tools (replan_objectives, complete_direct_objective) plus the
+# planner's return tool (submit_objectives). The objective queue is auto-refilled
+# by a built-in planner when it runs low; these tools let the orchestrator drive
+# completion and force a fresh replan. See continual_harness/objectives.py.
+
+REPLAN_OBJECTIVES_TOOL: dict[str, Any] = {
+    "name": "replan_objectives",
+    "description": (
+        "Discard the remaining active objectives and plan 3 fresh ones based on "
+        "the current game state. Use when the current objectives are stale, "
+        "unachievable, or invalidated by something you just learned. The system "
+        "ALSO auto-plans objectives at game start and whenever the queue runs "
+        "low, so use this only to deliberately revise the plan."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "Why the current objectives should be replaced now. Required.",
+            },
+            "guidance": {
+                "type": "string",
+                "description": "Optional focus for the new plan (e.g. 'prioritise reaching the exit', 'we proved ACTION6 toggles doors').",
+            },
+        },
+        "required": ["reasoning"],
+    },
+}
+
+
+COMPLETE_DIRECT_OBJECTIVE_TOOL: dict[str, Any] = {
+    "name": "complete_direct_objective",
+    "description": (
+        "Mark the current objective (top of the queue) as complete and advance "
+        "to the next one. Call this the moment the current objective's described "
+        "outcome is verifiably true in the grid or score."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "How you verified the current objective is done. Required.",
+            },
+        },
+        "required": ["reasoning"],
+    },
+}
+
+
+# submit_objectives is the terminator the objective planner watches for. Exposed
+# ONLY to the built-in planner subagent (never to the orchestrator).
+SUBMIT_OBJECTIVES_NAME = "submit_objectives"
+SUBMIT_OBJECTIVES_TOOL: dict[str, Any] = {
+    "name": SUBMIT_OBJECTIVES_NAME,
+    "description": (
+        "Return exactly 3 concrete next objectives for the agent and terminate "
+        "planning. Each objective is what to accomplish next, ordered most "
+        "immediate first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "Short justification for this set of objectives. Required.",
+            },
+            "objectives": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "What to accomplish (one sentence). Required.",
+                        },
+                        "hint": {
+                            "type": "string",
+                            "description": "How to approach it and how completion is verified.",
+                        },
+                    },
+                    "required": ["description"],
+                },
+                "description": "Ordered list of objectives (3 expected; extras beyond 3 are ignored).",
+            },
+        },
+        "required": ["reasoning", "objectives"],
+    },
+}
+
+
+def is_submit_objectives_call(name: str) -> bool:
+    """True iff `name` is the objective planner's terminator tool."""
+    return name == SUBMIT_OBJECTIVES_NAME
+
 
 def build_analysis_tools() -> list[dict[str, Any]]:
     """Always-on read-only analysis tool. process_memory + skill tools are appended by the agent."""

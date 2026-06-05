@@ -521,6 +521,7 @@ def build_working_prompt(
     skill_overview: str,
     subagent_overview: str,
     observation_block: str = "",
+    objectives_block: str = "",
     base_prompt: str = "",
 ) -> str:
     """Assemble the per-VLM-call working prompt."""
@@ -554,6 +555,10 @@ def build_working_prompt(
         sections.append(
             "## OBSERVATIONS SINCE LAST QUERY\n" + observation_block.rstrip()
         )
+    # Objective section sits adjacent to CURRENT STATE + TURN (highest-attention
+    # region) so the active goal frames the next decision.
+    if objectives_block.strip():
+        sections.append(objectives_block.rstrip())
 
     state_block = (
         "## CURRENT STATE\n"
@@ -619,5 +624,69 @@ def build_subagent_prompt(
     parts.append(
         "When you have completed your task, call "
         "subagent_return(reasoning=..., answer=..., status=...)."
+    )
+    return "\n".join(parts)
+
+
+def build_plan_objectives_prompt(
+    *,
+    latest_frame: FrameData,
+    active_descriptions: Sequence[str],
+    completed_descriptions: Sequence[str],
+    memory_overview: str,
+    compact_history: str,
+    guidance: str = "",
+) -> str:
+    """Assemble the user prompt for the built-in objective planner subagent.
+
+    Mirrors `build_subagent_prompt`: the planner's `instructions` are passed as
+    system_instruction; this builds the per-call user prompt, ending with the
+    submit_objectives cue.
+    """
+    available = available_game_actions(latest_frame.available_actions)
+    parts: list[str] = []
+    parts.append("## TASK")
+    parts.append(
+        "Propose the agent's next 3 objectives for this game, given the state below."
+    )
+    parts.append("")
+
+    if guidance.strip():
+        parts.append("## FOCUS")
+        parts.append(guidance.strip())
+        parts.append("")
+
+    parts.append(memory_overview)
+    parts.append("")
+
+    parts.append("## RECENT STEPS")
+    parts.append(compact_history or "(no actions yet)")
+    parts.append("")
+
+    parts.append("## ALREADY COMPLETED OBJECTIVES")
+    if completed_descriptions:
+        parts.extend(f"- {d}" for d in completed_descriptions)
+    else:
+        parts.append("(none yet)")
+    parts.append("")
+
+    parts.append("## OBJECTIVES BEING REPLACED (will be discarded)")
+    if active_descriptions:
+        parts.extend(f"- {d}" for d in active_descriptions)
+    else:
+        parts.append("(none — this is the initial plan)")
+    parts.append("")
+
+    parts.append("## CURRENT FRAME")
+    parts.append(
+        f"state={latest_frame.state.name} score={latest_frame.levels_completed}"
+    )
+    parts.append(f"available actions: {_format_available_actions(available)}")
+    parts.append(pretty_print_3d(latest_frame.frame))
+    parts.append("")
+
+    parts.append(
+        "Call submit_objectives(reasoning=..., objectives=[{description, hint} x3]) "
+        "with exactly 3 objectives, most immediate first."
     )
     return "\n".join(parts)

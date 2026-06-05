@@ -41,6 +41,11 @@ BASE_ORCHESTRATOR_POLICY: str = _read("base_orchestrator_policy.md")
 EVOLUTION_SYSTEM_INSTRUCTION: str = _read("evolution_system.md")
 EVOLUTION_USER_PROMPT: str = _read("evolution_user.md")
 
+# Objective-planner prompt — system instruction for the built-in planner
+# subagent that proposes 3 fresh objectives when the queue runs low (consumed
+# by ContinualHarness._run_plan_objectives).
+PLAN_OBJECTIVES_SYSTEM_INSTRUCTION: str = _read("plan_objectives_system.md")
+
 
 __all__ = [
     "NAIVE_SYSTEM_INSTRUCTION",
@@ -49,5 +54,6 @@ __all__ = [
     "BASE_ORCHESTRATOR_POLICY",
     "EVOLUTION_SYSTEM_INSTRUCTION",
     "EVOLUTION_USER_PROMPT",
+    "PLAN_OBJECTIVES_SYSTEM_INSTRUCTION",
     "load_prompt",
 ]

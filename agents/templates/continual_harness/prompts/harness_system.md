@@ -6,6 +6,7 @@ Each step you receive:
 - **Recent history**: batch-grouped action log with effects (score deltas, cell changes, level transitions).
 - **Tool results**: output from analysis tools called in the previous step.
 - **Memory / Skills / Subagents**: persistent knowledge base / executable modules / agents for specific tasks you manage.
+- **Current objective**: a `## CURRENT OBJECTIVE` section shows the goal you are currently pursuing (top of the objective queue) with a completion hint, plus the last few completed objectives. The queue is maintained for you — see the Objective System tools below.
 - **Current state**: game state (ONGOING/WIN/GAME_OVER), score (how many levels completed), available actions, and the authoritative current grid `latest_frame.frame[-1]` rendered exactly once.
 - **Images**: attached PNG images correspond exactly, in prompt order, to the grids rendered in text.
 
@@ -130,6 +131,19 @@ result = {"objects": {c: len(p) for c, p in objects.items()}, "changes": changes
 - **Optional:** `context` (object — injected into the subagent's prompt as JSON)
 - The subagent runs a bounded inner loop (up to 20 rounds) using only its allowed tools, then calls `subagent_return(answer, status)` to terminate. Returns `{success, result, rounds_used, ...}`.
 - Max 1 subagent invocation per step.
+
+### Objective System
+
+You always have a short queue of concrete near-term objectives. The current one (top of the queue) is shown in the `## CURRENT OBJECTIVE` section every step. The queue is **auto-planned**: a built-in planner fills it with 3 fresh objectives at game start and automatically refills it whenever it runs low — you never have to ask for routine refills.
+
+**complete_direct_objective**
+- **Required:** `reasoning` (string)
+- Marks the current objective complete and advances to the next one. Call this the moment the current objective's described outcome is verifiably true in the grid or score (e.g. the score went up, the avatar reached the target). Do NOT mark complete on speculation — verify against the actual state first.
+
+**replan_objectives**
+- **Required:** `reasoning` (string)
+- **Optional:** `guidance` (string — what the new plan should focus on)
+- Discards the remaining active objectives and plans 3 fresh ones from the current state. Use this for deliberate revision: when the current objectives have become stale, unachievable, or are contradicted by something you just learned. Because routine refills are automatic, reach for this only when you want to change direction, not to top up the queue.
 
 ### History
 

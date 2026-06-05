@@ -25,6 +25,7 @@ RUN_PROMPT_EVOLUTION_PATH_ENV = "RUN_PROMPT_EVOLUTION_PATH"
 EMPTY_MEMORY_STATE: dict[str, Any] = {"next_id": 1, "entries": []}
 EMPTY_SKILLS_STATE: dict[str, Any] = {"next_id": 1, "entries": []}
 EMPTY_SUBAGENTS_STATE: dict[str, Any] = {"next_id": 1, "entries": []}
+EMPTY_OBJECTIVES_STATE: dict[str, Any] = {"next_id": 1, "objectives": []}
 _SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -141,6 +142,14 @@ class GameArtifacts:
     @property
     def subagents_final_path(self) -> Path:
         return self.game_dir / "subagents.final.json"
+
+    @property
+    def objectives_path(self) -> Path:
+        return self.game_dir / "objectives.json"
+
+    @property
+    def objectives_final_path(self) -> Path:
+        return self.game_dir / "objectives.final.json"
 
     @property
     def prompt_path(self) -> Path:
@@ -358,6 +367,11 @@ def snapshot_skills(source: str | Path, destination: Path) -> Path:
 def snapshot_subagents(source: str | Path, destination: Path) -> Path:
     """Thin wrapper around snapshot_json_file with the subagents empty state."""
     return snapshot_json_file(source, destination, empty_state=EMPTY_SUBAGENTS_STATE)
+
+
+def snapshot_objectives(source: str | Path, destination: Path) -> Path:
+    """Thin wrapper around snapshot_json_file with the objectives empty state."""
+    return snapshot_json_file(source, destination, empty_state=EMPTY_OBJECTIVES_STATE)
 
 
 def snapshot_prompt(source: str | Path, destination: Path, *, baseline: str) -> Path:
