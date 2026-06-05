@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ...run_artifacts import game_artifacts
 from ._locks import lock_for_path
 from .prompts import EVOLUTION_USER_PROMPT
 from .trajectory import format_full_history
@@ -36,33 +37,21 @@ logger = logging.getLogger(__name__)
 PROMPT_MIN_CHARS = 200
 PROMPT_MAX_CHARS = 12000
 
-BOOTSTRAP_PROMPT_ENV = "CONTINUAL_HARNESS_BOOTSTRAP_PROMPT"
-RUN_PROMPT_PATH_ENV = "RUN_PROMPT_PATH"
-RUN_PROMPT_EVOLUTION_PATH_ENV = "RUN_PROMPT_EVOLUTION_PATH"
 RUN_DIR_ENV = "RUN_DIR"
 RUN_LOG_PATH_ENV = "RUN_LOG_PATH"
 
 
-def bootstrap_prompt_path() -> Path | None:
-    raw = os.getenv(BOOTSTRAP_PROMPT_ENV)
-    return Path(raw) if raw else None
+def active_prompt_path(game_id: str | None = None) -> Path:
+    """Resolve the backing prompt file (the evolvable base prompt).
 
-
-def active_prompt_path() -> Path:
-    """Resolve the backing prompt file.
-
-    Priority: --bootstrap-prompt > RUN_PROMPT_PATH > RUN_DIR/prompt.current.md
-    > RUN_LOG_PATH sibling > logs/continual_harness.prompt.current.md.
+    Per-game when a game_id and RUN_DIR are available (the swarm default), so
+    each game evolves its own prompt. Falls back to a single run-local file
+    only when there is no game_id (tests / non-run).
     """
-    bootstrap = bootstrap_prompt_path()
-    if bootstrap is not None:
-        return bootstrap
-
-    raw = os.getenv(RUN_PROMPT_PATH_ENV)
-    if raw:
-        return Path(raw)
-
     run_dir = os.getenv(RUN_DIR_ENV)
+    if run_dir and game_id:
+        return game_artifacts(run_dir, game_id).prompt_path
+
     if run_dir:
         return Path(run_dir) / "prompt.current.md"
 
@@ -73,18 +62,12 @@ def active_prompt_path() -> Path:
     return Path("logs") / "continual_harness.prompt.current.md"
 
 
-def active_prompt_evolution_path() -> Path:
-    """Resolve the backing evolution-log file.
-
-    Always run-local — no cross-run flag; the log is an audit trail per run.
-    Priority: RUN_PROMPT_EVOLUTION_PATH > RUN_DIR/prompt_evolution.jsonl >
-    RUN_LOG_PATH sibling > logs/continual_harness.prompt_evolution.jsonl.
-    """
-    raw = os.getenv(RUN_PROMPT_EVOLUTION_PATH_ENV)
-    if raw:
-        return Path(raw)
-
+def active_prompt_evolution_path(game_id: str | None = None) -> Path:
+    """Resolve the backing evolution-log file (a per-run, per-game audit trail)."""
     run_dir = os.getenv(RUN_DIR_ENV)
+    if run_dir and game_id:
+        return game_artifacts(run_dir, game_id).prompt_evolution_path
+
     if run_dir:
         return Path(run_dir) / "prompt_evolution.jsonl"
 

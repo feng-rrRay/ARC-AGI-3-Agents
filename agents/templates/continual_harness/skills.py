@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ...run_artifacts import game_artifacts
 from ._locks import lock_for_path
 
 logger = logging.getLogger(__name__)
@@ -21,8 +22,6 @@ MAX_SKILLS = 200
 SEARCH_MAX_MATCHES = 10
 
 
-BOOTSTRAP_SKILLS_ENV = "CONTINUAL_HARNESS_BOOTSTRAP_SKILLS"
-RUN_SKILLS_PATH_ENV = "RUN_SKILLS_PATH"
 RUN_DIR_ENV = "RUN_DIR"
 RUN_LOG_PATH_ENV = "RUN_LOG_PATH"
 
@@ -42,27 +41,17 @@ class SkillEntry:
     updated_at: str = ""
 
 
-def bootstrap_skill_path() -> Path | None:
-    """Explicit cross-run skill file passed via --bootstrap-skills, if any."""
-    raw = os.getenv(BOOTSTRAP_SKILLS_ENV)
-    return Path(raw) if raw else None
-
-
-def active_skill_path() -> Path:
+def active_skill_path(game_id: str | None = None) -> Path:
     """Resolve the backing skill file.
 
-    --bootstrap-skills wins; without it, falls back to run-local storage so
-    skills are always available regardless of CLI flags.
+    Per-game when a game_id and RUN_DIR are available (the swarm default), so
+    parallel games never share a skill registry. Falls back to a single
+    run-local file only when there is no game_id (tests / non-run).
     """
-    bootstrap = bootstrap_skill_path()
-    if bootstrap is not None:
-        return bootstrap
-
-    raw = os.getenv(RUN_SKILLS_PATH_ENV)
-    if raw:
-        return Path(raw)
-
     run_dir = os.getenv(RUN_DIR_ENV)
+    if run_dir and game_id:
+        return game_artifacts(run_dir, game_id).skills_path
+
     if run_dir:
         return Path(run_dir) / "skills.json"
 

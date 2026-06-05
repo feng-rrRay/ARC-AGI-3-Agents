@@ -79,11 +79,11 @@ def test_manifest_and_scorecard_are_written(tmp_path: Path) -> None:
     write_manifest(
         artifacts,
         agent="agent",
-        games=["game-1"],
+        games=["ls20", "vc33"],
         tags=["tag"],
         status="running",
         card_id="card-1",
-        bootstrap_memory=tmp_path / "memory.json",
+        bootstrap=tmp_path / "snap.zip",
     )
     write_scorecard(artifacts, {"score": 1})
 
@@ -91,14 +91,16 @@ def test_manifest_and_scorecard_are_written(tmp_path: Path) -> None:
     scorecard = json.loads(artifacts.scorecard_path.read_text())
     assert manifest["run_id"] == artifacts.run_id
     assert manifest["status"] == "running"
-    assert manifest["paths"]["recordings"] == str(artifacts.recordings_dir)
-    assert manifest["paths"]["memory"] == str(tmp_path / "memory.json")
-    assert manifest["paths"]["memory_initial"] == str(artifacts.memory_initial_path)
-    assert manifest["paths"]["memory_final"] == str(artifacts.memory_final_path)
-    assert manifest["paths"]["prompt"] == str(artifacts.prompt_path)
-    assert manifest["paths"]["prompt_initial"] == str(artifacts.prompt_initial_path)
-    assert manifest["paths"]["prompt_final"] == str(artifacts.prompt_final_path)
-    assert manifest["paths"]["prompt_evolution"] == str(artifacts.prompt_evolution_path)
+    assert manifest["bootstrap"] == str(tmp_path / "snap.zip")
+    assert manifest["paths"]["log"] == str(artifacts.log_path)
+    assert manifest["paths"]["scorecard"] == str(artifacts.scorecard_path)
+    # Per-game isolated paths under <run_dir>/<game_id>/.
+    games = manifest["paths"]["games"]
+    assert set(games) == {"ls20", "vc33"}
+    assert games["ls20"]["memory"] == str(artifacts.run_dir / "ls20" / "memory.json")
+    assert games["vc33"]["prompt"] == str(
+        artifacts.run_dir / "vc33" / "prompt.current.md"
+    )
     assert scorecard == {"score": 1}
 
 

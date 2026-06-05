@@ -13,7 +13,6 @@ from agents.templates.continual_harness.subagents import (
     SubagentEntry,
     SubagentStore,
     active_subagent_path,
-    bootstrap_subagent_path,
     format_subagent_overview,
 )
 
@@ -43,56 +42,31 @@ def _add_basic(
 
 
 @pytest.mark.unit
-class TestBootstrapSubagentPath:
-    def test_returns_none_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS", raising=False)
-        assert bootstrap_subagent_path() is None
-
-    def test_returns_set_env(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        target = tmp_path / "subagents.json"
-        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS", str(target))
-        assert bootstrap_subagent_path() == target
-
-
-@pytest.mark.unit
 class TestActiveSubagentPath:
-    def test_prefers_bootstrap_over_run(
+    def test_per_game_under_run_dir(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        bootstrap = tmp_path / "bootstrap.json"
-        run_subagents = tmp_path / "run" / "subagents.json"
-        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS", str(bootstrap))
-        monkeypatch.setenv("RUN_SUBAGENTS_PATH", str(run_subagents))
-        assert active_subagent_path() == bootstrap
-
-    def test_falls_through_to_run_subagents_path(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS", raising=False)
-        target = tmp_path / "run" / "subagents.json"
-        monkeypatch.setenv("RUN_SUBAGENTS_PATH", str(target))
-        assert active_subagent_path() == target
-
-    def test_falls_through_to_run_dir(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS", raising=False)
-        monkeypatch.delenv("RUN_SUBAGENTS_PATH", raising=False)
         run_dir = tmp_path / "logs" / "run-id"
         monkeypatch.setenv("RUN_DIR", str(run_dir))
-        assert active_subagent_path() == run_dir / "subagents.json"
 
-    def test_falls_through_to_run_log_path(
+        assert active_subagent_path("ls20") == run_dir / "ls20" / "subagents.json"
+        assert active_subagent_path("ls20") != active_subagent_path("vc33")
+
+    def test_falls_back_to_run_dir_without_game_id(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS", raising=False)
-        monkeypatch.delenv("RUN_SUBAGENTS_PATH", raising=False)
+        run_dir = tmp_path / "logs" / "run-id"
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
+        monkeypatch.delenv("RUN_LOG_PATH", raising=False)
+        assert active_subagent_path() == run_dir / "subagents.json"
+
+    def test_falls_back_to_run_log_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         monkeypatch.delenv("RUN_DIR", raising=False)
         log_path = tmp_path / "logs" / "agent.log"
         monkeypatch.setenv("RUN_LOG_PATH", str(log_path))
-        assert active_subagent_path() == log_path.with_name("subagents.json")
+        assert active_subagent_path("ls20") == log_path.with_name("subagents.json")
 
 
 @pytest.mark.unit

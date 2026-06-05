@@ -280,21 +280,21 @@ class TestTraceWriter:
     def test_default_path_uses_run_log_path_env(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.delenv("RUN_DIR", raising=False)
         run_log = tmp_path / "logs" / "continualharness-x.log"
         monkeypatch.setenv("RUN_LOG_PATH", str(run_log))
         path = default_trace_path()
         assert path == run_log.with_suffix(".trace.jsonl")
 
-    def test_default_path_uses_run_artifacts_dir_with_stem(
+    def test_default_path_uses_run_dir_with_game_id(
         self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        artifacts_dir = tmp_path / "logs" / "run" / "artifacts"
-        monkeypatch.setenv("RUN_ARTIFACTS_DIR", str(artifacts_dir))
-        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "logs" / "run" / "run.log"))
+        run_dir = tmp_path / "logs" / "run"
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
 
-        path = default_trace_path(prefix="game.agent/model", guid="guid:1")
+        path = default_trace_path("ls20")
 
-        assert path == artifacts_dir / "game.agent-model.guid-1.trace.jsonl"
+        assert path == run_dir / "ls20" / "trace.jsonl"
 
     def test_serialize_response_extracts_function_calls_and_text(self) -> None:
         # Single-candidate response with one function_call and one text part.

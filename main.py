@@ -23,6 +23,8 @@ from agents.run_artifacts import (
     RunArtifacts,
     create_run_artifacts,
     export_run_env,
+    game_artifacts,
+    seed_game_from_bootstrap,
     snapshot_memory,
     snapshot_prompt,
     snapshot_skills,
@@ -30,7 +32,7 @@ from agents.run_artifacts import (
     write_manifest,
     write_scorecard,
 )
-from agents.templates.continual_harness.prompts import HARNESS_SYSTEM_INSTRUCTION
+from agents.templates.continual_harness.prompts import BASE_ORCHESTRATOR_POLICY
 from agents.tracing import initialize as init_agentops
 
 logger = logging.getLogger()
@@ -67,10 +69,7 @@ def _parse_prompt_evolve_frequency(value: str | int) -> int:
 def run_agent(
     swarm: Swarm,
     run_artifacts: RunArtifacts,
-    bootstrap_memory: Path | None,
-    bootstrap_skills: Path | None,
-    bootstrap_subagents: Path | None,
-    bootstrap_prompt: Path | None,
+    bootstrap: Path | None,
     prompt_evolve_frequency: int,
 ) -> None:
     scorecard = swarm.main()
@@ -78,10 +77,7 @@ def run_agent(
         run_artifacts,
         swarm=swarm,
         scorecard=scorecard,
-        bootstrap_memory=bootstrap_memory,
-        bootstrap_skills=bootstrap_skills,
-        bootstrap_subagents=bootstrap_subagents,
-        bootstrap_prompt=bootstrap_prompt,
+        bootstrap=bootstrap,
         prompt_evolve_frequency=prompt_evolve_frequency,
         status="completed",
     )
@@ -93,28 +89,21 @@ def finalize_run_artifacts(
     *,
     swarm: Swarm,
     scorecard: object | None,
-    bootstrap_memory: Path | None,
-    bootstrap_skills: Path | None,
-    bootstrap_subagents: Path | None,
-    bootstrap_prompt: Path | None,
+    bootstrap: Path | None,
     prompt_evolve_frequency: int,
     status: str,
 ) -> None:
     card_id = _scorecard_id(scorecard)
     if scorecard is not None:
         write_scorecard(run_artifacts, scorecard)
-    memory_source = bootstrap_memory or run_artifacts.memory_path
-    snapshot_memory(memory_source, run_artifacts.memory_final_path)
-    skills_source = bootstrap_skills or run_artifacts.skills_path
-    snapshot_skills(skills_source, run_artifacts.skills_final_path)
-    subagents_source = bootstrap_subagents or run_artifacts.subagents_path
-    snapshot_subagents(subagents_source, run_artifacts.subagents_final_path)
-    prompt_source = bootstrap_prompt or run_artifacts.prompt_path
-    snapshot_prompt(
-        prompt_source,
-        run_artifacts.prompt_final_path,
-        baseline=HARNESS_SYSTEM_INSTRUCTION,
-    )
+    for game_id in swarm.GAMES:
+        ga = game_artifacts(run_artifacts.run_dir, game_id)
+        snapshot_memory(ga.memory_path, ga.memory_final_path)
+        snapshot_skills(ga.skills_path, ga.skills_final_path)
+        snapshot_subagents(ga.subagents_path, ga.subagents_final_path)
+        snapshot_prompt(
+            ga.prompt_path, ga.prompt_final_path, baseline=BASE_ORCHESTRATOR_POLICY
+        )
     write_manifest(
         run_artifacts,
         agent=swarm.agent_name,
@@ -122,10 +111,7 @@ def finalize_run_artifacts(
         tags=swarm.tags,
         card_id=card_id,
         status=status,
-        bootstrap_memory=bootstrap_memory,
-        bootstrap_skills=bootstrap_skills,
-        bootstrap_subagents=bootstrap_subagents,
-        bootstrap_prompt=bootstrap_prompt,
+        bootstrap=bootstrap,
         prompt_evolve_frequency=prompt_evolve_frequency,
     )
 
@@ -146,10 +132,7 @@ def _scorecard_id(scorecard: object | None) -> str | None:
 def cleanup(
     swarm: Swarm,
     run_artifacts: RunArtifacts,
-    bootstrap_memory: Path | None,
-    bootstrap_skills: Path | None,
-    bootstrap_subagents: Path | None,
-    bootstrap_prompt: Path | None,
+    bootstrap: Path | None,
     prompt_evolve_frequency: int,
     signum: Optional[int],
     frame: Optional[FrameType],
@@ -166,10 +149,7 @@ def cleanup(
             run_artifacts,
             swarm=swarm,
             scorecard=scorecard,
-            bootstrap_memory=bootstrap_memory,
-            bootstrap_skills=bootstrap_skills,
-            bootstrap_subagents=bootstrap_subagents,
-            bootstrap_prompt=bootstrap_prompt,
+            bootstrap=bootstrap,
             prompt_evolve_frequency=prompt_evolve_frequency,
             status="interrupted",
         )
@@ -218,51 +198,15 @@ def main() -> None:
         default=None,
     )
     parser.add_argument(
-        "--bootstrap-memory",
+        "--bootstrap",
         type=str,
         default=None,
         help=(
-            "Optional JSON file backing ContinualHarness long-term memory. "
-            "When provided, the agent loads it on start and writes mutations "
-            "atomically on every change. When omitted, memory still runs with "
-            "run-local backing at logs/<run_id>/memory.json."
-        ),
-    )
-    parser.add_argument(
-        "--bootstrap-skills",
-        type=str,
-        default=None,
-        help=(
-            "Optional JSON file backing the ContinualHarness skill registry. "
-            "When provided, skills load from and write back to this file "
-            "(cross-run persistence). When omitted, skills live in "
-            "logs/<run_id>/skills.json. process_skill, run_skill, and run_code "
-            "are ALWAYS available; this flag only changes the backing file."
-        ),
-    )
-    parser.add_argument(
-        "--bootstrap-subagents",
-        type=str,
-        default=None,
-        help=(
-            "Optional JSON file backing the ContinualHarness subagent "
-            "registry. When provided, subagents load from and write back to "
-            "this file (cross-run persistence). When omitted, subagents live "
-            "in logs/<run_id>/subagents.json. process_subagent and "
-            "run_subagent are ALWAYS available; this flag only changes the "
-            "backing file."
-        ),
-    )
-    parser.add_argument(
-        "--bootstrap-prompt",
-        type=str,
-        default=None,
-        help=(
-            "Optional markdown file backing the ContinualHarness system "
-            "instruction. When provided, the agent loads it on start and "
-            "rewrites it on every successful prompt-evolution step (cross-run "
-            "persistence). When omitted, the prompt lives in "
-            "logs/<run-id>/prompt.current.md."
+            "Optional .zip archive or directory bundling one game's "
+            "memory.json, skills.json, subagents.json, and prompt.current.md. "
+            "It seeds that game's per-game folder before the run (read once; "
+            "the run never writes back to the source). Requires exactly one "
+            "game via -g; with zero or multiple games selected it errors."
         ),
     )
     parser.add_argument(
@@ -294,54 +238,8 @@ def main() -> None:
     run_artifacts = create_run_artifacts(args.agent or "no-agent", game=args.game)
     export_run_env(run_artifacts)
 
-    bootstrap_memory_raw = args.bootstrap_memory or os.getenv(
-        "CONTINUAL_HARNESS_BOOTSTRAP_MEMORY"
-    )
-    bootstrap_memory = (
-        Path(bootstrap_memory_raw).resolve() if bootstrap_memory_raw else None
-    )
-    if bootstrap_memory is not None:
-        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_MEMORY"] = str(bootstrap_memory)
-    memory_source = bootstrap_memory or run_artifacts.memory_path
-    snapshot_memory(memory_source, run_artifacts.memory_initial_path)
-
-    bootstrap_skills_raw = args.bootstrap_skills or os.getenv(
-        "CONTINUAL_HARNESS_BOOTSTRAP_SKILLS"
-    )
-    bootstrap_skills = (
-        Path(bootstrap_skills_raw).resolve() if bootstrap_skills_raw else None
-    )
-    if bootstrap_skills is not None:
-        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_SKILLS"] = str(bootstrap_skills)
-    skills_source = bootstrap_skills or run_artifacts.skills_path
-    snapshot_skills(skills_source, run_artifacts.skills_initial_path)
-
-    bootstrap_subagents_raw = args.bootstrap_subagents or os.getenv(
-        "CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS"
-    )
-    bootstrap_subagents = (
-        Path(bootstrap_subagents_raw).resolve() if bootstrap_subagents_raw else None
-    )
-    if bootstrap_subagents is not None:
-        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS"] = str(bootstrap_subagents)
-    subagents_source = bootstrap_subagents or run_artifacts.subagents_path
-    snapshot_subagents(subagents_source, run_artifacts.subagents_initial_path)
-
-    bootstrap_prompt_raw = args.bootstrap_prompt or os.getenv(
-        "CONTINUAL_HARNESS_BOOTSTRAP_PROMPT"
-    )
-    bootstrap_prompt = (
-        Path(bootstrap_prompt_raw).resolve() if bootstrap_prompt_raw else None
-    )
-    if bootstrap_prompt is not None:
-        os.environ["CONTINUAL_HARNESS_BOOTSTRAP_PROMPT"] = str(bootstrap_prompt)
+    bootstrap = Path(args.bootstrap).resolve() if args.bootstrap else None
     os.environ[PROMPT_EVOLVE_FREQUENCY_ENV] = str(prompt_evolve_frequency)
-    prompt_source = bootstrap_prompt or run_artifacts.prompt_path
-    snapshot_prompt(
-        prompt_source,
-        run_artifacts.prompt_initial_path,
-        baseline=HARNESS_SYSTEM_INSTRUCTION,
-    )
 
     file_handler = logging.FileHandler(run_artifacts.log_path, mode="w")
     file_handler.setLevel(log_level)
@@ -357,10 +255,7 @@ def main() -> None:
             games=[],
             tags=[],
             status="error",
-            bootstrap_memory=bootstrap_memory,
-            bootstrap_skills=bootstrap_skills,
-            bootstrap_subagents=bootstrap_subagents,
-            bootstrap_prompt=bootstrap_prompt,
+            bootstrap=bootstrap,
             prompt_evolve_frequency=prompt_evolve_frequency,
         )
         return
@@ -431,13 +326,43 @@ def main() -> None:
             games=games,
             tags=tags,
             status="error",
-            bootstrap_memory=bootstrap_memory,
-            bootstrap_skills=bootstrap_skills,
-            bootstrap_subagents=bootstrap_subagents,
-            bootstrap_prompt=bootstrap_prompt,
+            bootstrap=bootstrap,
             prompt_evolve_frequency=prompt_evolve_frequency,
         )
         return
+
+    # --bootstrap seeds exactly one game's folder; reject ambiguous targets.
+    if bootstrap is not None and len(games) != 1:
+        logger.error(
+            "--bootstrap requires exactly one game (-g); got %d: %s",
+            len(games),
+            games,
+        )
+        write_manifest(
+            run_artifacts,
+            agent=args.agent,
+            games=games,
+            tags=tags,
+            status="error",
+            bootstrap=bootstrap,
+            prompt_evolve_frequency=prompt_evolve_frequency,
+        )
+        return
+
+    # Create each game's folder, seed it from --bootstrap (single game only),
+    # and capture initial snapshots before any agent thread starts.
+    for game_id in games:
+        ga = game_artifacts(run_artifacts.run_dir, game_id)
+        ga.game_dir.mkdir(parents=True, exist_ok=True)
+        if bootstrap is not None:
+            seeded = seed_game_from_bootstrap(bootstrap, ga)
+            logger.info("Seeded %s from %s: %s", game_id, bootstrap, seeded)
+        snapshot_memory(ga.memory_path, ga.memory_initial_path)
+        snapshot_skills(ga.skills_path, ga.skills_initial_path)
+        snapshot_subagents(ga.subagents_path, ga.subagents_initial_path)
+        snapshot_prompt(
+            ga.prompt_path, ga.prompt_initial_path, baseline=BASE_ORCHESTRATOR_POLICY
+        )
 
     # Initialize AgentOps client
     init_agentops(api_key=os.getenv("AGENTOPS_API_KEY"), log_level=log_level)
@@ -454,10 +379,7 @@ def main() -> None:
         games=games,
         tags=swarm.tags,
         status="running",
-        bootstrap_memory=bootstrap_memory,
-        bootstrap_skills=bootstrap_skills,
-        bootstrap_subagents=bootstrap_subagents,
-        bootstrap_prompt=bootstrap_prompt,
+        bootstrap=bootstrap,
         prompt_evolve_frequency=prompt_evolve_frequency,
     )
     agent_thread = threading.Thread(
@@ -465,10 +387,7 @@ def main() -> None:
             run_agent,
             swarm,
             run_artifacts,
-            bootstrap_memory,
-            bootstrap_skills,
-            bootstrap_subagents,
-            bootstrap_prompt,
+            bootstrap,
             prompt_evolve_frequency,
         )
     )
@@ -479,10 +398,7 @@ def main() -> None:
             cleanup,
             swarm,
             run_artifacts,
-            bootstrap_memory,
-            bootstrap_skills,
-            bootstrap_subagents,
-            bootstrap_prompt,
+            bootstrap,
             prompt_evolve_frequency,
         ),
     )  # handler for Ctrl+C
@@ -497,10 +413,7 @@ def main() -> None:
         cleanup(
             swarm,
             run_artifacts,
-            bootstrap_memory,
-            bootstrap_skills,
-            bootstrap_subagents,
-            bootstrap_prompt,
+            bootstrap,
             prompt_evolve_frequency,
             signal.SIGINT,
             None,
@@ -510,10 +423,7 @@ def main() -> None:
         cleanup(
             swarm,
             run_artifacts,
-            bootstrap_memory,
-            bootstrap_skills,
-            bootstrap_subagents,
-            bootstrap_prompt,
+            bootstrap,
             prompt_evolve_frequency,
             None,
             None,

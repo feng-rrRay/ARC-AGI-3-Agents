@@ -306,24 +306,25 @@ class TestDefaultTrajectoryPath:
     def test_uses_run_log_path_env(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.delenv("RUN_DIR", raising=False)
         run_log = tmp_path / "logs" / "continualharness-x.log"
         monkeypatch.setenv("RUN_LOG_PATH", str(run_log))
         assert default_trajectory_path() == run_log.with_suffix(".trajectory.jsonl")
 
-    def test_uses_run_artifacts_dir_with_stem(
+    def test_uses_run_dir_with_game_id(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        artifacts_dir = tmp_path / "logs" / "run" / "artifacts"
-        monkeypatch.setenv("RUN_ARTIFACTS_DIR", str(artifacts_dir))
-        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "logs" / "run" / "run.log"))
+        run_dir = tmp_path / "logs" / "run"
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
 
-        path = default_trajectory_path(prefix="game.agent/model", guid="guid:1")
+        path = default_trajectory_path("ls20")
 
-        assert path == artifacts_dir / "game.agent-model.guid-1.trajectory.jsonl"
+        assert path == run_dir / "ls20" / "trajectory.jsonl"
 
     def test_fallback_uses_logs_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.delenv("RUN_DIR", raising=False)
         monkeypatch.delenv("RUN_LOG_PATH", raising=False)
         monkeypatch.chdir(tmp_path)
         path = default_trajectory_path()

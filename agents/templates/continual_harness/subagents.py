@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ...run_artifacts import game_artifacts
 from ._locks import lock_for_path
 from .tools import SUBAGENT_TOOL_ENUM
 
@@ -23,8 +24,6 @@ SEARCH_MAX_MATCHES = 10
 DEFAULT_SUBAGENT_ALLOWED_TOOLS: tuple[str, ...] = ("get_recent_trajectory",)
 
 
-BOOTSTRAP_SUBAGENTS_ENV = "CONTINUAL_HARNESS_BOOTSTRAP_SUBAGENTS"
-RUN_SUBAGENTS_PATH_ENV = "RUN_SUBAGENTS_PATH"
 RUN_DIR_ENV = "RUN_DIR"
 RUN_LOG_PATH_ENV = "RUN_LOG_PATH"
 
@@ -45,27 +44,17 @@ class SubagentEntry:
     updated_at: str = ""
 
 
-def bootstrap_subagent_path() -> Path | None:
-    """Explicit cross-run subagent file passed via --bootstrap-subagents, if any."""
-    raw = os.getenv(BOOTSTRAP_SUBAGENTS_ENV)
-    return Path(raw) if raw else None
-
-
-def active_subagent_path() -> Path:
+def active_subagent_path(game_id: str | None = None) -> Path:
     """Resolve the backing subagent file.
 
-    --bootstrap-subagents wins; without it, falls back to run-local storage so
-    subagents are always available regardless of CLI flags.
+    Per-game when a game_id and RUN_DIR are available (the swarm default), so
+    parallel games never share a subagent registry. Falls back to a single
+    run-local file only when there is no game_id (tests / non-run).
     """
-    bootstrap = bootstrap_subagent_path()
-    if bootstrap is not None:
-        return bootstrap
-
-    raw = os.getenv(RUN_SUBAGENTS_PATH_ENV)
-    if raw:
-        return Path(raw)
-
     run_dir = os.getenv(RUN_DIR_ENV)
+    if run_dir and game_id:
+        return game_artifacts(run_dir, game_id).subagents_path
+
     if run_dir:
         return Path(run_dir) / "subagents.json"
 

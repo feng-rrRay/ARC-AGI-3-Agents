@@ -4,6 +4,8 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -92,6 +94,131 @@ class RunArtifacts:
         return self.run_dir / "prompt_evolution.jsonl"
 
 
+@dataclass(frozen=True)
+class GameArtifacts:
+    """Per-game artifact layout inside a run directory.
+
+    Each game in a Swarm gets its own subfolder so the ContinualHarness stores
+    (memory/skills/subagents/prompt) and per-game logs (trace/trajectory/
+    recordings) never collide across games running in parallel threads.
+    """
+
+    game_id: str
+    game_dir: Path
+
+    @property
+    def memory_path(self) -> Path:
+        return self.game_dir / "memory.json"
+
+    @property
+    def memory_initial_path(self) -> Path:
+        return self.game_dir / "memory.initial.json"
+
+    @property
+    def memory_final_path(self) -> Path:
+        return self.game_dir / "memory.final.json"
+
+    @property
+    def skills_path(self) -> Path:
+        return self.game_dir / "skills.json"
+
+    @property
+    def skills_initial_path(self) -> Path:
+        return self.game_dir / "skills.initial.json"
+
+    @property
+    def skills_final_path(self) -> Path:
+        return self.game_dir / "skills.final.json"
+
+    @property
+    def subagents_path(self) -> Path:
+        return self.game_dir / "subagents.json"
+
+    @property
+    def subagents_initial_path(self) -> Path:
+        return self.game_dir / "subagents.initial.json"
+
+    @property
+    def subagents_final_path(self) -> Path:
+        return self.game_dir / "subagents.final.json"
+
+    @property
+    def prompt_path(self) -> Path:
+        return self.game_dir / "prompt.current.md"
+
+    @property
+    def prompt_initial_path(self) -> Path:
+        return self.game_dir / "prompt.initial.md"
+
+    @property
+    def prompt_final_path(self) -> Path:
+        return self.game_dir / "prompt.final.md"
+
+    @property
+    def prompt_evolution_path(self) -> Path:
+        return self.game_dir / "prompt_evolution.jsonl"
+
+    @property
+    def trace_path(self) -> Path:
+        return self.game_dir / "trace.jsonl"
+
+    @property
+    def trajectory_path(self) -> Path:
+        return self.game_dir / "trajectory.jsonl"
+
+    @property
+    def recordings_dir(self) -> Path:
+        return self.game_dir / "recordings"
+
+
+def game_artifacts(run_dir: str | Path, game_id: str) -> GameArtifacts:
+    """Resolve the per-game artifact layout for `game_id` under `run_dir`."""
+    return GameArtifacts(
+        game_id=game_id, game_dir=Path(run_dir) / safe_slug(game_id)
+    )
+
+
+# Filenames in a --bootstrap source mapped to the GameArtifacts attribute they
+# seed. Only these four files are restored; trace/trajectory/recordings and the
+# prompt_evolution audit log always start fresh per run.
+_BOOTSTRAP_DEST = {
+    "memory.json": "memory_path",
+    "skills.json": "skills_path",
+    "subagents.json": "subagents_path",
+    "prompt.current.md": "prompt_path",
+}
+
+
+def seed_game_from_bootstrap(bootstrap: str | Path, ga: GameArtifacts) -> list[str]:
+    """Copy the four state files from a .zip or directory into a game folder.
+
+    Missing files are skipped (the agent starts that store empty / at baseline).
+    A zip that wraps everything in a single top-level folder is unwrapped.
+    Returns the list of filenames actually seeded.
+    """
+    bootstrap = Path(bootstrap)
+    ga.game_dir.mkdir(parents=True, exist_ok=True)
+    seeded: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        if zipfile.is_zipfile(bootstrap):
+            with zipfile.ZipFile(bootstrap) as zf:
+                zf.extractall(tmp)
+            src = Path(tmp)
+            inner = list(src.iterdir())
+            if len(inner) == 1 and inner[0].is_dir():
+                src = inner[0]
+        elif bootstrap.is_dir():
+            src = bootstrap
+        else:
+            raise ValueError(f"--bootstrap must be a .zip or directory: {bootstrap}")
+        for name, attr in _BOOTSTRAP_DEST.items():
+            f = src / name
+            if f.exists():
+                shutil.copyfile(f, getattr(ga, attr))
+                seeded.append(name)
+    return seeded
+
+
 def safe_slug(value: str) -> str:
     """Return a filesystem-friendly slug while preserving useful dots."""
     slug = _SAFE_SLUG_RE.sub("-", value.strip()).strip(".-")
@@ -151,14 +278,29 @@ def write_manifest(
     tags: list[str],
     status: str,
     card_id: str | None = None,
-    bootstrap_memory: str | Path | None = None,
-    bootstrap_skills: str | Path | None = None,
-    bootstrap_subagents: str | Path | None = None,
-    bootstrap_prompt: str | Path | None = None,
+    bootstrap: str | Path | None = None,
     prompt_evolve_frequency: int | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Path:
-    """Write the current run manifest atomically."""
+    """Write the current run manifest atomically.
+
+    `paths.games` maps each game_id to its per-game artifact folder and the
+    files inside it — the ContinualHarness stores are isolated per game.
+    """
+    per_game: dict[str, dict[str, str]] = {}
+    for g in games:
+        ga = game_artifacts(artifacts.run_dir, g)
+        per_game[g] = {
+            "dir": str(ga.game_dir),
+            "memory": str(ga.memory_path),
+            "skills": str(ga.skills_path),
+            "subagents": str(ga.subagents_path),
+            "prompt": str(ga.prompt_path),
+            "prompt_evolution": str(ga.prompt_evolution_path),
+            "trace": str(ga.trace_path),
+            "trajectory": str(ga.trajectory_path),
+            "recordings": str(ga.recordings_dir),
+        }
     payload: dict[str, Any] = {
         "run_id": artifacts.run_id,
         "status": status,
@@ -166,31 +308,13 @@ def write_manifest(
         "games": games,
         "tags": tags,
         "card_id": card_id,
-        "bootstrap_memory": str(bootstrap_memory) if bootstrap_memory else None,
-        "bootstrap_skills": str(bootstrap_skills) if bootstrap_skills else None,
-        "bootstrap_subagents": (
-            str(bootstrap_subagents) if bootstrap_subagents else None
-        ),
-        "bootstrap_prompt": str(bootstrap_prompt) if bootstrap_prompt else None,
+        "bootstrap": str(bootstrap) if bootstrap else None,
         "prompt_evolve_frequency": prompt_evolve_frequency,
         "paths": {
             "run_dir": str(artifacts.run_dir),
             "log": str(artifacts.log_path),
-            "recordings": str(artifacts.recordings_dir),
-            "artifacts": str(artifacts.artifacts_dir),
-            "memory": str(bootstrap_memory or artifacts.memory_path),
-            "memory_initial": str(artifacts.memory_initial_path),
-            "memory_final": str(artifacts.memory_final_path),
-            "skills": str(bootstrap_skills or artifacts.skills_path),
-            "skills_initial": str(artifacts.skills_initial_path),
-            "skills_final": str(artifacts.skills_final_path),
-            "subagents": str(bootstrap_subagents or artifacts.subagents_path),
-            "subagents_initial": str(artifacts.subagents_initial_path),
-            "subagents_final": str(artifacts.subagents_final_path),
-            "prompt": str(bootstrap_prompt or artifacts.prompt_path),
-            "prompt_initial": str(artifacts.prompt_initial_path),
-            "prompt_final": str(artifacts.prompt_final_path),
-            "prompt_evolution": str(artifacts.prompt_evolution_path),
+            "scorecard": str(artifacts.scorecard_path),
+            "games": per_game,
         },
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }

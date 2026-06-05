@@ -22,7 +22,6 @@ from agents.templates.continual_harness.prompt_evolution import (
     PromptFile,
     active_prompt_evolution_path,
     active_prompt_path,
-    bootstrap_prompt_path,
     build_evolution_prompt,
     validate_evolved_prompt,
 )
@@ -152,63 +151,47 @@ class TestPromptEvolutionStore:
 
 
 @pytest.mark.unit
-class TestBootstrapPromptPath:
-    def test_returns_none_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", raising=False)
-        assert bootstrap_prompt_path() is None
-
-    def test_returns_set_env(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        target = tmp_path / "p.md"
-        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", str(target))
-        assert bootstrap_prompt_path() == target
-
-
-@pytest.mark.unit
 class TestActivePromptPath:
-    def test_prefers_bootstrap(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        bootstrap = tmp_path / "bootstrap.md"
-        run_local = tmp_path / "run" / "prompt.current.md"
-        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", str(bootstrap))
-        monkeypatch.setenv("RUN_PROMPT_PATH", str(run_local))
-        assert active_prompt_path() == bootstrap
-
-    def test_uses_run_prompt_path_without_bootstrap(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        target = tmp_path / "run" / "prompt.current.md"
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", raising=False)
-        monkeypatch.setenv("RUN_PROMPT_PATH", str(target))
-        assert active_prompt_path() == target
-
-    def test_derives_from_run_dir(
+    def test_per_game_under_run_dir(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         run_dir = tmp_path / "logs" / "run-id"
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_PROMPT", raising=False)
-        monkeypatch.delenv("RUN_PROMPT_PATH", raising=False)
         monkeypatch.setenv("RUN_DIR", str(run_dir))
+
+        assert active_prompt_path("ls20") == run_dir / "ls20" / "prompt.current.md"
+        assert active_prompt_path("ls20") != active_prompt_path("vc33")
+
+    def test_falls_back_to_run_dir_without_game_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = tmp_path / "logs" / "run-id"
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
+        monkeypatch.delenv("RUN_LOG_PATH", raising=False)
         assert active_prompt_path() == run_dir / "prompt.current.md"
 
 
 @pytest.mark.unit
 class TestActivePromptEvolutionPath:
-    def test_uses_explicit_path(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        target = tmp_path / "evolution.jsonl"
-        monkeypatch.setenv("RUN_PROMPT_EVOLUTION_PATH", str(target))
-        assert active_prompt_evolution_path() == target
-
-    def test_derives_from_run_dir(
+    def test_per_game_under_run_dir(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         run_dir = tmp_path / "logs" / "run-id"
-        monkeypatch.delenv("RUN_PROMPT_EVOLUTION_PATH", raising=False)
         monkeypatch.setenv("RUN_DIR", str(run_dir))
+
+        assert (
+            active_prompt_evolution_path("ls20")
+            == run_dir / "ls20" / "prompt_evolution.jsonl"
+        )
+        assert active_prompt_evolution_path("ls20") != active_prompt_evolution_path(
+            "vc33"
+        )
+
+    def test_falls_back_to_run_dir_without_game_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = tmp_path / "logs" / "run-id"
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
+        monkeypatch.delenv("RUN_LOG_PATH", raising=False)
         assert active_prompt_evolution_path() == run_dir / "prompt_evolution.jsonl"
 
 

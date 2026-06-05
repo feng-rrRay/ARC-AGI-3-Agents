@@ -10,6 +10,8 @@ from typing import Any
 from arcengine import FrameData, GameAction, GameState
 
 from ..agent import Agent
+from ..recorder import Recorder
+from ..run_artifacts import RUN_DIR_ENV, RUN_RECORDINGS_DIR_ENV, game_artifacts
 from ..tracing import trace_agent_session
 from .continual_harness.context import build_subagent_prompt, build_working_prompt
 from .continual_harness.helpers import (
@@ -257,14 +259,17 @@ class ContinualHarness(Agent):
             "{game_name}", self.game_id
         )
 
-        # Evolvable base prompt — strategic guidance, rule discoveries.
+        # Evolvable base prompt — strategic guidance, rule discoveries. Stored
+        # per-game so parallel games evolve independent prompts.
         self._base_prompt_file = PromptFile(
-            active_prompt_path(), baseline=BASE_ORCHESTRATOR_POLICY
+            active_prompt_path(self.game_id), baseline=BASE_ORCHESTRATOR_POLICY
         )
         self._current_base_prompt: str = self._base_prompt_file.read()
         self._prompt_generation: int = 0
         self._last_evolution_step: int = -1
-        self.prompt_evolution = PromptEvolutionStore(active_prompt_evolution_path())
+        self.prompt_evolution = PromptEvolutionStore(
+            active_prompt_evolution_path(self.game_id)
+        )
 
         self.vlm = VLM(
             self.model_name,
@@ -272,13 +277,9 @@ class ContinualHarness(Agent):
             system_instruction=self._system_instruction,
         )
         self.vlm.set_tools(self._full_tool_list())
-        recorder = getattr(self, "recorder", None)
-        guid = getattr(recorder, "guid", None)
-        # JSONL artifacts share the recording stem when run-dir wiring is active.
-        self.trace = TraceWriter(default_trace_path(prefix=self.name, guid=guid))
-        self.trajectory = TrajectoryStore(
-            default_trajectory_path(prefix=self.name, guid=guid)
-        )
+        # Per-game trace/trajectory JSONL under logs/<run>/<game_id>/.
+        self.trace = TraceWriter(default_trace_path(self.game_id))
+        self.trajectory = TrajectoryStore(default_trajectory_path(self.game_id))
 
         def _handle_get_recent_trajectory(args: dict[str, Any]) -> dict[str, Any]:
             try:
@@ -294,10 +295,12 @@ class ContinualHarness(Agent):
                 "history": format_full_history(records),
             }
 
-        # Memory is always available. --bootstrap-memory selects a cross-run
-        # backing file; otherwise active_memory_path() falls back to run-local
-        # storage under logs/<run_id>/memory.json.
-        self.memory = MemoryStore(active_memory_path(), game_id=self.game_id)
+        # Memory is always available, backed per-game at
+        # logs/<run_id>/<game_id>/memory.json (seeded from --bootstrap when a
+        # single game was launched).
+        self.memory = MemoryStore(
+            active_memory_path(self.game_id), game_id=self.game_id
+        )
 
         def _handle_process_memory(args: dict[str, Any]) -> dict[str, Any]:
             op = (args.get("operation") or "").strip().lower()
@@ -374,10 +377,12 @@ class ContinualHarness(Agent):
             except ValueError as exc:
                 return {"success": False, "operation": op, "error": str(exc)}
 
-        # Skills are always available too. --bootstrap-skills selects a cross-run
-        # backing file; otherwise active_skill_path() falls back to run-local
-        # storage under logs/<run_id>/skills.json.
-        self.skills = SkillStore(active_skill_path(), game_id=self.game_id)
+        # Skills are always available too, backed per-game at
+        # logs/<run_id>/<game_id>/skills.json (seeded from --bootstrap when a
+        # single game was launched).
+        self.skills = SkillStore(
+            active_skill_path(self.game_id), game_id=self.game_id
+        )
 
         # _current_sandbox_state is set at the top of each choose_action() so all
         # handlers (process_skill/run_skill) within that step share one
@@ -539,10 +544,12 @@ class ContinualHarness(Agent):
         # back to `analysis_tools`, and put `"run_code"` back into
         # `SUBAGENT_TOOL_ENUM` in tools.py.
 
-        # Subagents are always available too. --bootstrap-subagents selects a
-        # cross-run backing file; otherwise active_subagent_path() falls back
-        # to run-local storage under logs/<run_id>/subagents.json.
-        self.subagents = SubagentStore(active_subagent_path(), game_id=self.game_id)
+        # Subagents are always available too, backed per-game at
+        # logs/<run_id>/<game_id>/subagents.json (seeded from --bootstrap when a
+        # single game was launched).
+        self.subagents = SubagentStore(
+            active_subagent_path(self.game_id), game_id=self.game_id
+        )
 
         # Per-iteration state used by _handle_run_subagent. Set at the top of
         # every _vlm_loop_inner call so any subagent invocation in that
@@ -988,6 +995,24 @@ class ContinualHarness(Agent):
     def name(self) -> str:
         sanitized = self.model_name.replace("/", "-").replace(":", "-")
         return f"{super().name}.{sanitized}"
+
+    def start_recording(self) -> None:
+        """Record into the per-game folder logs/<run>/<game_id>/recordings/.
+
+        Overrides Agent.start_recording (called from Agent.__init__, after
+        self.game_id is set) so parallel games don't share one recordings dir.
+        Falls back to the run-wide RUN_RECORDINGS_DIR when no run dir is wired.
+        """
+        run_dir = os.environ.get(RUN_DIR_ENV)
+        directory = (
+            str(game_artifacts(run_dir, self.game_id).recordings_dir)
+            if run_dir
+            else os.environ.get(RUN_RECORDINGS_DIR_ENV)
+        )
+        self.recorder = Recorder(prefix=self.name, filename=None, directory=directory)
+        logger.info(
+            "created new recording for %s into %s", self.name, self.recorder.filename
+        )
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return latest_frame.state is GameState.WIN

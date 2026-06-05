@@ -11,7 +11,6 @@ from agents.templates.continual_harness.skills import (
     SEARCH_MAX_MATCHES,
     SkillStore,
     active_skill_path,
-    bootstrap_skill_path,
     format_skill_overview,
 )
 
@@ -21,48 +20,30 @@ def _store(tmp_path: Path, game_id: str = "ls20") -> SkillStore:
 
 
 @pytest.mark.unit
-class TestBootstrapSkillPath:
-    def test_returns_none_when_env_unset(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_SKILLS", raising=False)
-        assert bootstrap_skill_path() is None
-
-    def test_returns_set_env(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        target = tmp_path / "skills.json"
-        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_SKILLS", str(target))
-        assert bootstrap_skill_path() == target
-
-
-@pytest.mark.unit
 class TestActiveSkillPath:
-    def test_prefers_bootstrap_over_run(
+    def test_per_game_under_run_dir(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        bootstrap = tmp_path / "bootstrap.json"
-        run_skills = tmp_path / "run" / "skills.json"
-        monkeypatch.setenv("CONTINUAL_HARNESS_BOOTSTRAP_SKILLS", str(bootstrap))
-        monkeypatch.setenv("RUN_SKILLS_PATH", str(run_skills))
-        assert active_skill_path() == bootstrap
-
-    def test_falls_through_to_run_skills_path(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_SKILLS", raising=False)
-        target = tmp_path / "run" / "skills.json"
-        monkeypatch.setenv("RUN_SKILLS_PATH", str(target))
-        assert active_skill_path() == target
-
-    def test_falls_through_to_run_dir(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        monkeypatch.delenv("CONTINUAL_HARNESS_BOOTSTRAP_SKILLS", raising=False)
-        monkeypatch.delenv("RUN_SKILLS_PATH", raising=False)
         run_dir = tmp_path / "logs" / "run-id"
         monkeypatch.setenv("RUN_DIR", str(run_dir))
+
+        assert active_skill_path("ls20") == run_dir / "ls20" / "skills.json"
+        assert active_skill_path("ls20") != active_skill_path("vc33")
+
+    def test_falls_back_to_run_dir_without_game_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run_dir = tmp_path / "logs" / "run-id"
+        monkeypatch.setenv("RUN_DIR", str(run_dir))
+        monkeypatch.delenv("RUN_LOG_PATH", raising=False)
         assert active_skill_path() == run_dir / "skills.json"
+
+    def test_falls_back_to_run_log_sibling(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("RUN_DIR", raising=False)
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "run.log"))
+        assert active_skill_path("ls20") == tmp_path / "skills.json"
 
 
 @pytest.mark.unit

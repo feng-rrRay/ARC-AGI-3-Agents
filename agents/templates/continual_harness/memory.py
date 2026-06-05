@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ...run_artifacts import game_artifacts
 from ._locks import lock_for_path
 
 logger = logging.getLogger(__name__)
@@ -30,33 +31,21 @@ class MemoryEntry:
     updated_at: str = ""
 
 
-BOOTSTRAP_MEMORY_ENV = "CONTINUAL_HARNESS_BOOTSTRAP_MEMORY"
-RUN_MEMORY_PATH_ENV = "RUN_MEMORY_PATH"
 RUN_DIR_ENV = "RUN_DIR"
 RUN_LOG_PATH_ENV = "RUN_LOG_PATH"
 
 
-def bootstrap_memory_path() -> Path | None:
-    """Explicit cross-run memory file passed via --bootstrap-memory, if any."""
-    raw = os.getenv(BOOTSTRAP_MEMORY_ENV)
-    return Path(raw) if raw else None
-
-
-def active_memory_path() -> Path:
+def active_memory_path(game_id: str | None = None) -> Path:
     """Return the backing memory file for this agent.
 
-    --bootstrap-memory is the durable cross-run source. When omitted, memory is
-    still enabled and stored inside the current run directory.
+    Per-game when a game_id and RUN_DIR are available (the swarm default), so
+    games running in parallel threads never share a memory file. Falls back to
+    a single run-local file only when there is no game_id (tests / non-run).
     """
-    bootstrap = bootstrap_memory_path()
-    if bootstrap is not None:
-        return bootstrap
-
-    raw = os.getenv(RUN_MEMORY_PATH_ENV)
-    if raw:
-        return Path(raw)
-
     run_dir = os.getenv(RUN_DIR_ENV)
+    if run_dir and game_id:
+        return game_artifacts(run_dir, game_id).memory_path
+
     if run_dir:
         return Path(run_dir) / "memory.json"
 
