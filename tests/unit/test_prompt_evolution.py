@@ -264,3 +264,70 @@ class TestPromptEvolutionFrequencyParsing:
             _parse_prompt_evolve_frequency("-1")
         with pytest.raises(argparse.ArgumentTypeError):
             _parse_prompt_evolve_frequency("abc")
+
+
+@pytest.mark.unit
+class TestGameOverPromptEvolutionHook:
+    def _agent(self, *, frequency: int = 75, action_counter: int = 10):
+        from agents.templates.continual_harness_agent import ContinualHarness
+
+        agent = ContinualHarness.__new__(ContinualHarness)
+        agent._prompt_evolve_frequency = frequency
+        agent._last_evolution_step = 0
+        agent._last_game_over_evolution_step = -1
+        agent.action_counter = action_counter
+        return agent
+
+    def _frame(self) -> FrameData:
+        return FrameData(
+            game_id="game-over-evo-test",
+            frame=[[[0]]],
+            state=GameState.GAME_OVER,
+            levels_completed=0,
+        )
+
+    def test_game_over_evolves_once_and_resets_frequency_counter(self) -> None:
+        agent = self._agent(action_counter=12)
+        frame = self._frame()
+        calls: list[FrameData] = []
+        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+
+        agent._evolve_on_game_over(frame)
+
+        assert calls == [frame]
+        assert agent._last_game_over_evolution_step == 12
+        assert agent._last_evolution_step == 12
+
+    def test_game_over_evolution_respects_disabled_frequency(self) -> None:
+        agent = self._agent(frequency=0, action_counter=12)
+        frame = self._frame()
+        calls: list[FrameData] = []
+        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+
+        agent._evolve_on_game_over(frame)
+
+        assert calls == []
+        assert agent._last_game_over_evolution_step == -1
+
+    def test_game_over_evolution_only_once_per_action_counter(self) -> None:
+        agent = self._agent(action_counter=12)
+        frame = self._frame()
+        calls: list[FrameData] = []
+        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+
+        agent._evolve_on_game_over(frame)
+        agent._evolve_on_game_over(frame)
+
+        assert calls == [frame]
+
+    def test_game_over_reset_counter_blocks_immediate_periodic_evolution(self) -> None:
+        agent = self._agent(frequency=75, action_counter=12)
+        frame = self._frame()
+        calls: list[FrameData] = []
+        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+
+        agent._evolve_on_game_over(frame)
+        agent.action_counter = 13
+        agent._maybe_evolve_prompt(frame)
+
+        assert calls == [frame]

@@ -184,7 +184,9 @@ class ContinualHarness(Agent):
     """Single-game VLM agent: one VLM call per outer iteration, unified `take_actions`.
 
     Overrides `Agent.main()` to drive the engine directly. Each outer iteration:
-      1. If state is NOT_PLAYED or GAME_OVER, emit RESET and continue.
+      1. If state is NOT_PLAYED, emit RESET and continue. If state is
+         GAME_OVER, evolve the base prompt once for that terminal state, then
+         emit RESET and continue.
       2. Maybe evolve the system prompt (boundary-gated by action_counter).
       3. Make ONE VLM call via `_vlm_loop_inner`. The response may contain
          analysis tool calls (process_memory, run_skill, etc.) and/or one
@@ -248,6 +250,7 @@ class ContinualHarness(Agent):
         self._current_base_prompt: str = self._base_prompt_file.read()
         self._prompt_generation: int = 0
         self._last_evolution_step: int = -1
+        self._last_game_over_evolution_step: int = -1
         self.prompt_evolution = PromptEvolutionStore(
             active_prompt_evolution_path(self.game_id)
         )
@@ -1173,8 +1176,15 @@ class ContinualHarness(Agent):
         ):
             latest_frame = self.frames[-1]
 
-            # Terminal / idle states: emit RESET and restart the iteration.
-            if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+            # Terminal failure: consolidate the failed trajectory before reset.
+            if latest_frame.state is GameState.GAME_OVER:
+                self._evolve_on_game_over(latest_frame)
+                self._execute_one(GameAction.RESET, source="auto_reset")
+                self._recent_tool_results = []
+                continue
+
+            # Idle initial state: emit RESET and restart the iteration.
+            if latest_frame.state is GameState.NOT_PLAYED:
                 self._execute_one(GameAction.RESET, source="auto_reset")
                 self._recent_tool_results = []
                 continue
@@ -1633,6 +1643,16 @@ class ContinualHarness(Agent):
         """Trigger evolution unconditionally on level transition."""
         if self._prompt_evolve_frequency <= 0:
             return
+        self._last_evolution_step = self.action_counter
+        self._evolve_system_prompt(latest_frame)
+
+    def _evolve_on_game_over(self, latest_frame: FrameData) -> None:
+        """Trigger evolution once for a GAME_OVER state before auto-reset."""
+        if self._prompt_evolve_frequency <= 0:
+            return
+        if self._last_game_over_evolution_step == self.action_counter:
+            return
+        self._last_game_over_evolution_step = self.action_counter
         self._last_evolution_step = self.action_counter
         self._evolve_system_prompt(latest_frame)
 
