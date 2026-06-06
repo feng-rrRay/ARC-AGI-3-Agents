@@ -85,7 +85,7 @@ _batch_counter: int = 0
 _action_counter: int = 0
 _observe_counter: int = 0                          # get_game_state calls, for step-sequenced image names
 
-ARC_MAX_ACTIONS = int(os.environ.get("ARC_MAX_ACTIONS", "5000"))
+ARC_MAX_ACTIONS = int(os.environ.get("ARC_MAX_ACTIONS", "50000"))
 UPSCALE_FACTOR = int(os.environ.get("ARC_IMAGE_UPSCALE", "8"))
 # Full per-action RESULT/keyframe detail is rendered for the last N actions in
 # the observe window; older ones collapse to a one-line summary (the grid count
