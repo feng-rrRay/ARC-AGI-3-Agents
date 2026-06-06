@@ -7,7 +7,7 @@ Hermes container, monitors the termination condition, and collects the
 per-game scorecard. Results are aggregated into logs/<run_id>/summary.json.
 
 Usage:
-    python run_cli.py --game <game_id1>[,<game_id2>,...] [options]
+    python run_cli.py [--game <game_id1>[,<game_id2>,...]] [options]
 
 Example:
     python run_cli.py --game my_game --build --model gemini-3.1-pro-preview
@@ -47,10 +47,25 @@ from cli_agents.agent_infrastructure.cli_agent_backends import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+SCHEME = os.environ.get("SCHEME", "http")
+HOST = os.environ.get("HOST", "localhost")
+PORT = os.environ.get("PORT", 8001)
+if (SCHEME == "http" and str(PORT) == "80") or (
+    SCHEME == "https" and str(PORT) == "443"
+):
+    ROOT_URL = f"{SCHEME}://{HOST}"
+else:
+    ROOT_URL = f"{SCHEME}://{HOST}:{PORT}"
+HEADERS = {
+    "X-API-Key": os.getenv("ARC_API_KEY", ""),
+    "Accept": "application/json",
+}
+
 DEFAULT_DIRECTIVE = str(
     _REPO_ROOT / "cli_agents/directives/arc_directive.md"
 )
 DEFAULT_MCP_PORT_OFFSET = 2  # MCP port = game port + 2
+DEFAULT_MAX_ACTIONS = 50000
 MAX_CONSECUTIVE_FAILURES = 3  # stop relaunching a game after this many failed sessions
 
 
@@ -61,8 +76,11 @@ MAX_CONSECUTIVE_FAILURES = 3  # stop relaunching a game after this many failed s
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ARC-AGI-3 Hermes evaluation")
     parser.add_argument(
-        "--game", required=True,
-        help="Comma-separated game_id(s) to play (e.g. game1,game2)",
+        "--game", default="",
+        help=(
+            "Comma-separated game_id(s) to play (e.g. ls20,ka59). "
+            "If omitted, all games returned by the ARC API are evaluated."
+        ),
     )
     parser.add_argument("--backend", default="hermes", choices=["hermes"],
                         help="Agent backend (currently only 'hermes')")
@@ -89,8 +107,8 @@ def _parse_args() -> argparse.Namespace:
             "file, terminal, and code execution tools (default: min)"
         ),
     )
-    parser.add_argument("--max-actions", type=int, default=5000,
-                        help="Per-game ARC action budget (default: 5000)")
+    parser.add_argument("--max-actions", type=int, default=DEFAULT_MAX_ACTIONS,
+                        help=f"Per-game ARC action budget (default: {DEFAULT_MAX_ACTIONS})")
     parser.add_argument("--max-turns", type=int, default=5000,
                         help="Max Hermes tool-calling iterations per session "
                              "(maps to AIAgent max_iterations; default: 5000)")
@@ -110,6 +128,46 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tags", default="",
                         help="Comma-separated extra scorecard tags")
     return parser.parse_args()
+
+
+def _fetch_available_games(root_url: str = ROOT_URL) -> list[str]:
+    """Fetch the online game list the same way main.py does."""
+    import requests
+
+    try:
+        with requests.Session() as session:
+            session.headers.update(HEADERS)
+            response = session.get(f"{root_url}/api/games", timeout=10)
+    except requests.exceptions.RequestException as exc:
+        logger.error("Failed to connect to API server: %s", exc)
+        return []
+
+    if response.status_code != 200:
+        logger.error(
+            "API request failed with status %s: %s",
+            response.status_code,
+            response.text[:200],
+        )
+        return []
+
+    try:
+        return [game["game_id"] for game in response.json()]
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.error("Failed to parse games response: %s", exc)
+        logger.error("Response content: %s", response.text[:200])
+        return []
+
+
+def _resolve_game_ids(game_arg: str, full_games: list[str]) -> list[str]:
+    if not game_arg.strip():
+        return full_games[:]
+
+    filters = [g.strip() for g in game_arg.split(",") if g.strip()]
+    return [
+        game_id
+        for game_id in full_games
+        if any(game_id.startswith(prefix) for prefix in filters)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -635,10 +693,22 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Run ID: %s  →  %s", run_id, run_dir)
 
-    game_ids = [g.strip() for g in args.game.split(",") if g.strip()]
+    logger.info("Fetching ARC game list from %s/api/games", ROOT_URL)
+    full_games = _fetch_available_games()
+    game_ids = _resolve_game_ids(args.game, full_games)
+    logger.info("Game list: %s", game_ids)
     if not game_ids:
-        logger.error("No game IDs specified")
+        if full_games and args.game.strip():
+            logger.error(
+                "The specified game '%s' does not exist or is not available "
+                "with your API key. Please try a different game.",
+                args.game,
+            )
+        else:
+            logger.error("No games available from ARC API")
         sys.exit(1)
+    if not args.game.strip():
+        logger.info("No --game specified; evaluating all available online games")
 
     mcp_port  = args.mcp_port or (args.port + DEFAULT_MCP_PORT_OFFSET)
     game_port = args.port
