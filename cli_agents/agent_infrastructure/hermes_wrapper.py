@@ -67,6 +67,27 @@ def _normalize_tool_name(name: str) -> str:
     return name.split("__")[-1] if "__" in name else name
 
 
+def _payload_from_result(result: Any) -> dict | None:
+    """Extract an ARC MCP tool's payload dict from a tool-call result.
+
+    Used for both get_game_state and take_actions. The result arrives as the MCP
+    wrapper ``{"result": "<json string>"}`` (or an already-decoded dict). Returns
+    the inner payload dict, or None if it can't be parsed — the trace callback
+    must never raise.
+    """
+    try:
+        obj = result if isinstance(result, (dict, list)) else json.loads(result)
+    except (ValueError, TypeError):
+        return None
+    inner = obj.get("result", obj) if isinstance(obj, dict) else obj
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except ValueError:
+            return None
+    return inner if isinstance(inner, dict) else None
+
+
 def _normalise_toolset_mode(value: str) -> str:
     mode = (value or "").strip().lower()
     return mode if mode in {"min", "full"} else "min"
@@ -267,15 +288,66 @@ def main() -> int:
         })
 
     def tool_complete_callback(tool_id: Any, name: Any, args: Any, result: Any) -> None:
-        preview = result if isinstance(result, str) else str(result)
-        if len(preview) > 800:
-            preview = preview[:800] + f"...(+{len(preview) - 800} chars)"
-        _emit({
-            "type": "tool_result",
-            "tool_id": str(tool_id),
-            "name": _normalize_tool_name(str(name)),
-            "result_preview": preview,
-        })
+        tool = _normalize_tool_name(str(name))
+
+        def _emit_preview(limit: int = 5000) -> None:
+            preview = result if isinstance(result, str) else str(result)
+            if len(preview) > limit:
+                preview = preview[:limit] + f"...(+{len(preview) - limit} chars)"
+            _emit({
+                "type": "tool_result",
+                "tool_id": str(tool_id),
+                "name": tool,
+                "result_preview": preview,
+            })
+
+        if tool == "get_game_state":
+            # The agent's observation: emit the full, untruncated rendered
+            # observation (text + saved image paths, no inline base64) as a
+            # dedicated event so the per-step observation is preserved in the trace.
+            payload = _payload_from_result(result)
+            if payload is None:
+                _emit_preview()
+                return
+            _emit({
+                "type": "observation",
+                "tool_id": str(tool_id),
+                "observe_index": payload.get("observe_index"),
+                "state": payload.get("state"),
+                "levels_completed": payload.get("levels_completed"),
+                "available_actions": payload.get("available_actions"),
+                "observations_since_last_query": payload.get(
+                    "observations_since_last_query"
+                ),
+                "current_grid": payload.get("current_grid"),
+                "screenshot_files": payload.get("screenshot_files"),
+            })
+        elif tool == "take_actions":
+            # The agent's action batch: emit the structured outcome (what applied
+            # vs rejected, resulting state/score, budget) rather than a string
+            # preview, so the action log is machine-readable in the trajectory.
+            payload = _payload_from_result(result)
+            if payload is None:
+                _emit_preview()
+                return
+            _emit({
+                "type": "action_result",
+                "tool_id": str(tool_id),
+                "success": payload.get("success"),
+                "applied_count": payload.get("applied_count"),
+                "applied_actions": payload.get("applied_actions"),
+                "levels_gained": payload.get("levels_gained"),
+                "rejected": payload.get("rejected"),
+                "state": payload.get("state"),
+                "levels_completed": payload.get("levels_completed"),
+                "available_actions": payload.get("available_actions"),
+                "budget_remaining": payload.get("budget_remaining"),
+                "done": payload.get("done"),
+                "error": payload.get("error"),
+            })
+        else:
+            # Any other tool (full-toolset code/file/terminal/etc.): capped preview.
+            _emit_preview()
 
     def reasoning_callback(reasoning_text: Any) -> None:
         if isinstance(reasoning_text, str) and reasoning_text.strip():

@@ -38,7 +38,12 @@ if str(_REPO_ROOT) not in sys.path:
 from arc_agi import Arcade, OperationMode
 from arcengine import GameAction, GameState
 
-from agents.templates.continual_harness.context import pretty_print_3d
+from agents.templates.continual_harness.context import (
+    _grid_diff_stats,
+    build_observation_section,
+    current_state_rendered_grid,
+    pretty_print_grid,
+)
 from agents.templates.continual_harness.helpers import (
     _action_from_name,
     available_game_actions,
@@ -46,6 +51,7 @@ from agents.templates.continual_harness.helpers import (
     grid_to_image,
     validate_action_sequence,
 )
+from agents.templates.continual_harness.models import PendingActionObservation
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +68,28 @@ _game_id: str = ""
 _tags: list[str] = []
 _run_dir: Path | None = None
 _recordings_dir: Path | None = None
+_observations_dir: Path | None = None  # logs/<run>/<game>/logs/observations/ (rendered PNGs)
 _scorecard_closed = False
 _scorecard_closing = False
 _scorecard_payload: dict[str, Any] | None = None
 _state_lock = threading.Lock()
 
+# Observation tracking: the frames + per-action observations accumulated since
+# the last get_game_state call (the ContinualHarness `_pending_observations`
+# analog). Reset on every get_game_state flush so memory stays bounded to one
+# observe window rather than the whole game.
+_obs_window: list[Any] = []                       # _ObsFrame list; index 0 is the pre-batch baseline
+_pending_obs: list[PendingActionObservation] = []
+_batch_counter: int = 0
+_action_counter: int = 0
+_observe_counter: int = 0                          # get_game_state calls, for step-sequenced image names
+
 ARC_MAX_ACTIONS = int(os.environ.get("ARC_MAX_ACTIONS", "5000"))
 UPSCALE_FACTOR = int(os.environ.get("ARC_IMAGE_UPSCALE", "8"))
+# Full per-action RESULT/keyframe detail is rendered for the last N actions in
+# the observe window; older ones collapse to a one-line summary (the grid count
+# is separately capped by context.MAX_OBSERVATION_TEXT_GRIDS=4).
+MAX_OBSERVATION_DETAIL_BLOCKS = 15
 
 app = FastAPI(title="arc-game-server")
 
@@ -93,27 +114,77 @@ def _convert_raw(raw: Any) -> dict[str, Any]:
     }
 
 
-def _render_screenshot(frame: list[list[list[int]]]) -> str:
-    """Render the first (top) grid layer to an upscaled PNG; return base64."""
-    if not frame or not frame[0]:
+def _render_grid_png(grid: list[list[int]]) -> str:
+    """Render one 2D grid to an upscaled PNG; return base64."""
+    if not grid or not grid[0]:
         return ""
-    grid = frame[-1]
     img = grid_to_image(grid)
     if UPSCALE_FACTOR > 1:
-        new_w = img.width * UPSCALE_FACTOR
-        new_h = img.height * UPSCALE_FACTOR
         from PIL import Image as _Image
-        img = img.resize((new_w, new_h), _Image.NEAREST)
+        img = img.resize(
+            (img.width * UPSCALE_FACTOR, img.height * UPSCALE_FACTOR),
+            _Image.NEAREST,
+        )
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _frame_payload(cached: dict[str, Any]) -> dict[str, Any]:
-    """Build the get_game_state response payload from a cached converted frame."""
-    frame: list[list[list[int]]] = cached["frame"]
-    avail_ids: list[int] = cached["available_actions"]
-    avail_actions = available_game_actions(avail_ids)
+class _ObsState:
+    """Minimal stand-in for FrameData.state — exposes `.name`."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _ObsFrame:
+    """Attribute-access adapter over a converted-frame dict.
+
+    The ContinualHarness renderers (build_observation_section /
+    current_state_rendered_grid) read `.frame`, `.state.name`, and
+    `.levels_completed`; the server stores converted dicts, so this shim bridges
+    dict->attribute without a real arcengine.FrameData (and without editing the
+    shared context.py).
+    """
+
+    __slots__ = ("frame", "levels_completed", "state")
+
+    def __init__(self, cached: dict[str, Any]) -> None:
+        self.frame = cached["frame"]
+        self.levels_completed = cached["levels_completed"]
+        self.state = _ObsState(cached["state"])
+
+
+def _collapse_summary(
+    obs_list: list[PendingActionObservation],
+    window: list[_ObsFrame],
+) -> str:
+    """One-line summary for observations beyond the per-window detail cap."""
+    names = _compact_names([o.action_name for o in obs_list])
+    first_pre = window[obs_list[0].pre_frame_index]
+    last_post = window[obs_list[-1].post_frame_index]
+    pre_grid = first_pre.frame[-1] if first_pre.frame else None
+    post_grid = last_post.frame[-1] if last_post.frame else None
+    changed = _grid_diff_stats(pre_grid, post_grid).count
+    return (
+        f"EARLIER ACTIONS (collapsed): {len(obs_list)} actions {names}; "
+        f"state {first_pre.state.name}->{last_post.state.name}; "
+        f"score {first_pre.levels_completed}->{last_post.levels_completed}; "
+        f"net_cells_changed={changed}"
+    )
+
+
+def _frame_payload(
+    cached: dict[str, Any],
+    pending: list[PendingActionObservation],
+    window: list[_ObsFrame],
+    latest_adapter: _ObsFrame,
+) -> dict[str, Any]:
+    """Build the get_game_state response: observations-since-last-query plus the
+    current grid rendered once, with one PNG per rendered grid (same order)."""
+    avail_actions = available_game_actions(cached["available_actions"])
     action_menu = [
         {
             "name": a.name,
@@ -122,6 +193,33 @@ def _frame_payload(cached: dict[str, Any]) -> dict[str, Any]:
         }
         for a in avail_actions
     ]
+
+    # OBSERVATIONS SINCE LAST QUERY — full RESULT/keyframe blocks for the last
+    # MAX_OBSERVATION_DETAIL_BLOCKS actions; older ones collapse to one line.
+    obs_text = ""
+    obs_grids: list[Any] = []
+    if pending:
+        detail = pending[-MAX_OBSERVATION_DETAIL_BLOCKS:]
+        collapsed = (
+            pending[:-MAX_OBSERVATION_DETAIL_BLOCKS]
+            if len(pending) > MAX_OBSERVATION_DETAIL_BLOCKS
+            else []
+        )
+        obs_body, obs_grids = build_observation_section(detail, window)
+        obs_text = (
+            _collapse_summary(collapsed, window) + "\n\n" + obs_body
+            if collapsed
+            else obs_body
+        )
+
+    # CURRENT STATE grid (latest_frame.frame[-1]) rendered exactly once.
+    current_grid = current_state_rendered_grid(latest_adapter)
+    rendered = list(obs_grids)
+    current_text = ""
+    if current_grid is not None:
+        rendered.append(current_grid)
+        current_text = pretty_print_grid(current_grid.grid, current_grid.label)
+
     return {
         "game_id": cached["game_id"],
         "state": cached["state"],
@@ -129,9 +227,13 @@ def _frame_payload(cached: dict[str, Any]) -> dict[str, Any]:
         "win_levels": cached["win_levels"],
         "available_actions": [a.name for a in avail_actions],
         "action_menu": action_menu,
-        "state_text": pretty_print_3d(frame),
-        "screenshot_base64": _render_screenshot(frame),
-        "num_layers": len(frame),
+        "observations_since_last_query": obs_text,
+        "current_grid": current_text,
+        "screenshots_base64": [_render_grid_png(rg.grid) for rg in rendered],
+        # Parallel grid labels (e.g. action_step_3_frame_2, current_state_frame)
+        # used by mcp_get_game_state to name the persisted PNGs; popped before the
+        # payload is returned to the agent.
+        "screenshot_labels": [rg.label for rg in rendered],
         "guid": cached["guid"],
     }
 
@@ -156,17 +258,51 @@ async def health() -> dict[str, str]:
 
 @app.post("/mcp/get_game_state")
 async def mcp_get_game_state() -> JSONResponse:
+    global _pending_obs, _obs_window, _observe_counter
     with _state_lock:
         cached = _latest
-    if cached is None:
-        return JSONResponse({"success": False, "error": "environment not initialised"})
-    payload = _frame_payload(cached)
+        if cached is None:
+            return JSONResponse(
+                {"success": False, "error": "environment not initialised"}
+            )
+        # Snapshot the observe window, then flush so the next take_actions starts
+        # a fresh window seeded with the current frame as its baseline. Rendering
+        # (diffing + PNG encoding) happens outside the lock on the captured refs.
+        pending = _pending_obs
+        window = _obs_window
+        latest_adapter = _ObsFrame(cached)
+        _pending_obs = []
+        _obs_window = [latest_adapter]
+        _observe_counter += 1
+        observe_idx = _observe_counter
+    payload = _frame_payload(cached, pending, window, latest_adapter)
+
+    # Persist each rendered grid PNG with a step-sequenced, navigable name
+    # (obs<NNNN>_<seq>_<label>.png) so the trace links to readable files instead
+    # of Hermes's hash-named multimodal cache. The base64 still feeds the agent
+    # (the proxy turns it into image blocks); these files are for offline traces.
+    labels = payload.pop("screenshot_labels", [])
+    screenshot_files: list[str] = []
+    if _observations_dir is not None:
+        for seq, b64 in enumerate(payload.get("screenshots_base64", [])):
+            if not b64:
+                continue
+            label = labels[seq] if seq < len(labels) else f"grid_{seq}"
+            fname = f"obs{observe_idx:04d}_{seq}_{label}.png"
+            try:
+                (_observations_dir / fname).write_bytes(base64.b64decode(b64))
+                screenshot_files.append(f"observations/{fname}")
+            except OSError as exc:
+                logger.warning("could not write observation image %s: %s", fname, exc)
+    payload["observe_index"] = observe_idx
+    payload["screenshot_files"] = screenshot_files
     return JSONResponse(payload)
 
 
 @app.post("/mcp/take_actions")
 async def mcp_take_actions(request: Request) -> JSONResponse:
     global _latest, _budget, _scorecard_closed
+    global _pending_obs, _obs_window, _batch_counter, _action_counter
 
     body: dict[str, Any] = {}
     try:
@@ -214,6 +350,11 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
 
     steps, rejected = validate_action_sequence(normalised, all_actions)
 
+    with _state_lock:
+        _batch_counter += 1
+        batch_id = f"b_{_batch_counter:04d}"
+    batch_total = len(steps)
+
     applied: list[dict[str, Any]] = []
     final_cached = cached
 
@@ -233,6 +374,7 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
             data = action.action_data.model_dump() if hasattr(action, "action_data") else {}
             reasoning_text = getattr(action, "reasoning", None) or outer_reasoning
             step_reasoning = {"reasoning": reasoning_text} if reasoning_text else {}
+            pre_cached = final_cached
             try:
                 raw = env.step(action, data=data, reasoning=step_reasoning)
             except Exception as exc:
@@ -248,6 +390,27 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
             bud = _budget
             if raw is not None:
                 new_cached = _convert_raw(raw)
+                # Record the per-action transition for the next get_game_state's
+                # OBSERVATIONS SINCE LAST QUERY section. The window is seeded with
+                # the pre-action frame as its baseline (index 0) the first time an
+                # action runs after a flush.
+                if not _obs_window:
+                    _obs_window.append(_ObsFrame(pre_cached))
+                pre_index = len(_obs_window) - 1
+                _obs_window.append(_ObsFrame(new_cached))
+                _action_counter += 1
+                _pending_obs.append(PendingActionObservation(
+                    action_counter=_action_counter,
+                    action_name=action.name,
+                    action_data={k: v for k, v in data.items() if k != "game_id"},
+                    source="take_actions",
+                    batch_id=batch_id,
+                    batch_position=step.position,
+                    batch_total=batch_total,
+                    pre_frame_index=pre_index,
+                    post_frame_index=len(_obs_window) - 1,
+                    valid_frame=True,
+                ))
                 _latest = new_cached
                 final_cached = new_cached
 
@@ -468,7 +631,7 @@ def _signal_handler(signum: int, _frame: Any) -> None:
 
 def main() -> None:
     global _arc, _card_id, _env, _latest, _budget, _win_levels
-    global _game_id, _tags, _run_dir, _recordings_dir
+    global _game_id, _tags, _run_dir, _recordings_dir, _observations_dir
 
     logging.basicConfig(
         level=logging.DEBUG if os.environ.get("DEBUG") == "True" else logging.INFO,
@@ -499,6 +662,9 @@ def main() -> None:
     if args.run_dir:
         _run_dir = Path(args.run_dir)
         _run_dir.mkdir(parents=True, exist_ok=True)
+        # Sits beside the host-written observations.jsonl under <game>/logs/.
+        _observations_dir = _run_dir / "logs" / "observations"
+        _observations_dir.mkdir(parents=True, exist_ok=True)
 
     recordings_dir = args.recordings_dir or os.environ.get("ARC_RECORDINGS_DIR")
 

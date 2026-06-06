@@ -218,9 +218,11 @@ class HermesCliBackend:
     # Stream reader — phase-1: tee to log; phase-2 adds JSONL event parsing
     # ---------------------------------------------------------------------------
 
-    # JSONL event types worth persisting to the trajectory file.
+    # JSONL event types worth persisting to the trajectory file. ("observation"
+    # is handled separately and routed to observations.jsonl.)
     _TRAJECTORY_EVENT_TYPES = {
-        "system", "thinking", "tool_use", "tool_result", "result", "error",
+        "system", "thinking", "tool_use", "tool_result", "action_result",
+        "result", "error",
     }
 
     def run_stream_reader(
@@ -231,9 +233,11 @@ class HermesCliBackend:
         metrics: CliSessionMetrics | None,
         server_url: str | None = None,
         trajectory_file: io.TextIOWrapper | None = None,
+        observations_file: io.TextIOWrapper | None = None,
     ) -> None:
         """Read container stdout; tee raw lines to log_file; parse JSONL events,
-        update metrics, and append structured events to trajectory_file."""
+        update metrics, append structured events to trajectory_file, and route the
+        full per-step `observation` events (get_game_state) to observations_file."""
         try:
             buffered = io.BufferedReader(stdout_pipe)  # type: ignore[arg-type]
             for raw_line in buffered:
@@ -249,10 +253,15 @@ class HermesCliBackend:
                 except json.JSONDecodeError:
                     continue
                 self._handle_stream_event(event, metrics)
-                if (
+                etype = event.get("type") if isinstance(event, dict) else None
+                # Untruncated observation records go to their own JSONL so the
+                # compact trajectory.jsonl stays small.
+                if observations_file is not None and etype == "observation":
+                    observations_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    observations_file.flush()
+                elif (
                     trajectory_file is not None
-                    and isinstance(event, dict)
-                    and event.get("type") in self._TRAJECTORY_EVENT_TYPES
+                    and etype in self._TRAJECTORY_EVENT_TYPES
                 ):
                     trajectory_file.write(json.dumps(event, ensure_ascii=False) + "\n")
                     trajectory_file.flush()

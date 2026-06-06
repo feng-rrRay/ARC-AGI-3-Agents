@@ -402,6 +402,7 @@ def _run_game(
     game_server_stream: ProcessStream | None = None
     log_file: io.TextIOWrapper | None = None
     trajectory_file: io.TextIOWrapper | None = None
+    observations_file: io.TextIOWrapper | None = None
     active_proc: subprocess.Popen | None = None
     active_stop_event: threading.Event | None = None
     active_stream_thread: threading.Thread | None = None
@@ -427,6 +428,9 @@ def _run_game(
 
         log_file = open(game_log_dir / "hermes.log", "w", encoding="utf-8")
         trajectory_file = open(game_log_dir / "trajectory.jsonl", "w", encoding="utf-8")
+        # Full per-step observations (get_game_state); images saved by the game
+        # server under game_log_dir/observations/ and referenced by path here.
+        observations_file = open(game_log_dir / "observations.jsonl", "w", encoding="utf-8")
 
         resume_session_id = ""
         consecutive_failures = 0
@@ -480,7 +484,7 @@ def _run_game(
             stream_thread = threading.Thread(
                 target=backend.run_stream_reader,
                 args=(proc.stdout, stop_event, log_file, metrics, server_url,
-                      trajectory_file),
+                      trajectory_file, observations_file),
                 daemon=True,
             )
             active_stream_thread = stream_thread
@@ -582,6 +586,8 @@ def _run_game(
             log_file.close()
         if trajectory_file:
             trajectory_file.close()
+        if observations_file:
+            observations_file.close()
 
     # Read scorecard written by the game server on shutdown
     scorecard_path = game_dir / "scorecard.json"
