@@ -45,6 +45,34 @@ FULL_TOOLSETS = [
     "code_execution",
 ]
 
+# Full-toolset code-execution guidance, kept as a directive markdown (appended to
+# SOUL.md in full mode) rather than inlined here.
+_FULL_TOOLSET_DIRECTIVE = (
+    Path(__file__).resolve().parents[1] / "directives" / "arc_full_toolset.md"
+)
+
+# ARC MCP tools to expose inside the Hermes code-execution sandbox (registered
+# tool names — what handle_function_call dispatches on).
+ARC_SANDBOX_TOOLS = (
+    "mcp_arc_agi_3_get_game_state",
+    "mcp_arc_agi_3_take_actions",
+)
+
+# Friendly stub functions appended to the sandbox's generated hermes_tools module
+# so code can call get_game_state()/take_actions(...) which RPC to the registered
+# MCP tools above. (_call is defined by the module's transport header.)
+_ARC_SANDBOX_STUBS = '''
+
+# --- ARC game tools (injected by hermes_wrapper) ---
+def get_game_state():
+    """Observe the ARC game; returns the observation payload dict."""
+    return _call("mcp_arc_agi_3_get_game_state", {})
+
+def take_actions(actions, reasoning=""):
+    """Apply ARC actions, e.g. actions=[{"name": "ACTION1"}]; returns the result dict."""
+    return _call("mcp_arc_agi_3_take_actions", {"actions": actions, "reasoning": reasoning})
+'''
+
 
 def _emit(event: dict) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
@@ -108,6 +136,37 @@ def _full_toolset_runtime_note() -> str:
     )
 
 
+def _enable_arc_tools_in_sandbox() -> bool:
+    """Expose the ARC MCP tools inside Hermes's execute_code sandbox.
+
+    Hermes only stubs an allow-list of built-ins (SANDBOX_ALLOWED_TOOLS) into the
+    sandbox; the dynamically-registered ARC MCP tools aren't included, so code
+    can't drive the game. We add the MCP tool names to the allow-list (so the RPC
+    server permits them — handle_function_call already routes by registered name)
+    and append friendly get_game_state()/take_actions() stubs to the generated
+    hermes_tools module. Runtime monkeypatch (no Hermes fork / image rebuild);
+    returns False if the sandbox module isn't importable.
+    """
+    try:
+        import tools.code_execution_tool as cet  # type: ignore[import]
+    except Exception as exc:
+        logger.warning("Could not patch code-exec sandbox for ARC tools: %s", exc)
+        return False
+
+    cet.SANDBOX_ALLOWED_TOOLS = frozenset(
+        set(cet.SANDBOX_ALLOWED_TOOLS) | set(ARC_SANDBOX_TOOLS)
+    )
+    _orig_generate = cet.generate_hermes_tools_module
+
+    def _generate_with_arc(enabled_tools, transport="uds"):
+        return _orig_generate(enabled_tools, transport) + _ARC_SANDBOX_STUBS
+
+    _generate_with_arc.__name__ = "generate_hermes_tools_module"
+    cet.generate_hermes_tools_module = _generate_with_arc
+    logger.info("Enabled ARC tools in execute_code sandbox: %s", list(ARC_SANDBOX_TOOLS))
+    return True
+
+
 def _build_initial_prompt(
     server_url: str,
     is_resume: bool,
@@ -166,7 +225,15 @@ def main() -> int:
     # persona (config.py _ensure_default_soul_md only seeds when SOUL.md is absent).
     directive_text = _read_text(args.directive_path)
     if directive_text.strip():
-        (hermes_home / "SOUL.md").write_text(directive_text, encoding="utf-8")
+        soul = directive_text.rstrip()
+        # In full toolset mode, append the code-execution directive markdown so the
+        # guidance is durable (survives context compaction) and lives next to the
+        # main directive rather than inline in code.
+        if _normalise_toolset_mode(args.toolset) == "full":
+            code_note = _read_text(_FULL_TOOLSET_DIRECTIVE)
+            if code_note.strip():
+                soul += "\n\n" + code_note.rstrip()
+        (hermes_home / "SOUL.md").write_text(soul, encoding="utf-8")
 
     # Resolve model / provider / api_key from args then env vars
     model    = args.model.strip()    or os.environ.get("HERMES_MODEL",    "").strip() or "gemini-3.1-pro-preview"
@@ -200,6 +267,10 @@ def main() -> int:
             "error": str(exc),
         })
         return 1
+
+    # In full toolset mode, let sandboxed code call the ARC game tools directly.
+    if toolset_mode == "full":
+        _enable_arc_tools_in_sandbox()
 
     session_db = SessionDB(hermes_home / "state.db")
     conversation_history = None

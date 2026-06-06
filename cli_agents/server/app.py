@@ -69,6 +69,7 @@ _tags: list[str] = []
 _run_dir: Path | None = None
 _recordings_dir: Path | None = None
 _observations_dir: Path | None = None  # logs/<run>/<game>/logs/observations/ (rendered PNGs)
+_state_file: Path | None = None        # <game>/scratch/arc_state/latest_frame.json (-> /workspace in-container)
 _scorecard_closed = False
 _scorecard_closing = False
 _scorecard_payload: dict[str, Any] | None = None
@@ -247,6 +248,78 @@ def _compact_names(names: list[str], head: int = 15, tail: int = 15) -> list[str
     return names[:head] + [f"...({omitted} more)..."] + names[-tail:]
 
 
+def _write_state_file(cached: dict[str, Any] | None, budget: int) -> None:
+    """Dump the machine-readable current frame to the mounted workspace.
+
+    FULL-toolset code execution (Hermes `execute_code`) cannot call the ARC MCP
+    tools and has no game state injected, so it would otherwise paste grids in as
+    string literals. Writing the raw frame here lets sandboxed code load live
+    state from /workspace/arc_state/latest_frame.json instead. Best-effort; never
+    raises into the request path. This file never enters the model's context.
+    """
+    if _state_file is None or cached is None:
+        return
+    frame = cached.get("frame") or []
+    try:
+        avail = [a.name for a in available_game_actions(cached.get("available_actions") or [])]
+    except Exception:
+        avail = []
+    payload = {
+        "state": cached.get("state"),
+        "levels_completed": cached.get("levels_completed"),
+        "win_levels": cached.get("win_levels"),
+        "available_actions": avail,
+        "current_grid": frame[-1] if frame else None,
+        "frame": frame,
+        "budget_remaining": budget,
+        "guid": cached.get("guid"),
+    }
+    try:
+        _state_file.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("could not write state file %s: %s", _state_file, exc)
+
+
+def _record_step(
+    pre_cached: dict[str, Any],
+    new_cached: dict[str, Any],
+    *,
+    action_name: str,
+    action_data: dict[str, Any] | None,
+    batch_id: str,
+    position: int,
+    total: int,
+    source: str,
+) -> None:
+    """Record one executed action's pre->post transition for the next
+    get_game_state, and advance _latest.
+
+    Shared by the take_actions step loop and the GAME_OVER auto-reset. The caller
+    holds _state_lock and has already run env.step + _convert_raw + decremented
+    _budget. The observe window is seeded with the pre-action frame as baseline
+    (index 0) the first time an action runs after a flush.
+    """
+    global _latest, _action_counter
+    if not _obs_window:
+        _obs_window.append(_ObsFrame(pre_cached))
+    pre_index = len(_obs_window) - 1
+    _obs_window.append(_ObsFrame(new_cached))
+    _action_counter += 1
+    _pending_obs.append(PendingActionObservation(
+        action_counter=_action_counter,
+        action_name=action_name,
+        action_data=action_data or {},
+        source=source,
+        batch_id=batch_id,
+        batch_position=position,
+        batch_total=total,
+        pre_frame_index=pre_index,
+        post_frame_index=len(_obs_window) - 1,
+        valid_frame=True,
+    ))
+    _latest = new_cached
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -296,6 +369,7 @@ async def mcp_get_game_state() -> JSONResponse:
                 logger.warning("could not write observation image %s: %s", fname, exc)
     payload["observe_index"] = observe_idx
     payload["screenshot_files"] = screenshot_files
+    _write_state_file(cached, _budget)  # keep the code-sandbox state file in sync
     return JSONResponse(payload)
 
 
@@ -390,28 +464,15 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
             bud = _budget
             if raw is not None:
                 new_cached = _convert_raw(raw)
-                # Record the per-action transition for the next get_game_state's
-                # OBSERVATIONS SINCE LAST QUERY section. The window is seeded with
-                # the pre-action frame as its baseline (index 0) the first time an
-                # action runs after a flush.
-                if not _obs_window:
-                    _obs_window.append(_ObsFrame(pre_cached))
-                pre_index = len(_obs_window) - 1
-                _obs_window.append(_ObsFrame(new_cached))
-                _action_counter += 1
-                _pending_obs.append(PendingActionObservation(
-                    action_counter=_action_counter,
+                _record_step(
+                    pre_cached, new_cached,
                     action_name=action.name,
                     action_data={k: v for k, v in data.items() if k != "game_id"},
-                    source="take_actions",
                     batch_id=batch_id,
-                    batch_position=step.position,
-                    batch_total=batch_total,
-                    pre_frame_index=pre_index,
-                    post_frame_index=len(_obs_window) - 1,
-                    valid_frame=True,
-                ))
-                _latest = new_cached
+                    position=step.position,
+                    total=batch_total,
+                    source="take_actions",
+                )
                 final_cached = new_cached
 
         prev_levels = applied[-1]["levels_completed"] if applied else cached["levels_completed"]
@@ -433,6 +494,38 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
         if done:
             break
 
+    # --- Force-recover from GAME_OVER (server-side auto-reset) ---
+    # GAME_OVER is recoverable, but agents waste actions probing a dead board and a
+    # post-GAME_OVER frame can report win_levels=0 (which would falsely trip
+    # /termination_condition). Reset immediately so the next observation is a fresh,
+    # playable board. Mirrors ContinualHarness.main()'s auto_reset on GAME_OVER.
+    auto_reset = False
+    if final_cached["state"] == GameState.GAME_OVER.name:
+        with _state_lock:
+            if _budget > 0 and not _scorecard_closed:
+                try:
+                    raw = env.step(GameAction.RESET, data={},
+                                   reasoning={"reasoning": "auto-reset after GAME_OVER"})
+                except Exception as exc:
+                    logger.error("auto-reset env.step failed: %s", exc)
+                    raw = None
+                if raw is not None:
+                    _budget -= 1
+                    new_cached = _convert_raw(raw)
+                    _record_step(
+                        final_cached, new_cached,
+                        action_name="RESET",
+                        action_data=None,
+                        batch_id=batch_id,
+                        position=batch_total + 1,
+                        total=batch_total + 1,
+                        source="auto_reset",
+                    )
+                    final_cached = new_cached
+                    auto_reset = True
+                    logger.info("Game %s: auto-reset after GAME_OVER (budget=%d)",
+                                _game_id, _budget)
+
     avail_names = [a.name for a in available_game_actions(final_cached["available_actions"])]
     state_name = final_cached["state"]
     done = (
@@ -446,6 +539,7 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
     # trajectory log; the agent re-observes the grid via get_game_state.
     applied_names = [a["name"] for a in applied]
     echo = _compact_names(applied_names)
+    _write_state_file(final_cached, _budget)  # refresh live state for the code sandbox
     return JSONResponse({
         "success": True,
         "applied_count": len(applied_names),
@@ -457,7 +551,13 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
         "available_actions": avail_names,
         "budget_remaining": _budget,
         "done": done,
-        "note": "Call get_game_state to observe the resulting grid.",
+        "auto_reset": auto_reset,
+        "note": (
+            "You hit GAME_OVER; the board was automatically reset — "
+            "call get_game_state and keep playing."
+            if auto_reset else
+            "Call get_game_state to observe the resulting grid."
+        ),
     })
 
 
@@ -478,7 +578,9 @@ async def termination_condition() -> JSONResponse:
     done = (
         state == GameState.WIN.name
         or bud <= 0
-        or (win_lvls is not None and levels >= win_lvls)
+        # win_lvls > 0 guards against the degenerate post-GAME_OVER frame that
+        # reports win_levels=0 (0 >= 0 would otherwise falsely terminate the run).
+        or (win_lvls is not None and win_lvls > 0 and levels >= win_lvls)
     )
     return JSONResponse({
         "condition_met": done,
@@ -631,7 +733,7 @@ def _signal_handler(signum: int, _frame: Any) -> None:
 
 def main() -> None:
     global _arc, _card_id, _env, _latest, _budget, _win_levels
-    global _game_id, _tags, _run_dir, _recordings_dir, _observations_dir
+    global _game_id, _tags, _run_dir, _recordings_dir, _observations_dir, _state_file
 
     logging.basicConfig(
         level=logging.DEBUG if os.environ.get("DEBUG") == "True" else logging.INFO,
@@ -665,6 +767,10 @@ def main() -> None:
         # Sits beside the host-written observations.jsonl under <game>/logs/.
         _observations_dir = _run_dir / "logs" / "observations"
         _observations_dir.mkdir(parents=True, exist_ok=True)
+        # scratch/ is bind-mounted to /workspace in the agent container, so the
+        # FULL-toolset code sandbox can read this live state file.
+        _state_file = _run_dir / "scratch" / "arc_state" / "latest_frame.json"
+        _state_file.parent.mkdir(parents=True, exist_ok=True)
 
     recordings_dir = args.recordings_dir or os.environ.get("ARC_RECORDINGS_DIR")
 
@@ -704,6 +810,7 @@ def main() -> None:
     _latest = _convert_raw(raw)
     _win_levels = _latest["win_levels"]
     _budget = ARC_MAX_ACTIONS
+    _write_state_file(_latest, _budget)  # seed the file before the first action
     logger.info("Game %s ready; budget=%d win_levels=%s", _game_id, _budget, _win_levels)
 
     atexit.register(_close_scorecard)
