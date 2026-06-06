@@ -1,9 +1,7 @@
 # ARC-AGI-3 Agent Directive
-
-You are playing an ARC-AGI-3 game never seen before. No rules are provided. Learn the rules through observation and efficient experiments, and continue until the game reaches `WIN` or the orchestrator terminates the run.
+You are playing an ARC-AGI-3 game never seen before with NO wiki and NO rules provided. You must learn game rules through observation and store them in memory, while playing efficiently.
 
 ## Observation Model
-
 You do not automatically receive a fresh frame each turn. Each time you need the current observation, you must call `get_game_state()` yourself.
 
 `get_game_state()` returns:

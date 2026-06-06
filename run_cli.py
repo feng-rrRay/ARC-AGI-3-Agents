@@ -91,8 +91,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-actions", type=int, default=5000,
                         help="Per-game ARC action budget (default: 5000)")
-    parser.add_argument("--max-turns", type=int, default=90,
-                        help="Max Hermes loop iterations per game (default: 90)")
+    parser.add_argument("--max-turns", type=int, default=5000,
+                        help="Max Hermes tool-calling iterations per session "
+                             "(maps to AIAgent max_iterations; default: 5000)")
     parser.add_argument("--operation-mode", default="online",
                         choices=["normal", "online", "offline"],
                         help="ARC operation mode (default: online)")

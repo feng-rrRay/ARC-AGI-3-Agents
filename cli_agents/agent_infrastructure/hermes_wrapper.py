@@ -20,7 +20,7 @@ Usage (inside container):
         --model gemini-3.1-pro-preview \
         --provider gemini \
         --api-key-env GEMINI_API_KEY \
-        --max-turns 90
+        --max-turns 5000
 """
 from __future__ import annotations
 
@@ -88,11 +88,12 @@ def _full_toolset_runtime_note() -> str:
 
 
 def _build_initial_prompt(
-    directive_text: str,
     server_url: str,
     is_resume: bool,
     toolset_mode: str,
 ) -> str:
+    # The full ARC directive is installed as SOUL.md (system prompt), so this
+    # opening user turn only carries runtime context + a kickoff to start acting.
     full_note = _full_toolset_runtime_note() if _normalise_toolset_mode(toolset_mode) == "full" else ""
     runtime_ctx = (
         "Runtime context:\n"
@@ -101,11 +102,8 @@ def _build_initial_prompt(
         "- Observe and act using only the two MCP tools: get_game_state and take_actions.\n"
         "- Do not wait for follow-up prompts; continue until WIN or external termination.\n"
     )
-    if is_resume:
-        return f"Continue the ARC-AGI-3 session.\n\n{runtime_ctx}{full_note}"
-    if directive_text.strip():
-        return f"{directive_text.rstrip()}{full_note}"
-    return f"Start the ARC-AGI-3 session.\n\n{runtime_ctx}{full_note}"
+    lead = "Continue the ARC-AGI-3 session." if is_resume else "Start the ARC-AGI-3 session."
+    return f"{lead}\n\n{runtime_ctx}{full_note}"
 
 
 def main() -> int:
@@ -118,7 +116,7 @@ def main() -> int:
     parser.add_argument("--provider",          default="")
     parser.add_argument("--base-url",          default="")
     parser.add_argument("--api-key-env",       default="")
-    parser.add_argument("--max-turns",         type=int, default=90)
+    parser.add_argument("--max-turns",         type=int, default=5000)
     parser.add_argument("--resume-session-id", default="")
     parser.add_argument(
         "--toolset",
@@ -137,6 +135,17 @@ def main() -> int:
     hermes_home.mkdir(parents=True, exist_ok=True)
     os.environ["HERMES_HOME"] = str(hermes_home)
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+    # Install the ARC directive as Hermes's SOUL.md (identity / system prompt).
+    # Hermes loads HERMES_HOME/SOUL.md into the cache-stable `stable` layer of the
+    # system prompt (agent/system_prompt.py build_system_prompt_parts -> load_soul_md),
+    # so unlike a first user message it SURVIVES context compaction and is present
+    # on every relaunch/resume. Written every launch (idempotent overwrite) so the
+    # directive stays in sync; this also pre-empts Hermes seeding its default
+    # persona (config.py _ensure_default_soul_md only seeds when SOUL.md is absent).
+    directive_text = _read_text(args.directive_path)
+    if directive_text.strip():
+        (hermes_home / "SOUL.md").write_text(directive_text, encoding="utf-8")
 
     # Resolve model / provider / api_key from args then env vars
     model    = args.model.strip()    or os.environ.get("HERMES_MODEL",    "").strip() or "gemini-3.1-pro-preview"
@@ -179,9 +188,10 @@ def main() -> int:
         except Exception:
             conversation_history = None
 
-    directive_text = _read_text(args.directive_path)
+    # The directive is the SOUL.md system prompt now (see above), so the opening
+    # user turn is just a short kickoff — no need to duplicate ~4.6KB of directive
+    # into the conversation on every (re)launch.
     user_message = _build_initial_prompt(
-        directive_text,
         args.server_url,
         is_resume=bool(resume_session_id and conversation_history),
         toolset_mode=toolset_mode,
@@ -322,6 +332,8 @@ def main() -> int:
     try:
         result = agent.run_conversation(
             user_message=user_message,
+            # Directive is installed as SOUL.md (system prompt) in main(), so it is
+            # not passed as system_message here.
             conversation_history=conversation_history,
             persist_user_message=user_message,
         ) or {}

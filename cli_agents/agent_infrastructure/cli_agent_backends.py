@@ -148,7 +148,7 @@ class HermesCliBackend:
         model: str = "gemini-3.1-pro-preview",
         provider: str = "gemini",
         api_key_env: str = "GEMINI_API_KEY",
-        max_turns: int = 90,
+        max_turns: int = 5000,
         resume_session_id: str = "",
         toolset: str = "min",
     ) -> list[str]:
