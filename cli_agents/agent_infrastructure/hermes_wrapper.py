@@ -167,6 +167,70 @@ def _enable_arc_tools_in_sandbox() -> bool:
     return True
 
 
+def _extend_rate_limit_resilience(agent: Any) -> None:
+    """Make a Gemini 429 / rate limit (e.g. the 8M-tokens-per-minute cap) survivable.
+
+    A 429 is transient — it clears once the per-minute quota window resets — so we
+    want the in-session API retry loop to be patient instead of giving up after a
+    few seconds. Two knobs, both env-overridable:
+
+      * ``agent._api_max_retries`` — how many times each model API call is retried
+        before ``run_conversation`` returns ``failed=True``. Hermes defaults to 3
+        (~20s total backoff via base=2s, cap=60s), far too short for a per-minute
+        token quota to reset. We raise it (default 8) so the retry loop rides
+        through a minutes-long throttle.
+      * ``agent.conversation_loop.jittered_backoff`` — raise the per-retry wait
+        floor/cap so early retries don't burn out in 2-12s. Guarded monkeypatch
+        (no-op if Hermes internals differ), same runtime-patch pattern as
+        ``_enable_arc_tools_in_sandbox``. Set HERMES_RATE_LIMIT_BACKOFF_BASE=0 to
+        leave Hermes's native backoff untouched.
+
+    When the retries are still exhausted, ``run_conversation`` returns
+    ``failure_reason="rate_limit"``; the host orchestrator treats that as
+    non-fatal and resumes the session rather than ending it.
+    """
+    # 1) More attempts.
+    try:
+        retries = int(os.environ.get("HERMES_API_MAX_RETRIES", "8"))
+    except ValueError:
+        retries = 8
+    retries = max(retries, 1)
+    if hasattr(agent, "_api_max_retries"):
+        agent._api_max_retries = retries
+        logger.info("Rate-limit resilience: api_max_retries=%d", retries)
+    else:
+        logger.warning("agent._api_max_retries not present; cannot raise retry count")
+
+    # 2) Longer waits between attempts.
+    try:
+        floor = float(os.environ.get("HERMES_RATE_LIMIT_BACKOFF_BASE", "10"))
+        cap = float(os.environ.get("HERMES_RATE_LIMIT_BACKOFF_MAX", "90"))
+    except ValueError:
+        floor, cap = 10.0, 90.0
+    if floor <= 0:
+        return
+    try:
+        import importlib
+
+        cl = importlib.import_module("agent.conversation_loop")
+        _orig_backoff = cl.jittered_backoff
+
+        def _patient_backoff(attempt, *, base_delay=5.0, max_delay=120.0, jitter_ratio=0.5):
+            # Only ever raise the wait, never shorten Hermes's own choice.
+            return _orig_backoff(
+                attempt,
+                base_delay=max(base_delay, floor),
+                max_delay=max(max_delay, cap),
+                jitter_ratio=jitter_ratio,
+            )
+
+        _patient_backoff.__name__ = "jittered_backoff"
+        cl.jittered_backoff = _patient_backoff
+        logger.info("Rate-limit resilience: retry backoff floor=%.0fs cap=%.0fs", floor, cap)
+    except Exception as exc:
+        logger.warning("Could not extend retry backoff for rate limits: %s", exc)
+
+
 def _build_initial_prompt(
     server_url: str,
     is_resume: bool,
@@ -440,6 +504,10 @@ def main() -> int:
         pass_session_id=True,
     )
 
+    # Be patient with Gemini 429 / per-minute token throttling: more in-session
+    # retries + longer backoff before run_conversation gives up (see helper).
+    _extend_rate_limit_resilience(agent)
+
     agent_tool_names = [
         (t.get("function", {}) if isinstance(t, dict) else {}).get("name", "")
         for t in (agent.tools or [])
@@ -498,6 +566,9 @@ def main() -> int:
         "model": agent.model,
         "is_error": is_error,
         "error": str(result.get("error") or ""),
+        # Classified reason from conversation_loop (e.g. "rate_limit", "billing").
+        # The host uses "rate_limit" to resume rather than count a hard failure.
+        "failure_reason": (result.get("failure_reason") if isinstance(result, dict) else None),
         "content": result.get("final_response") if isinstance(result, dict) else None,
         "duration_ms": duration_ms,
     })

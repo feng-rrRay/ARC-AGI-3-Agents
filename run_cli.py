@@ -65,8 +65,13 @@ DEFAULT_DIRECTIVE = str(
     _REPO_ROOT / "cli_agents/directives/arc_directive.md"
 )
 DEFAULT_MCP_PORT_OFFSET = 2  # MCP port = game port + 2
-DEFAULT_MAX_ACTIONS = 50000
+DEFAULT_MAX_ACTIONS = 10000
 MAX_CONSECUTIVE_FAILURES = 3  # stop relaunching a game after this many failed sessions
+# A 429 / tokens-per-minute throttle is transient, not a failure: resume the
+# session after a backoff (so the quota window can reset) instead of counting it
+# toward MAX_CONSECUTIVE_FAILURES.
+RATE_LIMIT_BACKOFF_BASE = 30   # seconds before the first rate-limit resume
+RATE_LIMIT_BACKOFF_MAX  = 120  # cap for the escalating rate-limit backoff
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +573,7 @@ def _run_game(
 
         resume_session_id = ""
         consecutive_failures = 0
+        rate_limit_relaunches = 0
 
         # --- Outer relaunch loop ---
         while True:
@@ -688,6 +694,30 @@ def _run_game(
                 logger.error("Game %s: agent loaded 0 tools — aborting "
                              "(check MCP proxy reachability / config).", game_id)
                 break
+            if metrics.rate_limited:
+                # Transient provider throttle (Gemini 429 / 8M-tokens-per-minute
+                # cap). Not fatal — wait for the quota window to reset, then
+                # resume the same Hermes session. Reset the failure counter so a
+                # throttle never trips the consecutive-failure abort.
+                rate_limit_relaunches += 1
+                consecutive_failures = 0
+                backoff = min(
+                    RATE_LIMIT_BACKOFF_BASE * (2 ** min(rate_limit_relaunches - 1, 3)),
+                    RATE_LIMIT_BACKOFF_MAX,
+                )
+                logger.warning(
+                    "Game %s: session %d ended on API rate limit (%s); not "
+                    "counted as a failure — waiting %ds for the quota window to "
+                    "reset, then resuming (rate-limit relaunch #%d).",
+                    game_id, sessions_run,
+                    metrics.last_failure_reason or "rate_limit",
+                    backoff, rate_limit_relaunches,
+                )
+                if shutdown_event.wait(backoff):
+                    termination_reason = "interrupted"
+                    result["interrupted"] = True
+                    break
+                continue
             if rc not in (0, None):
                 consecutive_failures += 1
                 logger.warning("Game %s: session %d exited rc=%s (failure %d/%d)",
@@ -698,6 +728,7 @@ def _run_game(
                     break
             else:
                 consecutive_failures = 0
+                rate_limit_relaunches = 0
                 logger.info("Game %s: session %d ended cleanly but game not "
                             "terminal; relaunching (resume).", game_id, sessions_run)
             # loop → relaunch

@@ -19,6 +19,21 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# 429 / rate-limit signatures used to recognise a transient throttle when the
+# structured failure_reason isn't propagated (e.g. an uncaught provider error
+# surfaced via an "error" event). "quota" is intentionally excluded so a hard
+# billing/credit exhaustion is not mistaken for a transient per-minute throttle.
+_RATE_LIMIT_PATTERNS = (
+    "429", "resource_exhausted", "rate limit", "rate-limit",
+    "ratelimit", "too many requests",
+)
+
+
+def _looks_rate_limited(text: str) -> bool:
+    t = (text or "").lower()
+    return any(p in t for p in _RATE_LIMIT_PATTERNS)
+
+
 # ---------------------------------------------------------------------------
 # Session metrics (thin container; extended in phase-2 parity pass)
 # ---------------------------------------------------------------------------
@@ -32,6 +47,8 @@ class CliSessionMetrics:
     last_error: str = ""
     session_id: str = ""          # Hermes session id (for resume across relaunches)
     tool_count: int = 0           # number of MCP tools the agent loaded
+    rate_limited: bool = False    # last session ended on a transient 429 / rate limit
+    last_failure_reason: str = "" # classified failure_reason from the result event
 
 
 @dataclass
@@ -285,9 +302,21 @@ class HermesCliBackend:
             metrics.total_turns    += int(event.get("num_turns") or 0)
             metrics.is_error        = bool(event.get("is_error"))
             metrics.last_error      = str(event.get("error") or "")
+            # A 429 / tokens-per-minute throttle surfaces as failure_reason=
+            # "rate_limit" (Hermes classifies it before giving up). It is
+            # transient, not fatal: the orchestrator resumes the session rather
+            # than counting it as a hard failure. Fall back to text matching for
+            # the rare case the reason isn't propagated.
+            reason = str(event.get("failure_reason") or "")
+            metrics.last_failure_reason = reason
+            if reason == "rate_limit" or _looks_rate_limited(metrics.last_error):
+                metrics.rate_limited = True
         elif etype == "error" and metrics:
             msg = str(event.get("message") or "")
+            err = str(event.get("error") or "")
             if "auth" in msg.lower() or "unauthorized" in msg.lower():
                 metrics.auth_fatal_error = True
-            metrics.last_error = msg
+            if _looks_rate_limited(msg) or _looks_rate_limited(err):
+                metrics.rate_limited = True
+            metrics.last_error = msg or err
         # Phase-2: thinking / tool_use events forwarded to the game server
