@@ -99,10 +99,12 @@ def take_actions(actions: list[dict[str, Any]], reasoning: str = "") -> dict[str
 
     Actions are applied in sequence and stop early on the first invalid action,
     budget exhaustion, level change, or terminal state. After calling this tool,
-    call get_game_state to observe the result.
+    call get_game_state to observe the result. RESET is not accepted here; the
+    game server performs lifecycle resets automatically before the first
+    playable frame and after GAME_OVER.
 
     Each action item must have:
-      - name (str): one of the available action names (ACTION1..ACTION7, RESET)
+      - name (str): one of the available gameplay action names (ACTION1..ACTION7)
       - reasoning (str): brief explanation of why this action (required)
       - x, y (int, 0..63): required only for ACTION6 (click), x=column y=row
 

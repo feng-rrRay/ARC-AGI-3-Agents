@@ -69,7 +69,7 @@ def get_game_state():
     return _call("mcp_arc_agi_3_get_game_state", {})
 
 def take_actions(actions, reasoning=""):
-    """Apply ARC actions, e.g. actions=[{"name": "ACTION1"}]; returns the result dict."""
+    """Apply ARC gameplay actions; RESET is server-owned and rejected here."""
     return _call("mcp_arc_agi_3_take_actions", {"actions": actions, "reasoning": reasoning})
 '''
 
@@ -456,6 +456,7 @@ def main() -> int:
                 ),
                 "current_grid": payload.get("current_grid"),
                 "screenshot_files": payload.get("screenshot_files"),
+                "auto_reset": payload.get("auto_reset"),
             })
         elif tool == "take_actions":
             # The agent's action batch: emit the structured outcome (what applied
@@ -478,6 +479,8 @@ def main() -> int:
                 "available_actions": payload.get("available_actions"),
                 "budget_remaining": payload.get("budget_remaining"),
                 "done": payload.get("done"),
+                "auto_reset": payload.get("auto_reset"),
+                "auto_reset_error": payload.get("auto_reset_error"),
                 "error": payload.get("error"),
             })
         else:

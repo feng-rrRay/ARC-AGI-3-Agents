@@ -45,7 +45,7 @@ from agents.templates.continual_harness.context import (
     pretty_print_grid,
 )
 from agents.templates.continual_harness.helpers import (
-    _action_from_name,
+    RejectedStep,
     available_game_actions,
     describe_action,
     grid_to_image,
@@ -91,6 +91,11 @@ UPSCALE_FACTOR = int(os.environ.get("ARC_IMAGE_UPSCALE", "1"))
 # the observe window; older ones collapse to a one-line summary (the grid count
 # is separately capped by context.MAX_OBSERVATION_TEXT_GRIDS=4).
 MAX_OBSERVATION_DETAIL_BLOCKS = 15
+AUTO_RESET_STATES = {GameState.NOT_PLAYED.name, GameState.GAME_OVER.name}
+RESET_REJECT_REASON = (
+    "RESET is managed by the server/harness. Call get_game_state; the server "
+    "automatically resets before the first playable frame and after GAME_OVER."
+)
 
 app = FastAPI(title="arc-game-server")
 
@@ -320,6 +325,114 @@ def _record_step(
     _latest = new_cached
 
 
+def _mint_batch_id_locked() -> str:
+    """Return a new batch id. Caller must hold _state_lock."""
+    global _batch_counter
+    _batch_counter += 1
+    return f"b_{_batch_counter:04d}"
+
+
+def _server_auto_reset_locked(
+    *,
+    reason: str,
+    source: str,
+    batch_id: str | None = None,
+    position: int = 1,
+    total: int = 1,
+) -> tuple[dict[str, Any] | None, bool, str | None]:
+    """Run a server-owned RESET and record it. Caller must hold _state_lock."""
+    global _budget
+
+    cached = _latest
+    env = _env
+    if cached is None or env is None:
+        return cached, False, "environment not initialised"
+    if _scorecard_closed:
+        return cached, False, "run already finished"
+    if _budget <= 0:
+        return cached, False, "action budget exhausted"
+
+    batch_id = batch_id or _mint_batch_id_locked()
+    try:
+        raw = env.step(
+            GameAction.RESET,
+            data={},
+            reasoning={"reasoning": reason},
+        )
+    except Exception as exc:
+        logger.error("%s env.step RESET failed: %s", source, exc)
+        return cached, False, f"auto-reset failed: {exc}"
+
+    if raw is None:
+        return cached, False, "auto-reset returned no frame"
+
+    _budget -= 1
+    new_cached = _convert_raw(raw)
+    _record_step(
+        cached,
+        new_cached,
+        action_name="RESET",
+        action_data=None,
+        batch_id=batch_id,
+        position=position,
+        total=total,
+        source=source,
+    )
+    logger.info("Game %s: %s (budget=%d)", _game_id, reason, _budget)
+    return new_cached, True, None
+
+
+def _auto_reset_if_needed_locked(
+    *,
+    reason: str,
+    source: str = "auto_reset",
+) -> tuple[dict[str, Any] | None, bool, str | None]:
+    """Reset automatically from non-playable lifecycle states."""
+    cached = _latest
+    if cached is None:
+        return None, False, "environment not initialised"
+    if cached["state"] not in AUTO_RESET_STATES:
+        return cached, False, None
+    return _server_auto_reset_locked(reason=reason, source=source)
+
+
+def _normalise_action_list(raw_actions: Any) -> Any:
+    """Normalize legacy action objects without turning non-lists into lists."""
+    if not isinstance(raw_actions, list):
+        return raw_actions
+
+    normalised: list[Any] = []
+    for item in raw_actions:
+        if isinstance(item, dict) and "action" in item and "name" not in item:
+            item = {**item, "name": item["action"]}
+        normalised.append(item)
+    return normalised
+
+
+def _validate_gameplay_action_sequence(
+    raw_actions: Any,
+    available_actions: list[GameAction],
+) -> tuple[Any, list[RejectedStep]]:
+    """Validate model-supplied actions while reserving RESET for the server."""
+    if not isinstance(raw_actions, list):
+        return validate_action_sequence(raw_actions, available_actions)
+
+    for index, item in enumerate(raw_actions, start=1):
+        if (
+            isinstance(item, dict)
+            and str(item.get("name", "")).upper() == GameAction.RESET.name
+        ):
+            prefix = raw_actions[: index - 1]
+            steps, rejected = validate_action_sequence(prefix, available_actions)
+            if rejected:
+                return steps, rejected
+            return steps, [
+                RejectedStep(raw=dict(item), reason=RESET_REJECT_REASON, position=index)
+            ]
+
+    return validate_action_sequence(raw_actions, available_actions)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -332,12 +445,22 @@ async def health() -> dict[str, str]:
 @app.post("/mcp/get_game_state")
 async def mcp_get_game_state() -> JSONResponse:
     global _pending_obs, _obs_window, _observe_counter
+    auto_reset = False
+    auto_reset_error: str | None = None
     with _state_lock:
         cached = _latest
         if cached is None:
             return JSONResponse(
                 {"success": False, "error": "environment not initialised"}
             )
+        if cached["state"] in AUTO_RESET_STATES:
+            cached, auto_reset, auto_reset_error = _auto_reset_if_needed_locked(
+                reason="auto-reset before playable observation",
+            )
+            if cached is None:
+                return JSONResponse(
+                    {"success": False, "error": "environment not initialised"}
+                )
         # Snapshot the observe window, then flush so the next take_actions starts
         # a fresh window seeded with the current frame as its baseline. Rendering
         # (diffing + PNG encoding) happens outside the lock on the captured refs.
@@ -349,6 +472,15 @@ async def mcp_get_game_state() -> JSONResponse:
         _observe_counter += 1
         observe_idx = _observe_counter
     payload = _frame_payload(cached, pending, window, latest_adapter)
+    if auto_reset:
+        payload["auto_reset"] = True
+        payload["note"] = (
+            "The server automatically reset the game before this observation; "
+            "use the current playable state."
+        )
+    elif auto_reset_error:
+        payload["auto_reset"] = False
+        payload["auto_reset_error"] = auto_reset_error
 
     # Persist each rendered grid PNG with a step-sequenced, navigable name
     # (obs<NNNN>_<seq>_<label>.png) so the trace links to readable files instead
@@ -387,16 +519,60 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
     raw_actions = body.get("actions", [])
     outer_reasoning = body.get("reasoning", "")
 
+    initial_auto_reset = False
+    initial_auto_reset_error: str | None = None
     with _state_lock:
         cached = _latest
         bud = _budget
         env = _env
         closed = _scorecard_closed
+        if cached is not None and cached["state"] in AUTO_RESET_STATES:
+            cached, initial_auto_reset, initial_auto_reset_error = (
+                _auto_reset_if_needed_locked(
+                    reason="auto-reset before playable action request",
+                )
+            )
+            bud = _budget
 
     if cached is None or env is None:
         return JSONResponse({"success": False, "error": "environment not initialised"})
     if closed:
         return JSONResponse({"success": False, "error": "run already finished"})
+    if initial_auto_reset:
+        avail_names = [
+            a.name for a in available_game_actions(cached["available_actions"])
+        ]
+        _write_state_file(cached, _budget)
+        return JSONResponse({
+            "success": True,
+            "applied_count": 0,
+            "applied_actions": [],
+            "levels_gained": 0,
+            "rejected": [],
+            "state": cached["state"],
+            "levels_completed": cached["levels_completed"],
+            "available_actions": avail_names,
+            "budget_remaining": _budget,
+            "done": False,
+            "auto_reset": True,
+            "note": (
+                "The server automatically reset to a playable frame; no "
+                "requested actions were applied. Call get_game_state before "
+                "choosing the next action."
+            ),
+        })
+    if initial_auto_reset_error and cached["state"] in AUTO_RESET_STATES:
+        return JSONResponse({
+            "success": False,
+            "error": initial_auto_reset_error,
+            "state": cached["state"],
+            "levels_completed": cached["levels_completed"],
+            "available_actions": [
+                a.name for a in available_game_actions(cached["available_actions"])
+            ],
+            "budget_remaining": bud,
+            "done": bud <= 0,
+        })
     if bud <= 0:
         return JSONResponse({
             "success": False,
@@ -409,24 +585,13 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
             "done": True,
         })
 
-    # Normalize "action" key → "name" so validate_action_sequence works
-    normalised: list[Any] = []
-    for item in raw_actions:
-        if isinstance(item, dict) and "action" in item and "name" not in item:
-            item = {**item, "name": item.pop("action")}
-        normalised.append(item)
-
+    # Normalize "action" key -> "name" so validate_action_sequence works.
+    normalised = _normalise_action_list(raw_actions)
     avail_actions = available_game_actions(cached["available_actions"])
-    # Include RESET in the valid set for take_actions
-    all_actions = list(avail_actions)
-    if GameAction.RESET not in all_actions:
-        all_actions.append(GameAction.RESET)
-
-    steps, rejected = validate_action_sequence(normalised, all_actions)
+    steps, rejected = _validate_gameplay_action_sequence(normalised, avail_actions)
 
     with _state_lock:
-        _batch_counter += 1
-        batch_id = f"b_{_batch_counter:04d}"
+        batch_id = _mint_batch_id_locked()
     batch_total = len(steps)
 
     applied: list[dict[str, Any]] = []
@@ -500,31 +665,18 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
     # /termination_condition). Reset immediately so the next observation is a fresh,
     # playable board. Mirrors ContinualHarness.main()'s auto_reset on GAME_OVER.
     auto_reset = False
+    auto_reset_error: str | None = None
     if final_cached["state"] == GameState.GAME_OVER.name:
         with _state_lock:
-            if _budget > 0 and not _scorecard_closed:
-                try:
-                    raw = env.step(GameAction.RESET, data={},
-                                   reasoning={"reasoning": "auto-reset after GAME_OVER"})
-                except Exception as exc:
-                    logger.error("auto-reset env.step failed: %s", exc)
-                    raw = None
-                if raw is not None:
-                    _budget -= 1
-                    new_cached = _convert_raw(raw)
-                    _record_step(
-                        final_cached, new_cached,
-                        action_name="RESET",
-                        action_data=None,
-                        batch_id=batch_id,
-                        position=batch_total + 1,
-                        total=batch_total + 1,
-                        source="auto_reset",
-                    )
-                    final_cached = new_cached
-                    auto_reset = True
-                    logger.info("Game %s: auto-reset after GAME_OVER (budget=%d)",
-                                _game_id, _budget)
+            final_cached, auto_reset, auto_reset_error = _server_auto_reset_locked(
+                reason="auto-reset after GAME_OVER",
+                source="auto_reset",
+                batch_id=batch_id,
+                position=batch_total + 1,
+                total=batch_total + 1,
+            )
+            if final_cached is None:
+                final_cached = cached
 
     avail_names = [a.name for a in available_game_actions(final_cached["available_actions"])]
     state_name = final_cached["state"]
@@ -552,6 +704,7 @@ async def mcp_take_actions(request: Request) -> JSONResponse:
         "budget_remaining": _budget,
         "done": done,
         "auto_reset": auto_reset,
+        "auto_reset_error": auto_reset_error,
         "note": (
             "You hit GAME_OVER; the board was automatically reset — "
             "call get_game_state and keep playing."
@@ -810,6 +963,17 @@ def main() -> None:
     _latest = _convert_raw(raw)
     _win_levels = _latest["win_levels"]
     _budget = ARC_MAX_ACTIONS
+    if _latest["state"] == GameState.NOT_PLAYED.name:
+        with _state_lock:
+            reset_cached, did_reset, reset_error = _server_auto_reset_locked(
+                reason="auto-reset before first playable frame",
+                source="auto_reset",
+            )
+            if did_reset and reset_cached is not None:
+                _latest = reset_cached
+                _win_levels = _latest["win_levels"]
+            elif reset_error:
+                logger.warning("Initial auto-reset skipped: %s", reset_error)
     _write_state_file(_latest, _budget)  # seed the file before the first action
     logger.info("Game %s ready; budget=%d win_levels=%s", _game_id, _budget, _win_levels)
 

@@ -49,6 +49,8 @@ Action key:
 
 Only call `ACTION1` through `ACTION7` when listed in the latest `available_actions`; unavailable actions are rejected. Keep action lists short: 1-4 actions, and prefer 1 action when the next state is hard to predict. Long sequences are risky because one wrong assumption can waste every later action in the batch. If the game reaches a terminal state, a level transition happens, or the action budget is exhausted, later actions in the batch may be skipped.
 
+Do not call `RESET`. The game server owns lifecycle resets and automatically resets before the first playable frame and after `GAME_OVER`; `take_actions` rejects `RESET`.
+
 Example:
 ```json
 {

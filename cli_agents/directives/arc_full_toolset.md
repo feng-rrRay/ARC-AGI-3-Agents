@@ -26,12 +26,13 @@ obs = get_game_state()
 
 - `take_actions(actions=[...], reasoning="")` returns a dict: `applied_count`, `applied_actions`, `state`, `levels_completed`, `available_actions`, `budget_remaining`, `done`, `rejected`.
 - `get_game_state()` returns the rendered observation payload (the same as the tool). For raw integer grids in code, prefer the state file above — it carries `current_grid`/`frame` as arrays.
+- `RESET` is not accepted by `take_actions`; the game server automatically resets before the first playable frame and after `GAME_OVER`.
 
 ### How to use code execution
 - Use `execute_code` for analysis: parse grids, identify objects, simulate routes offline, compute candidate paths, and print the proposed action list for review.
 - Do not fire long scored action sequences from `execute_code`. If code computes a path, return/print the path, then execute it with the top-level `take_actions` tool in small batches.
 - Inside `execute_code`, call `take_actions()` only for minimal probes: normally 1 action, at most 2 actions in one call. Never use loops, list multiplication, or comprehensions to generate repeated scored actions there.
-- Never use `execute_code` to drain fuel, waste turns, force a reset, or run "move until terminal" loops. Resets and long plans consume the real budget and must be explicit top-level decisions.
+- Never use `execute_code` to drain fuel, waste turns, force a reset, or run "move until terminal" loops. Resets are server-owned lifecycle events, and long plans consume the real budget.
 - For longer plans, take 1–4 actions at a time with the top-level `take_actions` tool so you stay responsive to new state.
 - After any `take_actions` (from code or as a tool), re-read the state file (it refreshes on every action) or call `get_game_state()` before assuming the grid.
 - A level transition or terminal state makes a precomputed plan stale: check `resp["done"]` and `resp["levels_completed"]` after each batch and stop if they change.
