@@ -9,7 +9,7 @@ description = "ARC-AGI-3-Agents"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "arc-agi>=0.9.1",
+    "arc-agi>=0.9.8",
     "dotenv>=0.9.9",
     "google-genai>=1.0.0",
     "langchain[openai]>=0.3.27",

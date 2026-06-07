@@ -372,8 +372,28 @@ def _check_termination(server_url: str) -> dict[str, Any]:
         return {"condition_met": False, "error": str(exc)}
 
 
+# Games run in parallel (ThreadPoolExecutor); on batch shutdown every game's
+# finally block calls _close_game_scorecard at once, so all POST
+# /api/scorecard/close simultaneously and the API throttles the burst with
+# transient 404s. Serialize the closes so each starts at least
+# _CLOSE_STAGGER_SECONDS after the previous one.
+_CLOSE_STAGGER_SECONDS = 1.0
+_close_stagger_gate = threading.Lock()
+_close_last_started = 0.0
+
+
+def _stagger_before_close() -> None:
+    global _close_last_started
+    with _close_stagger_gate:
+        wait = _CLOSE_STAGGER_SECONDS - (time.monotonic() - _close_last_started)
+        if wait > 0:
+            time.sleep(wait)
+        _close_last_started = time.monotonic()
+
+
 def _close_game_scorecard(server_url: str, game_id: str) -> dict[str, Any] | None:
     import requests as _req
+    _stagger_before_close()
     try:
         r = _req.post(f"{server_url}/close_scorecard", timeout=60)
         if r.status_code != 200:

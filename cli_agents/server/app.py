@@ -17,13 +17,16 @@ import io
 import json
 import logging
 import os
+import random
 import shutil
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
+import requests
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -810,6 +813,44 @@ def _unique_recording_target(target: Path, card_id: str) -> Path:
         index += 1
 
 
+# HTTP statuses worth retrying on scorecard close. 404 is included because a
+# concurrent batch shutdown makes many games POST /api/scorecard/close at the
+# same instant; the API throttles the burst and returns a *transient* 404 for
+# some (observed: a card that 404s on one attempt closes fine ~100ms later).
+_CLOSE_RETRY_STATUSES = frozenset({404, 408, 429, 500, 502, 503, 504})
+
+
+def _close_scorecard_with_retry(arc: Any, card_id: str, attempts: int = 6) -> Any:
+    """Close the scorecard, retrying transient failures with backoff + jitter.
+
+    Backoff is 1,2,4,8,16s (capped) plus 0-1s jitter. The jitter desynchronizes
+    the games that all close at once so their retries land outside the same
+    throttle window. Worst-case ~31s, within run_cli's 60s /close_scorecard
+    timeout. Non-transient errors (e.g. 401/403) are re-raised immediately.
+    """
+    for attempt in range(attempts):
+        try:
+            return arc.close_scorecard(card_id)
+        except Exception as exc:  # noqa: BLE001 - inspect status, then decide
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if isinstance(exc, requests.exceptions.HTTPError):
+                transient = status in _CLOSE_RETRY_STATUSES
+            elif isinstance(exc, requests.exceptions.RequestException):
+                transient = True  # connection reset / timeout
+            else:
+                transient = False
+            if not transient or attempt == attempts - 1:
+                raise
+            delay = min(2 ** attempt, 16) + random.uniform(0, 1)
+            logger.warning(
+                "close_scorecard transient failure (status=%s, attempt %d/%d); "
+                "retrying in %.1fs (card_id=%s)",
+                status, attempt + 1, attempts, delay, card_id,
+            )
+            time.sleep(delay)
+    return None  # unreachable
+
+
 def _close_scorecard() -> dict[str, Any] | None:
     global _scorecard_closed, _scorecard_closing, _scorecard_payload
     with _state_lock:
@@ -826,7 +867,7 @@ def _close_scorecard() -> dict[str, Any] | None:
         recordings_dir = _recordings_dir
 
     try:
-        scorecard = arc.close_scorecard(card_id)
+        scorecard = _close_scorecard_with_retry(arc, card_id)
         if scorecard is None:
             logger.warning("close_scorecard returned None (card_id=%s)", card_id)
             return None
