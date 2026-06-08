@@ -1,13 +1,12 @@
 """ARC-AGI-3 Hermes evaluation orchestrator.
 
 Mirrors run_cli.py from sethkarten/continual-harness, adapted for ARC-AGI-3.
-Starts one MCP proxy (stateless, shared across games), then loops over the
-requested game IDs: per game it starts the ARC game server, launches the
-Hermes container, monitors the termination condition, and collects the
-per-game scorecard. Results are aggregated into logs/<run_id>/summary.json.
+Launches one parallel worker per game. Each worker owns its own ARC game server,
+MCP proxy, Hermes container, ports, logs, and per-game scorecard. Results are
+aggregated into logs/<run_id>/summary.json.
 
 Usage:
-    python run_cli.py --game <game_id1>[,<game_id2>,...] [options]
+    python run_cli.py [--game <game_id1>[,<game_id2>,...]] [options]
 
 Example:
     python run_cli.py --game my_game --build --model gemini-3.1-pro-preview
@@ -15,6 +14,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import io
 import json
 import logging
@@ -47,11 +47,31 @@ from cli_agents.agent_infrastructure.cli_agent_backends import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+SCHEME = os.environ.get("SCHEME", "http")
+HOST = os.environ.get("HOST", "localhost")
+PORT = os.environ.get("PORT", 8001)
+if (SCHEME == "http" and str(PORT) == "80") or (
+    SCHEME == "https" and str(PORT) == "443"
+):
+    ROOT_URL = f"{SCHEME}://{HOST}"
+else:
+    ROOT_URL = f"{SCHEME}://{HOST}:{PORT}"
+HEADERS = {
+    "X-API-Key": os.getenv("ARC_API_KEY", ""),
+    "Accept": "application/json",
+}
+
 DEFAULT_DIRECTIVE = str(
     _REPO_ROOT / "cli_agents/directives/arc_directive.md"
 )
 DEFAULT_MCP_PORT_OFFSET = 2  # MCP port = game port + 2
+DEFAULT_MAX_ACTIONS = 10000
 MAX_CONSECUTIVE_FAILURES = 3  # stop relaunching a game after this many failed sessions
+# A 429 / tokens-per-minute throttle is transient, not a failure: resume the
+# session after a backoff (so the quota window can reset) instead of counting it
+# toward MAX_CONSECUTIVE_FAILURES.
+RATE_LIMIT_BACKOFF_BASE = 30   # seconds before the first rate-limit resume
+RATE_LIMIT_BACKOFF_MAX  = 120  # cap for the escalating rate-limit backoff
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +81,11 @@ MAX_CONSECUTIVE_FAILURES = 3  # stop relaunching a game after this many failed s
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ARC-AGI-3 Hermes evaluation")
     parser.add_argument(
-        "--game", required=True,
-        help="Comma-separated game_id(s) to play (e.g. game1,game2)",
+        "--game", default="",
+        help=(
+            "Comma-separated game_id(s) to play (e.g. ls20,ka59). "
+            "If omitted, all games returned by the ARC API are evaluated."
+        ),
     )
     parser.add_argument("--backend", default="hermes", choices=["hermes"],
                         help="Agent backend (currently only 'hermes')")
@@ -76,6 +99,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Base port for the ARC game server (default: 8000)")
     parser.add_argument("--mcp-port", type=int, default=None,
                         help="Port for the MCP proxy (default: --port + 2)")
+    parser.add_argument("--port-stride", type=int, default=10,
+                        help=("Port spacing between parallel games. Game i uses "
+                              "--port + i*stride; MCP i uses mcp_base + i*stride "
+                              "(default: 10)."))
     parser.add_argument("--model", default="gemini-3.1-pro-preview")
     parser.add_argument("--provider", default="gemini")
     parser.add_argument("--api-key-env", default="GEMINI_API_KEY")
@@ -89,10 +116,11 @@ def _parse_args() -> argparse.Namespace:
             "file, terminal, and code execution tools (default: min)"
         ),
     )
-    parser.add_argument("--max-actions", type=int, default=5000,
-                        help="Per-game ARC action budget (default: 5000)")
-    parser.add_argument("--max-turns", type=int, default=90,
-                        help="Max Hermes loop iterations per game (default: 90)")
+    parser.add_argument("--max-actions", type=int, default=DEFAULT_MAX_ACTIONS,
+                        help=f"Per-game ARC action budget (default: {DEFAULT_MAX_ACTIONS})")
+    parser.add_argument("--max-turns", type=int, default=5000,
+                        help="Max Hermes tool-calling iterations per session "
+                             "(maps to AIAgent max_iterations; default: 5000)")
     parser.add_argument("--operation-mode", default="online",
                         choices=["normal", "online", "offline"],
                         help="ARC operation mode (default: online)")
@@ -109,6 +137,86 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tags", default="",
                         help="Comma-separated extra scorecard tags")
     return parser.parse_args()
+
+
+def _fetch_available_games(root_url: str = ROOT_URL) -> list[str]:
+    """Fetch the online game list the same way main.py does."""
+    import requests
+
+    try:
+        with requests.Session() as session:
+            session.headers.update(HEADERS)
+            response = session.get(f"{root_url}/api/games", timeout=10)
+    except requests.exceptions.RequestException as exc:
+        logger.error("Failed to connect to API server: %s", exc)
+        return []
+
+    if response.status_code != 200:
+        logger.error(
+            "API request failed with status %s: %s",
+            response.status_code,
+            response.text[:200],
+        )
+        return []
+
+    try:
+        return [game["game_id"] for game in response.json()]
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.error("Failed to parse games response: %s", exc)
+        logger.error("Response content: %s", response.text[:200])
+        return []
+
+
+def _resolve_game_ids(game_arg: str, full_games: list[str]) -> list[str]:
+    if not game_arg.strip():
+        return full_games[:]
+
+    filters = [g.strip() for g in game_arg.split(",") if g.strip()]
+    return [
+        game_id
+        for game_id in full_games
+        if any(game_id.startswith(prefix) for prefix in filters)
+    ]
+
+
+def _ports_for_game(
+    index: int,
+    game_port_base: int,
+    mcp_port_base: int,
+    port_stride: int,
+) -> tuple[int, int]:
+    return (
+        game_port_base + index * port_stride,
+        mcp_port_base + index * port_stride,
+    )
+
+
+def _validate_port_plan(
+    game_count: int,
+    game_port_base: int,
+    mcp_port_base: int,
+    port_stride: int,
+) -> None:
+    if port_stride <= 0:
+        raise ValueError("--port-stride must be greater than 0")
+
+    seen: dict[int, str] = {}
+    for index in range(game_count):
+        game_port, mcp_port = _ports_for_game(
+            index, game_port_base, mcp_port_base, port_stride
+        )
+        labels = (
+            (game_port, f"game[{index}]"),
+            (mcp_port, f"mcp[{index}]"),
+        )
+        for port, label in labels:
+            if not (1 <= port <= 65535):
+                raise ValueError(f"{label} port {port} is outside 1..65535")
+            if port in seen:
+                raise ValueError(
+                    f"Port collision: {label} and {seen[port]} both use {port}"
+                )
+            seen[port] = label
 
 
 # ---------------------------------------------------------------------------
@@ -230,18 +338,28 @@ def _close_process_stream(stream: ProcessStream | None, timeout: int = 10) -> No
     stream.log_file.close()
 
 
-def _wait_for_server(url: str, timeout: int = 30) -> bool:
+def _wait_for_server(
+    url: str,
+    timeout: int = 30,
+    shutdown_event: threading.Event | None = None,
+) -> bool:
     """Poll GET <url>/health until 200 or timeout."""
     import requests as _req
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if shutdown_event is not None and shutdown_event.is_set():
+            return False
         try:
             r = _req.get(url, timeout=2)
             if r.status_code == 200:
                 return True
         except Exception:
             pass
-        time.sleep(1)
+        if shutdown_event is not None:
+            if shutdown_event.wait(1):
+                return False
+        else:
+            time.sleep(1)
     return False
 
 
@@ -254,8 +372,28 @@ def _check_termination(server_url: str) -> dict[str, Any]:
         return {"condition_met": False, "error": str(exc)}
 
 
+# Games run in parallel (ThreadPoolExecutor); on batch shutdown every game's
+# finally block calls _close_game_scorecard at once, so all POST
+# /api/scorecard/close simultaneously and the API throttles the burst with
+# transient 404s. Serialize the closes so each starts at least
+# _CLOSE_STAGGER_SECONDS after the previous one.
+_CLOSE_STAGGER_SECONDS = 1.0
+_close_stagger_gate = threading.Lock()
+_close_last_started = 0.0
+
+
+def _stagger_before_close() -> None:
+    global _close_last_started
+    with _close_stagger_gate:
+        wait = _CLOSE_STAGGER_SECONDS - (time.monotonic() - _close_last_started)
+        if wait > 0:
+            time.sleep(wait)
+        _close_last_started = time.monotonic()
+
+
 def _close_game_scorecard(server_url: str, game_id: str) -> dict[str, Any] | None:
     import requests as _req
+    _stagger_before_close()
     try:
         r = _req.post(f"{server_url}/close_scorecard", timeout=60)
         if r.status_code != 200:
@@ -370,6 +508,7 @@ def _run_game(
     max_actions: int,
     max_sessions: int,
     toolset: str,
+    shutdown_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run Hermes for one game until WIN / budget exhaustion / caps.
 
@@ -396,11 +535,22 @@ def _run_game(
         "game_id": game_id, "status": "error",
         "score": None, "scorecard_url": None,
     }
+    if shutdown_event is None:
+        shutdown_event = threading.Event()
+    if shutdown_event.is_set():
+        result.update({
+            "status": "interrupted",
+            "termination_reason": "interrupted",
+            "sessions_run": 0,
+            "interrupted": True,
+        })
+        return result
 
     game_server: GameServerHandle | None = None
     game_server_stream: ProcessStream | None = None
     log_file: io.TextIOWrapper | None = None
     trajectory_file: io.TextIOWrapper | None = None
+    observations_file: io.TextIOWrapper | None = None
     active_proc: subprocess.Popen | None = None
     active_stop_event: threading.Event | None = None
     active_stream_thread: threading.Thread | None = None
@@ -419,19 +569,38 @@ def _run_game(
             f"game-server-{game_id}",
             game_log_dir / "game-server.log",
         )
-        if not _wait_for_server(f"{server_url}/health", timeout=30):
-            logger.error("Game server for %s did not become healthy", game_id)
-            result["error"] = "game server failed to start"
+        if not _wait_for_server(
+            f"{server_url}/health", timeout=30, shutdown_event=shutdown_event
+        ):
+            if shutdown_event.is_set():
+                termination_reason = "interrupted"
+                result.update({
+                    "status": "interrupted",
+                    "termination_reason": termination_reason,
+                    "sessions_run": sessions_run,
+                    "interrupted": True,
+                })
+            else:
+                logger.error("Game server for %s did not become healthy", game_id)
+                result["error"] = "game server failed to start"
             return result
 
         log_file = open(game_log_dir / "hermes.log", "w", encoding="utf-8")
         trajectory_file = open(game_log_dir / "trajectory.jsonl", "w", encoding="utf-8")
+        # Full per-step observations (get_game_state); images saved by the game
+        # server under game_log_dir/observations/ and referenced by path here.
+        observations_file = open(game_log_dir / "observations.jsonl", "w", encoding="utf-8")
 
         resume_session_id = ""
         consecutive_failures = 0
+        rate_limit_relaunches = 0
 
         # --- Outer relaunch loop ---
         while True:
+            if shutdown_event.is_set():
+                termination_reason = "interrupted"
+                result["interrupted"] = True
+                break
             # Stop conditions checked BEFORE (re)launching
             tc = _check_termination(server_url)
             last_progress = _log_progress_if_changed(
@@ -479,7 +648,7 @@ def _run_game(
             stream_thread = threading.Thread(
                 target=backend.run_stream_reader,
                 args=(proc.stdout, stop_event, log_file, metrics, server_url,
-                      trajectory_file),
+                      trajectory_file, observations_file),
                 daemon=True,
             )
             active_stream_thread = stream_thread
@@ -488,6 +657,12 @@ def _run_game(
             # --- Monitor THIS session ---
             killed_for_termination = False
             while proc.poll() is None:
+                if shutdown_event.is_set():
+                    termination_reason = "interrupted"
+                    result["interrupted"] = True
+                    stop_event.set()
+                    _terminate_process(proc, active_session_label)
+                    break
                 if game_server.process.poll() is not None:
                     termination_reason = "server_died"
                     stop_event.set()
@@ -506,7 +681,7 @@ def _run_game(
                     stop_event.set()
                     _terminate_process(proc, active_session_label)
                     break
-                time.sleep(poll_interval)
+                shutdown_event.wait(poll_interval)
 
             stop_event.set()
             stream_thread.join(timeout=10)
@@ -519,6 +694,10 @@ def _run_game(
                 resume_session_id = metrics.session_id
 
             # Decide whether to relaunch
+            if shutdown_event.is_set():
+                termination_reason = "interrupted"
+                result["interrupted"] = True
+                break
             if game_server.process.poll() is not None:
                 termination_reason = "server_died"
                 break
@@ -535,6 +714,30 @@ def _run_game(
                 logger.error("Game %s: agent loaded 0 tools — aborting "
                              "(check MCP proxy reachability / config).", game_id)
                 break
+            if metrics.rate_limited:
+                # Transient provider throttle (Gemini 429 / 8M-tokens-per-minute
+                # cap). Not fatal — wait for the quota window to reset, then
+                # resume the same Hermes session. Reset the failure counter so a
+                # throttle never trips the consecutive-failure abort.
+                rate_limit_relaunches += 1
+                consecutive_failures = 0
+                backoff = min(
+                    RATE_LIMIT_BACKOFF_BASE * (2 ** min(rate_limit_relaunches - 1, 3)),
+                    RATE_LIMIT_BACKOFF_MAX,
+                )
+                logger.warning(
+                    "Game %s: session %d ended on API rate limit (%s); not "
+                    "counted as a failure — waiting %ds for the quota window to "
+                    "reset, then resuming (rate-limit relaunch #%d).",
+                    game_id, sessions_run,
+                    metrics.last_failure_reason or "rate_limit",
+                    backoff, rate_limit_relaunches,
+                )
+                if shutdown_event.wait(backoff):
+                    termination_reason = "interrupted"
+                    result["interrupted"] = True
+                    break
+                continue
             if rc not in (0, None):
                 consecutive_failures += 1
                 logger.warning("Game %s: session %d exited rc=%s (failure %d/%d)",
@@ -545,6 +748,7 @@ def _run_game(
                     break
             else:
                 consecutive_failures = 0
+                rate_limit_relaunches = 0
                 logger.info("Game %s: session %d ended cleanly but game not "
                             "terminal; relaunching (resume).", game_id, sessions_run)
             # loop → relaunch
@@ -581,6 +785,8 @@ def _run_game(
             log_file.close()
         if trajectory_file:
             trajectory_file.close()
+        if observations_file:
+            observations_file.close()
 
     # Read scorecard written by the game server on shutdown
     scorecard_path = game_dir / "scorecard.json"
@@ -608,6 +814,134 @@ def _run_game(
     return result
 
 
+def _run_game_stack(
+    index: int,
+    game_id: str,
+    args: argparse.Namespace,
+    run_id: str,
+    run_dir: Path,
+    game_port_base: int,
+    mcp_port_base: int,
+    tags: str,
+    shutdown_event: threading.Event,
+) -> dict[str, Any]:
+    game_port, mcp_port = _ports_for_game(
+        index, game_port_base, mcp_port_base, args.port_stride
+    )
+    game_log_dir = run_dir / game_id / "logs"
+    game_log_dir.mkdir(parents=True, exist_ok=True)
+
+    if shutdown_event.is_set():
+        return {
+            "game_id": game_id,
+            "status": "interrupted",
+            "score": None,
+            "scorecard_url": None,
+            "termination_reason": "interrupted",
+            "sessions_run": 0,
+            "interrupted": True,
+            "game_port": game_port,
+            "mcp_port": mcp_port,
+        }
+
+    mcp_proxy: subprocess.Popen | None = None
+    mcp_proxy_stream: ProcessStream | None = None
+    try:
+        logger.info("=" * 60)
+        logger.info(
+            "Starting game %s on game_port=%d mcp_port=%d",
+            game_id,
+            game_port,
+            mcp_port,
+        )
+        logger.info("=" * 60)
+
+        mcp_proxy = _start_mcp_proxy(mcp_port, game_port, _REPO_ROOT)
+        mcp_proxy_stream = _start_process_stream(
+            mcp_proxy,
+            f"mcp-proxy-{game_id}",
+            game_log_dir / "mcp-proxy.log",
+        )
+        if shutdown_event.wait(2):
+            return {
+                "game_id": game_id,
+                "status": "interrupted",
+                "score": None,
+                "scorecard_url": None,
+                "termination_reason": "interrupted",
+                "sessions_run": 0,
+                "interrupted": True,
+                "game_port": game_port,
+                "mcp_port": mcp_port,
+            }
+        if mcp_proxy.poll() is not None:
+            return {
+                "game_id": game_id,
+                "status": "error",
+                "score": None,
+                "scorecard_url": None,
+                "termination_reason": "mcp_proxy_died",
+                "error": f"MCP proxy exited with rc={mcp_proxy.poll()}",
+                "game_port": game_port,
+                "mcp_port": mcp_port,
+            }
+
+        backend = HermesCliBackend()
+        result = _run_game(
+            game_id       = game_id,
+            backend       = backend,
+            run_id        = run_id,
+            run_dir       = run_dir,
+            directive_path= args.directive,
+            game_port     = game_port,
+            mcp_port      = mcp_port,
+            model         = args.model,
+            provider      = args.provider,
+            api_key_env   = args.api_key_env,
+            max_turns     = args.max_turns,
+            poll_interval = args.poll_interval,
+            project_root  = _REPO_ROOT,
+            tags          = tags,
+            operation_mode= args.operation_mode,
+            max_actions   = args.max_actions,
+            max_sessions  = args.max_sessions,
+            toolset       = args.toolset,
+            shutdown_event= shutdown_event,
+        )
+        result["game_port"] = game_port
+        result["mcp_port"] = mcp_port
+        return result
+    except KeyboardInterrupt:
+        shutdown_event.set()
+        return {
+            "game_id": game_id,
+            "status": "interrupted",
+            "score": None,
+            "scorecard_url": None,
+            "termination_reason": "interrupted",
+            "sessions_run": 0,
+            "interrupted": True,
+            "game_port": game_port,
+            "mcp_port": mcp_port,
+        }
+    except Exception as exc:
+        logger.exception("Game %s worker failed", game_id)
+        return {
+            "game_id": game_id,
+            "status": "error",
+            "score": None,
+            "scorecard_url": None,
+            "termination_reason": "worker_exception",
+            "error": str(exc),
+            "game_port": game_port,
+            "mcp_port": mcp_port,
+        }
+    finally:
+        if mcp_proxy and mcp_proxy.poll() is None:
+            _terminate_process(mcp_proxy, f"mcp-proxy-{game_id}")
+        _close_process_stream(mcp_proxy_stream)
+
+
 # ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
@@ -628,89 +962,170 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Run ID: %s  →  %s", run_id, run_dir)
 
-    game_ids = [g.strip() for g in args.game.split(",") if g.strip()]
+    logger.info("Fetching ARC game list from %s/api/games", ROOT_URL)
+    full_games = _fetch_available_games()
+    game_ids = _resolve_game_ids(args.game, full_games)
+    logger.info("Game list: %s", game_ids)
     if not game_ids:
-        logger.error("No game IDs specified")
+        if full_games and args.game.strip():
+            logger.error(
+                "The specified game '%s' does not exist or is not available "
+                "with your API key. Please try a different game.",
+                args.game,
+            )
+        else:
+            logger.error("No games available from ARC API")
         sys.exit(1)
+    if not args.game.strip():
+        logger.info("No --game specified; evaluating all available online games")
 
-    mcp_port  = args.mcp_port or (args.port + DEFAULT_MCP_PORT_OFFSET)
-    game_port = args.port
+    game_port_base = args.port
+    mcp_port_base = args.mcp_port or (args.port + DEFAULT_MCP_PORT_OFFSET)
+    try:
+        _validate_port_plan(
+            len(game_ids),
+            game_port_base,
+            mcp_port_base,
+            args.port_stride,
+        )
+    except ValueError as exc:
+        logger.error("%s", exc)
+        sys.exit(2)
+    logger.info(
+        "Parallel port plan: game_base=%d mcp_base=%d stride=%d games=%d",
+        game_port_base,
+        mcp_port_base,
+        args.port_stride,
+        len(game_ids),
+    )
 
     # Propagate operation-mode to the environment so the game server reads it
     os.environ["OPERATION_MODE"] = args.operation_mode
 
-    backend = HermesCliBackend()
     logger.info("Hermes toolset mode: %s", args.toolset)
 
     # --- Build Docker image if requested ---
     if args.build:
+        backend = HermesCliBackend()
         backend.build_image(
             _REPO_ROOT,
             hermes_commit=args.hermes_commit,
         )
 
-    # --- Start MCP proxy once (shared across all games) ---
-    mcp_proxy: subprocess.Popen | None = None
-    mcp_proxy_stream: ProcessStream | None = None
-    game_results: list[dict[str, Any]] = []
+    # --- Start all games in parallel ---
+    shutdown_event = threading.Event()
+    results_by_index: list[dict[str, Any] | None] = [None] * len(game_ids)
     interrupted = False
-    try:
-        mcp_proxy = _start_mcp_proxy(mcp_port, game_port, _REPO_ROOT)  # game_port updated per-game if needed
-        mcp_proxy_stream = _start_process_stream(
-            mcp_proxy,
-            "mcp-proxy",
-            run_dir / "mcp-proxy.log",
+    extra_tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    tags_str   = ",".join(["hermes-eval", args.model] + extra_tags)
+
+    def _record_future_result(
+        future: concurrent.futures.Future[dict[str, Any]],
+        future_to_index: dict[concurrent.futures.Future[dict[str, Any]], int],
+    ) -> None:
+        nonlocal interrupted
+        index = future_to_index[future]
+        if results_by_index[index] is not None:
+            return
+        game_id = game_ids[index]
+        game_port, mcp_port = _ports_for_game(
+            index, game_port_base, mcp_port_base, args.port_stride
         )
-        # Give the proxy a moment to bind
-        time.sleep(2)
+        try:
+            game_result = future.result()
+        except concurrent.futures.CancelledError:
+            game_result = {
+                "game_id": game_id,
+                "status": "interrupted",
+                "score": None,
+                "scorecard_url": None,
+                "termination_reason": "cancelled",
+                "sessions_run": 0,
+                "interrupted": True,
+                "game_port": game_port,
+                "mcp_port": mcp_port,
+            }
+        except Exception as exc:
+            logger.exception("Game %s future failed", game_id)
+            game_result = {
+                "game_id": game_id,
+                "status": "error",
+                "score": None,
+                "scorecard_url": None,
+                "termination_reason": "future_exception",
+                "error": str(exc),
+                "game_port": game_port,
+                "mcp_port": mcp_port,
+            }
+        results_by_index[index] = game_result
+        interrupted = interrupted or bool(game_result.get("interrupted"))
+        logger.info(
+            "Game %s → status=%s score=%s url=%s",
+            game_id,
+            game_result.get("status"),
+            game_result.get("score"),
+            game_result.get("scorecard_url"),
+        )
 
-        extra_tags = [t.strip() for t in args.tags.split(",") if t.strip()]
-        tags_str   = ",".join(["hermes-eval", args.model] + extra_tags)
+    future_to_index: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(game_ids),
+            thread_name_prefix="hermes-game",
+        ) as executor:
+            for index, game_id in enumerate(game_ids):
+                future = executor.submit(
+                    _run_game_stack,
+                    index,
+                    game_id,
+                    args,
+                    run_id,
+                    run_dir,
+                    game_port_base,
+                    mcp_port_base,
+                    tags_str,
+                    shutdown_event,
+                )
+                future_to_index[future] = index
 
-        # --- Per-game loop ---
-        for game_id in game_ids:
-            logger.info("=" * 60)
-            logger.info("Starting game: %s", game_id)
-            logger.info("=" * 60)
-            game_result = _run_game(
-                game_id       = game_id,
-                backend       = backend,
-                run_id        = run_id,
-                run_dir       = run_dir,
-                directive_path= args.directive,
-                game_port     = game_port,
-                mcp_port      = mcp_port,
-                model         = args.model,
-                provider      = args.provider,
-                api_key_env   = args.api_key_env,
-                max_turns     = args.max_turns,
-                poll_interval = args.poll_interval,
-                project_root  = _REPO_ROOT,
-                tags          = tags_str,
-                operation_mode= args.operation_mode,
-                max_actions   = args.max_actions,
-                max_sessions  = args.max_sessions,
-                toolset       = args.toolset,
-            )
-            game_results.append(game_result)
-            logger.info(
-                "Game %s → status=%s score=%s url=%s",
-                game_id,
-                game_result.get("status"),
-                game_result.get("score"),
-                game_result.get("scorecard_url"),
-            )
-            if game_result.get("interrupted"):
+            try:
+                for future in concurrent.futures.as_completed(future_to_index):
+                    _record_future_result(future, future_to_index)
+            except KeyboardInterrupt:
                 interrupted = True
-                break
-
+                shutdown_event.set()
+                logger.warning(
+                    "Run interrupted; stopping all active game workers "
+                    "and writing partial summary"
+                )
+                for future in future_to_index:
+                    future.cancel()
+                for future in concurrent.futures.as_completed(future_to_index):
+                    _record_future_result(future, future_to_index)
     except KeyboardInterrupt:
         interrupted = True
+        shutdown_event.set()
         logger.warning("Run interrupted; writing partial summary")
-    finally:
-        if mcp_proxy and mcp_proxy.poll() is None:
-            _terminate_process(mcp_proxy, "mcp-proxy")
-        _close_process_stream(mcp_proxy_stream)
+
+    game_results: list[dict[str, Any]] = []
+    for index, game_id in enumerate(game_ids):
+        game_result = results_by_index[index]
+        if game_result is None:
+            game_port, mcp_port = _ports_for_game(
+                index, game_port_base, mcp_port_base, args.port_stride
+            )
+            game_result = {
+                "game_id": game_id,
+                "status": "interrupted" if interrupted else "error",
+                "score": None,
+                "scorecard_url": None,
+                "termination_reason": "missing_result",
+                "sessions_run": 0,
+                "interrupted": interrupted,
+                "game_port": game_port,
+                "mcp_port": mcp_port,
+            }
+        game_results.append(game_result)
 
     # --- Write summary ---
     summary = {

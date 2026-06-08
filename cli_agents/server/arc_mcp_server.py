@@ -53,36 +53,44 @@ def get_game_state():
     # FastMCP builds a structured-output schema and JSON-serializes the return
     # value, which fails on the MCPImage object ("Unable to serialize unknown
     # type: Image"). Omitting the annotation keeps FastMCP on the content-
-    # conversion path that turns [dict, Image] into a text block + an image block.
-    """Get the current ARC game state.
+    # conversion path that turns [dict, Image, ...] into a text block followed by
+    # one image block per Image.
+    """Observe the ARC game: what changed since your last observation, plus the
+    current grid.
 
-    Returns the grid as a labelled text description plus a rendered PNG image
-    so you can visually inspect the current puzzle state. Call this whenever
-    you need to observe the game before or after taking actions.
+    Call this after each take_actions batch to observe the result. Returns a
+    text block plus one PNG per rendered grid (observation keyframes first, then
+    the current grid), in the same order as the grids named in the text.
 
-    Returns:
-      - state_text: multi-layer integer grid rendered as labelled text rows
-      - available_actions: list of valid action names (and whether each needs x,y)
-      - state: current game state (NOT_PLAYED / NOT_FINISHED / WIN / GAME_OVER)
-      - levels_completed, guid
-      - A PNG image of the grid (the next content block)
+    Returns (text block):
+      - observations_since_last_query: one RESULT block per action executed since
+        the previous get_game_state — state/score transition, an ANIMATION
+        SUMMARY, and selected keyframe grids (final frame if it changed, else
+        transient keyframes). Empty on the first call / when no action ran.
+      - current_grid: the authoritative current grid (frame[-1]) rendered once
+      - available_actions / action_menu: valid action names (ACTION6 needs x,y)
+      - state (NOT_PLAYED / NOT_FINISHED / WIN / GAME_OVER), levels_completed,
+        win_levels, guid
+      - followed by one PNG content block per rendered grid, in text order
     """
     result = _post("/mcp/get_game_state")
-    b64 = result.pop("screenshot_base64", None)
-    if b64:
+    images = [b for b in (result.pop("screenshots_base64", None) or []) if b]
+    if images:
         result["_screenshot_note"] = (
-            "The next content block is the PNG image of the current grid. "
-            "Use it to visually inspect cell colours and layout."
+            f"The next {len(images)} content block(s) are PNG images of the "
+            "rendered grids, in the same order as the grids shown in the text "
+            "(observation keyframes first, then the current grid)."
         )
-        img_bytes = base64.b64decode(b64)
-        logger.info(
-            "get_game_state: state=%s levels=%s image=%dKB",
-            result.get("state"),
-            result.get("levels_completed"),
-            len(img_bytes) // 1024,
-        )
-        return [result, MCPImage(data=img_bytes, format="png")]
-    return [result]
+    blocks: list[Any] = [result]
+    for b64 in images:
+        blocks.append(MCPImage(data=base64.b64decode(b64), format="png"))
+    logger.info(
+        "get_game_state: state=%s levels=%s images=%d",
+        result.get("state"),
+        result.get("levels_completed"),
+        len(images),
+    )
+    return blocks
 
 
 @mcp.tool()
@@ -91,10 +99,12 @@ def take_actions(actions: list[dict[str, Any]], reasoning: str = "") -> dict[str
 
     Actions are applied in sequence and stop early on the first invalid action,
     budget exhaustion, level change, or terminal state. After calling this tool,
-    call get_game_state to observe the result.
+    call get_game_state to observe the result. RESET is not accepted here; the
+    game server performs lifecycle resets automatically before the first
+    playable frame and after GAME_OVER.
 
     Each action item must have:
-      - name (str): one of the available action names (ACTION1..ACTION7, RESET)
+      - name (str): one of the available gameplay action names (ACTION1..ACTION7)
       - reasoning (str): brief explanation of why this action (required)
       - x, y (int, 0..63): required only for ACTION6 (click), x=column y=row
 
