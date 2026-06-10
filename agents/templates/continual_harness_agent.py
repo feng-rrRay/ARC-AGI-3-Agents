@@ -88,8 +88,9 @@ from .continual_harness.trace import (
 from .continual_harness.trajectory import (
     TrajectoryStore,
     default_trajectory_path,
-    format_compact_history,
     format_full_history,
+    render_recent_history,
+    summarize_grid_transitions,
 )
 from .utils.vlm_backend import VLM
 
@@ -689,8 +690,8 @@ class ContinualHarness(Agent):
             )
             sub_vlm.set_tools(tools)
 
-            history = format_compact_history(
-                self.trajectory.tail(self.SUBAGENT_HISTORY_WINDOW),
+            history = render_recent_history(
+                self.trajectory.tail(self.MAX_ACTIONS + 1),
                 max_chars=self.HISTORY_MAX_CHARS,
             )
             base_prompt = build_subagent_prompt(
@@ -873,8 +874,8 @@ class ContinualHarness(Agent):
                         if len(images) > 1
                         else (images[0] if images else None)
                     )
-                    history = format_compact_history(
-                        self.trajectory.tail(self.SUBAGENT_HISTORY_WINDOW),
+                    history = render_recent_history(
+                        self.trajectory.tail(self.MAX_ACTIONS + 1),
                         max_chars=self.HISTORY_MAX_CHARS,
                     )
                     base_prompt = build_subagent_prompt(
@@ -1468,7 +1469,9 @@ class ContinualHarness(Agent):
         score_after = post.levels_completed
         state_after = post.state.name if frame is not None else "INVALID"
 
-        grid_delta = _compute_grid_delta(pre_grid, post.frame[-1] if post.frame else None)
+        post_grid = post.frame[-1] if post.frame else None
+        grid_delta = _compute_grid_delta(pre_grid, post_grid)
+        grid_change = summarize_grid_transitions(pre_grid, post_grid)
 
         self.trajectory.append(
             StepRecord(
@@ -1490,6 +1493,7 @@ class ContinualHarness(Agent):
                 skill_id=skill_id,
                 tool_calls=[],
                 grid_delta=grid_delta,
+                grid_change=grid_change,
             )
         )
         self._pending_observations.append(
@@ -1585,11 +1589,9 @@ class ContinualHarness(Agent):
     def _build_working_prompt(
         self, latest_frame: FrameData
     ) -> tuple[str, list[RenderedGrid]]:
-        history_block = format_compact_history(
-            self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT),
-            frames=self.frames,
+        history_block = render_recent_history(
+            self.trajectory.tail(self.MAX_ACTIONS + 1),
             max_chars=self.HISTORY_MAX_CHARS,
-            max_batches=self.HISTORY_BATCH_WINDOW,
         )
         observation_block, observation_grids = build_observation_section(
             self._pending_observations,

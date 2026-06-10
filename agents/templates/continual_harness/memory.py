@@ -225,7 +225,8 @@ def format_memory_overview(entries: list[MemoryEntry]) -> str:
     rows = [f"## LONG-TERM MEMORY ({len(entries)} entries)"]
     for e in entries:
         tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
-        rows.append(f"[{e.id}] {e.title}{tag_str}")
+        first_line = f"{e.body.splitlines()[0]}" if e.body else ""
+        rows.append(f"[{e.id}] {e.title}{tag_str}: {first_line}...")
     return "\n".join(rows)
 
 

@@ -531,30 +531,36 @@ def build_working_prompt(
         if current_grid is not None
         else "(empty frame)"
     )
-
     sections: list[str] = []
+
+    # Orchestrator policy
     if base_prompt.strip():
         sections.append(base_prompt.strip())
-    sections.append(f"# Step: {action_counter}")
-    sections.append(
-        "## RECENT HISTORY (batch-grouped; call get_recent_trajectory for older detail)\n"
-        + (history_block or "No previous actions recorded.")
-    )
-    sections.append(
-        "## TOOL RESULTS FROM PREVIOUS STEP\n"
-        + _render_tool_results(recent_tool_results)
-    )
+    
+    # persistent components
+    if subagent_overview.strip():
+        sections.append(subagent_overview.rstrip())
     if memory_overview.strip():
         sections.append(memory_overview.rstrip())
     if skill_overview.strip():
         sections.append(skill_overview.rstrip())
-    if subagent_overview.strip():
-        sections.append(subagent_overview.rstrip())
-    if observation_block.strip():
-        sections.append(
-            "## OBSERVATIONS SINCE LAST QUERY\n" + observation_block.rstrip()
-        )
 
+    # Append-only history sits in the cache-stable region: all lines but the
+    # newest are byte-identical across calls, so placing it above the volatile
+    # per-step blocks lets the prompt prefix (system + base + overviews +
+    # history) be served from the model's KV cache.
+    sections.append(
+        "## RECENT HISTORY\n" + (history_block or "No previous actions recorded.")
+    )
+
+    # Volatile per-step tail — re-rendered every call, never cached.
+    sections.append(f"# Step: {action_counter}")
+    if observation_block.strip():
+        sections.append("## OBSERVATIONS SINCE LAST QUERY\n" + observation_block.rstrip())
+    sections.append(
+        "## TOOL RESULTS FROM PREVIOUS STEP\n"
+        + _render_tool_results(recent_tool_results)
+    )
     state_block = (
         "## CURRENT STATE\n"
         f"state: {latest_frame.state.name}\n"

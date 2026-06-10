@@ -320,10 +320,7 @@ def format_skill_overview(entries: list[SkillEntry]) -> str:
         )
     rows = [f"## SKILLS ({len(entries)} saved)"]
     for e in entries:
-        tag_str = f" tags={','.join(e.tags)}" if e.tags else ""
-        first_line = (
-            (e.description or "").splitlines()[0][:120] if e.description else ""
-        )
-        sep = " — " if first_line else ""
-        rows.append(f"- id={e.id} name={e.name}{tag_str}{sep}{first_line}")
+        tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
+        first_line = f"{e.description.splitlines()[0]}" if e.description else ""
+        rows.append(f"[{e.id}] {e.name}{tag_str}: {first_line}...")
     return "\n".join(rows)
