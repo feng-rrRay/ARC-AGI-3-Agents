@@ -89,7 +89,7 @@ from .continual_harness.trace import (
 from .continual_harness.trajectory import (
     TrajectoryStore,
     default_trajectory_path,
-    format_full_history,
+    # format_full_history,  # removed with get_recent_trajectory (still used by prompt_evolution)
     hexify_record_colors,
     render_recent_history,
     summarize_grid_transitions,
@@ -316,19 +316,22 @@ class ContinualHarness(Agent):
         self.trace = TraceWriter(default_trace_path(self.game_id))
         self.trajectory = TrajectoryStore(default_trajectory_path(self.game_id))
 
-        def _handle_get_recent_trajectory(args: dict[str, Any]) -> dict[str, Any]:
-            try:
-                limit = int(args.get("limit", self.FULL_HISTORY_DEFAULT_LIMIT))
-            except (TypeError, ValueError):
-                limit = self.FULL_HISTORY_DEFAULT_LIMIT
-            limit = max(1, min(self.FULL_HISTORY_MAX_LIMIT, limit))
-            records = self.trajectory.tail(limit)
-            return {
-                "success": True,
-                "limit": limit,
-                "count": len(records),
-                "history": format_full_history(records),
-            }
+        # --- COMMENTED OUT: get_recent_trajectory removed (superseded by the
+        # always-in-prompt RECENT HISTORY block). format_full_history stays in
+        # trajectory.py for prompt_evolution. ---
+        # def _handle_get_recent_trajectory(args: dict[str, Any]) -> dict[str, Any]:
+        #     try:
+        #         limit = int(args.get("limit", self.FULL_HISTORY_DEFAULT_LIMIT))
+        #     except (TypeError, ValueError):
+        #         limit = self.FULL_HISTORY_DEFAULT_LIMIT
+        #     limit = max(1, min(self.FULL_HISTORY_MAX_LIMIT, limit))
+        #     records = self.trajectory.tail(limit)
+        #     return {
+        #         "success": True,
+        #         "limit": limit,
+        #         "count": len(records),
+        #         "history": format_full_history(records),
+        #     }
 
         # Memory is always available, backed per-game at
         # logs/<run_id>/<game_id>/memory.json (seeded from --bootstrap when a
@@ -988,7 +991,7 @@ class ContinualHarness(Agent):
             }
 
         handlers: dict[str, Any] = {
-            "get_recent_trajectory": _handle_get_recent_trajectory,
+            # "get_recent_trajectory": _handle_get_recent_trajectory,  # removed
             "process_memory": _handle_process_memory,
             "process_skill": _handle_process_skill,
             "run_skill": _handle_run_skill,
@@ -1685,7 +1688,7 @@ class ContinualHarness(Agent):
     def _full_tool_list(self) -> list[dict[str, Any]]:
         """Unified action tool + analysis tools — exposed every iteration."""
         tools: list[dict[str, Any]] = [TAKE_ACTIONS_TOOL]
-        tools.extend(build_analysis_tools())  # get_recent_trajectory
+        tools.extend(build_analysis_tools())  # currently empty (get_recent_trajectory removed)
         tools.append(PROCESS_MEMORY_TOOL)
         tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL])
         tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])

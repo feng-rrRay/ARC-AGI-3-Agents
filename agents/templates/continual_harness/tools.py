@@ -22,24 +22,30 @@ class FunctionCall:
 # --- Analysis tool specs ------------------------------------------------------
 # Schema shape matches build_action_tools so the backend treats them uniformly.
 
-GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
-    "name": "get_recent_trajectory",
-    "description": "Retrieve full step history (reasoning + tool calls + results) beyond the compact view in the prompt. Use to look further back or inspect older reasoning.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "reasoning": {
-                "type": "string",
-                "description": "Why the compact view isn't enough. Required.",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "How many recent actions to retrieve (1-80). Defaults to 40.",
-            },
-        },
-        "required": ["reasoning"],
-    },
-}
+# --- COMMENTED OUT: get_recent_trajectory removed ---
+# Superseded by the always-in-prompt RECENT HISTORY block (render_recent_history),
+# which now spans the whole run. The full reasoning/tool-result deep-dive this
+# tool exposed is no longer worth a tool round (findings live in memory).
+# Removed from the orchestrator analysis tools AND the subagent tool surface.
+# `format_full_history` (trajectory.py) is kept — prompt_evolution.py still uses it.
+# GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
+#     "name": "get_recent_trajectory",
+#     "description": "Retrieve full step history (reasoning + tool calls + results) beyond the compact view in the prompt. Use to look further back or inspect older reasoning.",
+#     "parameters": {
+#         "type": "object",
+#         "properties": {
+#             "reasoning": {
+#                 "type": "string",
+#                 "description": "Why the compact view isn't enough. Required.",
+#             },
+#             "limit": {
+#                 "type": "integer",
+#                 "description": "How many recent actions to retrieve (1-80). Defaults to 40.",
+#             },
+#         },
+#         "required": ["reasoning"],
+#     },
+# }
 
 
 PROCESS_MEMORY_TOOL: dict[str, Any] = {
@@ -201,7 +207,7 @@ RUN_CODE_TOOL: dict[str, Any] = {
 # for the rationale: too many wasted rounds on schema/import failures).
 SUBAGENT_TOOL_ENUM: frozenset[str] = frozenset(
     {
-        "get_recent_trajectory",
+        # "get_recent_trajectory",  # removed — superseded by RECENT HISTORY block
         "process_memory",
         "process_skill",
         "run_skill",
@@ -244,10 +250,10 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
                     "enum": sorted(SUBAGENT_TOOL_ENUM),
                 },
                 "description": "Tools the subagent may call (subset of "
-                "get_recent_trajectory/process_memory/process_skill/"
-                "run_skill/take_actions). Optional for add/edit; omitted on "
-                "add defaults to get_recent_trajectory. Empty list = subagent "
-                "that only reasons and returns.",
+                "process_memory/process_skill/run_skill/take_actions). "
+                "Optional for add/edit; omitted on add defaults to an empty "
+                "allowlist — the subagent only reasons over the history already "
+                "in its prompt and returns.",
             },
             "tags": {
                 "type": "array",
@@ -339,8 +345,14 @@ def is_subagent_return_call(name: str) -> bool:
 
 
 def build_analysis_tools() -> list[dict[str, Any]]:
-    """Always-on read-only analysis tool. process_memory + skill tools are appended by the agent."""
-    return [GET_RECENT_TRAJECTORY_TOOL]
+    """Read-only analysis tools. process_memory + skill tools are appended by the agent.
+
+    Currently empty: the only analysis tool was get_recent_trajectory, removed
+    once render_recent_history made it redundant. Kept as a seam for future
+    analysis tools.
+    """
+    # return [GET_RECENT_TRAJECTORY_TOOL]  # removed — superseded by RECENT HISTORY block
+    return []
 
 
 # --- Function-call extraction -------------------------------------------------
@@ -461,7 +473,7 @@ def is_take_actions_call(name: str) -> bool:
 # already defines. Keeping this lookup in one place avoids drift between the
 # allowlist enum and the actual spec shapes shown to the subagent VLM.
 _SUBAGENT_TOOL_SPECS: dict[str, dict[str, Any]] = {
-    "get_recent_trajectory": GET_RECENT_TRAJECTORY_TOOL,
+    # "get_recent_trajectory": GET_RECENT_TRAJECTORY_TOOL,  # removed
     "process_memory": PROCESS_MEMORY_TOOL,
     "process_skill": PROCESS_SKILL_TOOL,
     "run_skill": RUN_SKILL_TOOL,

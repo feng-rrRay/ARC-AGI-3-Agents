@@ -425,7 +425,10 @@ def format_full_history(
 ) -> str:
     """Full per-action detail with reasoning + tool calls, grouped by batch.
 
-    Returned by `get_recent_trajectory`. Drops oldest batches to fit `max_chars`.
+    Used by prompt_evolution to feed the meta-call full reasoning/tool-call
+    history. (The get_recent_trajectory tool that previously exposed this to the
+    model was removed once render_recent_history made it redundant.) Drops oldest
+    batches to fit `max_chars`.
     """
     record_list = [r for r in records if isinstance(r, dict)]
     if not record_list:

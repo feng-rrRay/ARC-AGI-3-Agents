@@ -21,7 +21,10 @@ DESCRIPTION_MAX_CHARS = 500
 INSTRUCTIONS_MAX_CHARS = 4000
 MAX_SUBAGENTS = 50
 SEARCH_MAX_MATCHES = 10
-DEFAULT_SUBAGENT_ALLOWED_TOOLS: tuple[str, ...] = ("get_recent_trajectory",)
+# Empty by default: subagents already receive the compact RECENT STEPS block in
+# their prompt, and get_recent_trajectory was removed. An omitted allowlist means
+# the subagent only reasons over that in-prompt history and returns.
+DEFAULT_SUBAGENT_ALLOWED_TOOLS: tuple[str, ...] = ()
 
 
 RUN_DIR_ENV = "RUN_DIR"
@@ -319,8 +322,8 @@ def format_subagent_overview(entries: list[SubagentEntry]) -> str:
             'No subagents saved yet. Use process_subagent(operation="add", name=..., '
             "description=..., instructions=..., allowed_tools=[...]) to register a "
             "focused inner agent for a complex task. If allowed_tools is omitted, "
-            "it defaults to get_recent_trajectory. Then run_subagent(id, task) "
-            "to invoke one. The inner loop cannot commit ARC actions."
+            "it defaults to an empty allowlist (reason-and-return only). Then "
+            "run_subagent(id, task) to invoke one. The inner loop cannot commit ARC actions."
         )
     rows = [f"## SUBAGENTS ({len(entries)} saved)"]
     for e in entries:

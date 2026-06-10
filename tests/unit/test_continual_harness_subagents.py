@@ -36,7 +36,7 @@ def _add_basic(
         instructions=instructions,
         allowed_tools=allowed_tools
         if allowed_tools is not None
-        else ["get_recent_trajectory"],
+        else ["process_memory"],
         tags=tags,
     )
 
@@ -93,13 +93,13 @@ class TestSubagentStoreCRUD:
             name="summarizer",
             description="d",
             instructions="do thing",
-            allowed_tools=["get_recent_trajectory"],
+            allowed_tools=["process_memory"],
         )
         reopened = SubagentStore(path, game_id="g")
         entries = reopened.all_entries()
         assert len(entries) == 1
         assert entries[0].name == "summarizer"
-        assert entries[0].allowed_tools == ["get_recent_trajectory"]
+        assert entries[0].allowed_tools == ["process_memory"]
 
     def test_add_rejects_invalid_name(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -172,7 +172,7 @@ class TestSubagentStoreCRUD:
 
     def test_edit_can_change_allowed_tools(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        entry = _add_basic(store, allowed_tools=["get_recent_trajectory"])
+        entry = _add_basic(store, allowed_tools=["process_skill"])
         edited = store.edit(entry.id, allowed_tools=["process_memory", "run_skill"])
         assert edited is not None
         assert edited.allowed_tools == ["process_memory", "run_skill"]
@@ -216,17 +216,17 @@ class TestAllowedToolsValidation:
         entry = _add_basic(
             store,
             allowed_tools=[
-                "get_recent_trajectory",
                 "process_memory",
                 "process_skill",
                 "run_skill",
+                "take_actions",
             ],
         )
         assert set(entry.allowed_tools) == {
-            "get_recent_trajectory",
             "process_memory",
             "process_skill",
             "run_skill",
+            "take_actions",
         }
 
     def test_rejects_run_code_now_disabled(self, tmp_path: Path) -> None:
@@ -332,11 +332,11 @@ class TestFormatSubagentOverview:
             name="summarizer",
             description="Compact the trajectory and save key insights.",
             instructions="SECRET_INSTRUCTION_TEXT do not leak in overview",
-            allowed_tools=["get_recent_trajectory", "process_memory"],
+            allowed_tools=["process_memory", "run_skill"],
         )
         out = format_subagent_overview(store.all_entries())
         assert "[subagent_001] summarizer" in out
-        assert "[get_recent_trajectory, process_memory]" in out
+        assert "[process_memory, run_skill]" in out
         assert "Compact the trajectory" in out  # description IS shown
         assert "SECRET_INSTRUCTION_TEXT" not in out  # instructions never leak
 
@@ -372,7 +372,7 @@ class TestStoreRobustness:
                             "name": "seed",
                             "description": "seeded sub",
                             "instructions": "do thing",
-                            "allowed_tools": ["get_recent_trajectory"],
+                            "allowed_tools": ["process_memory"],
                             "tags": [],
                             "version": 3,
                             "created_at": "",

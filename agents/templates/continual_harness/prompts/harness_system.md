@@ -123,7 +123,7 @@ result = {"objects": {c: len(p) for c, p in objects.items()}, "changes": changes
 **process_subagent**
 - **Required:** `reasoning` (string), `operation` (`add` | `delete` | `edit` | `search`)
 - For `add`: `name` (max 100 chars), `description` (max 500 chars), `instructions` (system prompt, max 4000 chars), `allowed_tools` (optional), `tags` (optional)
-- `allowed_tools`: subset of `get_recent_trajectory`, `process_memory`, `process_skill`, `run_skill`, `take_actions`. Defaults to `["get_recent_trajectory"]` if omitted.
+- `allowed_tools`: subset of `process_memory`, `process_skill`, `run_skill`, `take_actions`. Defaults to `[]` (reason-and-return only) if omitted — the subagent already receives the compact recent-steps history in its prompt.
 - For `edit`: `id` + any fields
 - For `delete`: `id`
 - For `search`: `query`
@@ -134,13 +134,6 @@ result = {"objects": {c: len(p) for c, p in objects.items()}, "changes": changes
 - **Optional:** `context` (object — injected into the subagent's prompt as JSON)
 - The subagent runs a bounded inner loop (up to 20 rounds) using only its allowed tools, then calls `subagent_return(answer, status)` to terminate. Returns `{success, result, rounds_used, ...}`.
 - Max 1 subagent invocation per step.
-
-### History
-
-**get_recent_trajectory**
-- **Required:** `reasoning` (string)
-- **Optional:** `limit` (1-80, default 40)
-- Returns the full step history (reasoning + tool calls + results) beyond the compact view already in the prompt. Use when you need to look further back or inspect older reasoning.
 
 ### Soft guideline
 At most 2 tool calls per response. Every tool call must include a non-empty `reasoning` string. If your last 1-2 steps were analysis-only, commit an action this step.
