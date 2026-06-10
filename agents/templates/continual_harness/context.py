@@ -7,7 +7,7 @@ from typing import Any, Iterable, Sequence
 from arcengine import FrameData, GameAction
 
 from .action_descriptions import ACTION_DESCRIPTIONS
-from .helpers import available_game_actions
+from .helpers import available_game_actions, color_to_hex, grid_to_hex_lines
 from .models import PendingActionObservation, RenderedGrid, ToolCallRecord
 
 
@@ -16,11 +16,12 @@ MAX_OBSERVATION_TEXT_GRIDS = 4
 
 
 def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
-    """Render a 3D grid stack as integer lists, one row per line.
+    """Render a 3D grid stack as hex maps, one dense hex string per row.
 
-    Output format matches ``state.latest_frame.frame`` exactly — each row is
-    a Python-style list of ints — so the model sees the same representation
-    in the prompt and in skill code.
+    Output matches ``state.latest_frame.frame`` exactly: each cell is a single
+    hex digit ``0-f`` (= color int 0-15), and each row is one hex string — so the
+    model sees the same representation in the prompt and in skill code. Recover
+    the int with ``int(ch, 16)``.
     """
     lines: list[str] = []
     for i, block in enumerate(array_3d):
@@ -30,9 +31,8 @@ def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
             continue
         height = len(block)
         width = max((len(row) for row in block), default=0)
-        lines.append(f"Grid {i} ({height}x{width}):")
-        for row in block:
-            lines.append("  " + str(list(row)))
+        lines.append(f"Grid {i} ({height}x{width}) [hex 0-f = color 0-15]:")
+        lines.extend(grid_to_hex_lines(block))
         lines.append("")
     return "\n".join(lines)
 
@@ -45,13 +45,16 @@ def _normalise_grid(grid: Sequence[Sequence[Any]]) -> list[list[int]]:
 
 
 def pretty_print_grid(grid: Sequence[Sequence[Any]], label: str) -> str:
-    """Render one 2D grid with a stable label."""
+    """Render one 2D grid as a hex map (one dense hex string per row).
+
+    Each cell is a single hex digit ``0-f`` = color int 0-15; this matches the
+    sandbox `state` view exactly. Recover the int with ``int(ch, 16)``.
+    """
     rows = _normalise_grid(grid)
     height = len(rows)
     width = max((len(row) for row in rows), default=0)
-    lines = [f"Grid {label} ({height}x{width}):"]
-    for row in rows:
-        lines.append("  " + str(list(row)))
+    lines = [f"Grid {label} ({height}x{width}) [hex 0-f = color 0-15]:"]
+    lines.extend(grid_to_hex_lines(rows))
     return "\n".join(lines)
 
 
@@ -296,7 +299,7 @@ def _animation_summary(
         colors: set[int] = set()
         for i in changed_indices:
             colors.update(diff_to_pre[i].colors or set())
-        colors_text = "[" + ",".join(str(c) for c in sorted(colors)) + "]"
+        colors_text = "[" + ",".join(color_to_hex(c) for c in sorted(colors)) + "]"
         changed_text = (
             f"{_format_index_ranges(changed_indices)} "
             f"({len(changed_indices)}/{len(grids)})"
@@ -310,14 +313,14 @@ def _animation_summary(
             f"max_motion={diff_to_prev[max_motion].count} cells "
             f"at grid {max_motion}; "
             f"bbox={_format_bbox(bbox)}; "
-            f"colors_seen={colors_text}"
+            f"colors_seen(hex)={colors_text}"
         )
     else:
         summary = (
             "ANIMATION SUMMARY: "
             f"frame_count={len(grids)}; changed_frames=none; "
             "peak_change=0 cells; max_motion=0 cells; "
-            "bbox=none; colors_seen=[]"
+            "bbox=none; colors_seen(hex)=[]"
         )
 
     return (

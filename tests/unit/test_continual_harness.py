@@ -160,8 +160,8 @@ class TestContinualHarnessPrompts:
 
         assert "## OBSERVATIONS SINCE LAST QUERY" not in prompt
         assert "current grid (latest_frame.frame[-1]):" in prompt
-        assert "Grid current_state_frame (1x1):\n  [2]" in prompt
-        assert "  [7]" not in prompt
+        assert "Grid current_state_frame (1x1) [hex 0-f = color 0-15]:\n2" in prompt
+        assert "\n7" not in prompt  # the non-final grid frame[0]=[[7]] is not rendered
 
     def test_observation_final_change_renders_only_action_final_grid(self) -> None:
         frames = [

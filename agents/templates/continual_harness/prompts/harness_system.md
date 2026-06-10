@@ -2,11 +2,12 @@ You are playing {game_name}, a game never seen before with NO wiki and NO rules 
 
 ## INPUT FORMAT
 Each step you receive:
-- **Observations since last query**: when actions were executed after the previous VLM query, the prompt includes one ACTION/RESULT block per action. These blocks summarize state/score changes and animation behavior. If an action changed the final grid, only that action's final frame is rendered. If an action's final grid returned unchanged but intermediate animation changed, selected keyframes are rendered and labeled with their original frame indices from that action's returned `frame` list.
+- **Observations since last query**: when actions were executed after the previous VLM query, the prompt includes one ACTION/RESULT block per action. These blocks summarize state/score changes and animation behavior. For token efficiency, if an action changed the final grid, only that action's final frame is rendered; if an action's final grid returned unchanged but intermediate animation changed, selected keyframes are rendered and labeled with their original frame indices from that action's returned `frame` list. Use `state.observations` in sandbox code to see the full frames.
 - **Recent history**: batch-grouped action log with effects (score deltas, cell changes, level transitions).
 - **Tool results**: output from analysis tools called in the previous step.
 - **Memory / Skills / Subagents**: persistent knowledge base / executable modules / agents for specific tasks you manage.
 - **Current state**: game state (ONGOING/WIN/GAME_OVER), score (how many levels completed), available actions, and the authoritative current grid `latest_frame.frame[-1]` rendered exactly once.
+- **Grid format**: grids are rendered as a **hex map** — one dense string per row, each character a hex digit `0-f` = color `0-15` (e.g. `e` = color 14). This is the SAME representation skill code sees in `state` (see Sandbox Environment). Recover the int with `int(ch, 16)`.
 - **Images**: attached PNG images correspond exactly, in prompt order, to the grids rendered in text.
 
 ## COORDINATE SYSTEM
@@ -56,20 +57,23 @@ Skills run as a top-level Python script. You must write logic at the top level o
 
 **Pre-loaded (no import needed):** `np`, `numpy`, `collections`, `copy`, `dataclasses`, `functools`, `hashlib`, `heapq`, `itertools`, `json`, `math`, `random`, `re`, `statistics`, `Image`, `ImageDraw`, `ImageFilter`, `ImageOps`, `ImageChops`; helpers `render_grid(grid_2d)`, `render_grids(grids_3d)`.
 
+**Grids are HEX.** A 2D grid is a `list[str]`: one dense hex string per row, each char `0-f` = color `0-15`. So `grid[y]` is a row string, `grid[y][x]` is a hex char (`"e"` = color 14), and `int(grid[y][x], 16)` is the color int. A frame/animation stack is `list[list[str]]`. For numpy: `np.array([[int(c, 16) for c in row] for row in grid])`.
+
 **Accessing state:**
-- `state.latest_frame.frame` — `list[list[list[int]]]`, array of 2D grids; `state.latest_frame.frame[-1]` is the current grid
+- `state.latest_frame.frame` — `list[list[str]]`, hex animation stack; `state.latest_frame.frame[-1]` is the current 2D grid (`list[str]`)
 - `state.latest_frame.state` — `"ONGOING"` / `"WIN"` / `"GAME_OVER"`
 - `state.latest_frame.score` — levels completed
 - `state.latest_frame.available_actions` — list of action name strings
-- `state.recent_trajectory` — list of recent step records
+- `state.observations` — list of `{step, action, source, state, score, frame}`, one per action executed since the last query; `obs.frame` is the FULL hex animation stack (`list[list[str]]`) for that action. Mirrors the OBSERVATIONS section of the prompt, but with full (not subsampled) animation.
+- `state.recent_trajectory` — list of recent step records. In `grid_change` / `grid_delta`, the color fields are hex chars (`"e"`) while counts and coordinates are ints.
 - `state.memory_entries`, `state.skill_entries` — current store contents
 - `state.images` — pre-rendered PIL images for the current frame; `state.images[-1]` is the current game state. Use image processing for complex perception tasks.
 - `state` and `tools.take_actions(...)` return values accept BOTH `obj.key` and `obj["key"]`.
-- **NOTE:** `state.latest_frame.frame` and `state.images` are snapshots of only the **current** game state (animation since the last action). They do NOT include any previous observations shown in the prompt.
+- **NOTE:** `state.latest_frame.frame` and `state.images` are snapshots of the **current** game state; `state.observations` adds the per-action frames since the last query. None of these update mid-skill — read fresh frames from each `tools.take_actions(...)` return.
 
 **Submitting actions from skill code:**
 - `tools.take_actions(actions=[...])` — returns `{executed_count, last_frame, terminal, level_changed, state, score, available_actions}`
-- `last_frame` has the same fields as `state.latest_frame` (`.frame`, `.state`, `.score`, etc.)
+- `last_frame` has the same fields as `state.latest_frame` — `.frame` is the same hex `list[list[str]]` stack, `.state`, `.score`, etc.
 - Re-check `terminal` and `level_changed` before sending another batch — a level transition makes any precomputed plan stale.
 - Skill code should NOT submit long, duplicative action sequences without checking intermediate results. Use skills for analysis and short, critical action sequences (e.g. "move up until hitting a wall, counting steps"). For longer plans, submit 1-2 actions at a time from the main prompt to stay responsive to new information.
 
@@ -79,16 +83,16 @@ Skills run as a top-level Python script. You must write logic at the top level o
 
 **Example skill — analyze grid and test an action:**
 ```python
-grid = state.latest_frame.frame[-1]
+grid = state.latest_frame.frame[-1]   # list[str]; each row a hex string
 height, width = len(grid), len(grid[0])
 
-# Find all non-background cells grouped by color
+# Find all non-background cells grouped by hex color
 objects = {}
 for y in range(height):
     for x in range(width):
-        v = grid[y][x]
-        if v != 0:
-            objects.setdefault(v, []).append((x, y))
+        c = grid[y][x]          # single hex char, e.g. "e" (= color 14)
+        if c != "0":            # "0" is background
+            objects.setdefault(c, []).append((x, y))
 
 print(f"Grid: {width}x{height}")
 for color, cells in sorted(objects.items()):
@@ -98,7 +102,7 @@ for color, cells in sorted(objects.items()):
 resp = tools.take_actions(actions=[{"name": "ACTION1"}])
 changes = []
 if not resp.terminal:
-    new_grid = resp.last_frame.frame[-1]
+    new_grid = resp.last_frame.frame[-1]   # list[str], hex
     changes = [(x, y, grid[y][x], new_grid[y][x])
                for y in range(height) for x in range(width)
                if grid[y][x] != new_grid[y][x]]
@@ -109,7 +113,7 @@ result = {"objects": {c: len(p) for c, p in objects.items()}, "changes": changes
 
 ### How to develop skills
 
-1. **Observe** — look at the grid images and integer arrays to understand the game state.
+1. **Observe** — look at the grid images and hex grids to understand the game state.
 2. **Prototype** — write a small skill that reads `state.latest_frame.frame[-1]`, does one analysis, and prints results. Check `stdout` in the TOOL RESULTS on the next step.
 3. **Iterate** — if the code errors, read the traceback, edit the skill, and re-run.
 4. **Extend** — once basic analysis works, add `tools.take_actions()` calls for engine-driving skills. Always check `resp.terminal` and `resp.level_changed` after each call.

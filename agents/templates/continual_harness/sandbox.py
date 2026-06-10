@@ -249,9 +249,22 @@ _PRELOADED_MODULE_NAMES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class SandboxState:
-    """JSON-only read-only view passed to sandboxed code as `state`."""
+    """JSON-only read-only view passed to sandboxed code as `state`.
 
+    Grids are hex (the same representation as the working prompt): a 2D grid is
+    a ``list[str]`` (one dense hex string per row, each char ``0-f`` = color
+    int 0-15), and a frame/animation stack is ``list[list[str]]``. Recover the
+    int with ``int(ch, 16)``.
+    """
+
+    # `.frame` is a hex stack list[list[str]]; `.state` / `.score` /
+    # `.available_actions` carry the usual metadata.
     latest_frame: dict[str, Any] | None = None
+    # One entry per action executed since the last VLM query, in order:
+    # {step, action, source, state, score, frame}. `frame` is the FULL hex
+    # animation stack (list[list[str]]) for that action — richer than the
+    # subsampled keyframes shown in the prompt.
+    observations: list[dict[str, Any]] = field(default_factory=list)
     recent_trajectory: list[dict[str, Any]] = field(default_factory=list)
     memory_entries: list[dict[str, Any]] = field(default_factory=list)
     skill_entries: list[dict[str, Any]] = field(default_factory=list)
@@ -1036,14 +1049,26 @@ def _safe_modules() -> dict[str, Any]:
     }
 
 
-def _render_grid_impl(grid: Any) -> Any:
-    """Render a 2D integer grid (palette indices) into a PIL.Image (RGBA).
+def _cell_to_index(value: Any) -> int:
+    """Map one grid cell to a palette index.
 
-    Exposed to skill code as `render_grid(...)`. Output is pixel-identical
-    to `helpers.grid_to_image` (same palette, same byte layout). Useful for
-    rendering the post-action frame returned from a
-    `tools.take_actions` RPC, where the skill receives raw grid data
-    rather than pre-rendered images.
+    Cells are hex chars in the model-facing representation (e.g. `"e"` = 14);
+    int cells are still tolerated for safety. Hex string rows mean a "row" is a
+    str, so `row[x]` yields a single hex char.
+    """
+    if isinstance(value, str):
+        return int(value, 16)
+    return int(value)
+
+
+def _render_grid_impl(grid: Any) -> Any:
+    """Render a 2D hex grid (list[str], one hex string per row) into a PIL.Image.
+
+    Exposed to skill code as `render_grid(...)`. Cells are hex chars `0-f` =
+    color int 0-15 (int cells also tolerated). Output is pixel-identical to
+    `helpers.grid_to_image` (same palette, same byte layout). Useful for
+    rendering the post-action frame returned from a `tools.take_actions` RPC,
+    where the skill receives raw grid data rather than pre-rendered images.
     """
     from PIL import Image as _PILImage
 
@@ -1063,14 +1088,14 @@ def _render_grid_impl(grid: Any) -> Any:
             except (IndexError, TypeError):
                 value = 0
             try:
-                raw.extend(palette[int(value) % len(palette)])
+                raw.extend(palette[_cell_to_index(value) % len(palette)])
             except (TypeError, ValueError):
                 raw.extend(palette[0])
     return _PILImage.frombytes("RGBA", (width, height), bytes(raw))
 
 
 def _render_grids_impl(grids: Any) -> Any:
-    """Render a 3D grid stack (a FrameData.frame value) into PIL.Images.
+    """Render a 3D hex grid stack (list[list[str]]) into PIL.Images.
 
     Exposed to skill code as `render_grids(...)`. Returns a list with one
     image per grid layer. An empty / None input yields a single 64×64

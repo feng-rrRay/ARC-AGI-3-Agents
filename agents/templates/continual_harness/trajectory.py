@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from ...run_artifacts import RUN_DIR_ENV, RUN_LOG_PATH_ENV, game_artifacts
+from .helpers import color_to_hex
 from .models import StepRecord
 
 
@@ -494,17 +495,8 @@ def format_full_history(
 
 # ---------------------------------------------------------------------------
 # Accumulative (append-only) RECENT HISTORY rendering.
-#
-# A pure, deterministic function of the immutable trajectory records: the same
-# records always render to the same bytes, so every line except the newest is
-# byte-identical across VLM calls and is served from the model's KV cache. The
-# log is segmented by level (grouped on the `score` field) and, within a level,
-# by attempt (split on RESET rows). Cleared levels collapse to one archive line;
-# finished attempts collapse to one summary line each (run-length-collapsed when
-# identical); only the current attempt is rendered per-action, with consecutive
-# identical (action, effect) rows collapsed.
+# auto compact when level change / game over
 # ---------------------------------------------------------------------------
-
 
 def summarize_grid_transitions(
     pre_grid: list[list[int]] | None,
@@ -542,6 +534,38 @@ def summarize_grid_transitions(
     return out
 
 
+def hexify_record_colors(record: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a trajectory record with only color fields hex-mapped.
+
+    ``grid_change`` rows are ``[from, to, count, r0, r1, c0, c1]`` and
+    ``grid_delta`` rows are ``[x, y, from, to]``; only the color slots become hex
+    chars (counts and coordinates stay int), matching the grid contract (cells
+    hex, coordinates int). The input is never mutated, so the stored record (and
+    ``trajectory.jsonl``) stay canonical int. Used only at the sandbox-view
+    boundary so skill code never sees a stray decimal color.
+    """
+    gc = record.get("grid_change")
+    gd = record.get("grid_delta")
+    if not gc and not gd:
+        return record
+    out = dict(record)
+    if gc:
+        out["grid_change"] = [
+            [color_to_hex(e[0]), color_to_hex(e[1]), *e[2:]]
+            if isinstance(e, (list, tuple)) and len(e) >= 2
+            else e
+            for e in gc
+        ]
+    if gd:
+        out["grid_delta"] = [
+            [e[0], e[1], color_to_hex(e[2]), color_to_hex(e[3]), *e[4:]]
+            if isinstance(e, (list, tuple)) and len(e) >= 4
+            else e
+            for e in gd
+        ]
+    return out
+
+
 def _range_token(r0: int, r1: int, c0: int, c1: int) -> str:
     rs = f"r{r0}" if r0 == r1 else f"r{r0}-{r1}"
     cs = f"c{c0}" if c0 == c1 else f"c{c0}-{c1}"
@@ -554,7 +578,11 @@ def _render_transitions(transitions: list[list[int]], *, max_groups: int = 6) ->
     for e in transitions[:max_groups]:
         f, t, cnt, r0, r1, c0, c1 = e[0], e[1], e[2], e[3], e[4], e[5], e[6]
         times = f" (×{cnt})" if cnt > 1 else ""
-        parts.append(f"color {f}→{t}{times}: {_range_token(r0, r1, c0, c1)}")
+        # Colors rendered hex (color_to_hex) to match the hex grids; storage is int.
+        parts.append(
+            f"color {color_to_hex(f)}→{color_to_hex(t)}{times}: "
+            f"{_range_token(r0, r1, c0, c1)}"
+        )
     if len(transitions) > max_groups:
         parts.append(f"+{len(transitions) - max_groups} more")
     noun = "cell" if total == 1 else "cells"

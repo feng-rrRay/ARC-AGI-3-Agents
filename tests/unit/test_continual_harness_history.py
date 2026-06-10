@@ -130,7 +130,7 @@ class TestRenderRecentHistory:
                  grid_change=[[1, 14, 9, 30, 32, 27, 29]]),
         ]
         out = render_recent_history(rows)
-        assert "[run_skill: solve_l6] step 1  ACTION1 → 9 cells changed: color 1→14 (×9): r30-32 c27-29" in out
+        assert "[run_skill: solve_l6] step 1  ACTION1 → 9 cells changed: color 1→e (×9): r30-32 c27-29" in out
 
     def test_game_over_effect_in_detail(self) -> None:
         rows = [_row(1, "ACTION2", state="NOT_FINISHED", state_after="GAME_OVER")]

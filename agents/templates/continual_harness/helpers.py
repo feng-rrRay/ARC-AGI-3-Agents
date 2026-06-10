@@ -35,6 +35,41 @@ _PALETTE: list[tuple[int, int, int, int]] = [
     (0xA3, 0x56, 0xD6, 0xFF),
 ]
 
+# ---------------------------------------------------------------------------
+# Hex grid representation.
+#
+# The model-facing view (working prompt + sandbox `state`) renders each color
+# cell as a single hex digit `0-f` (= palette index / color int 0-15). A 2D grid
+# becomes a list[str] (one dense hex string per row); a frame/animation stack
+# becomes list[list[str]]. Engine-internal storage stays int — hex is applied
+# only at the prompt and sandbox boundaries. `int(ch, 16)` recovers the color.
+# ---------------------------------------------------------------------------
+_HEX_DIGITS = "0123456789abcdef"
+
+
+def color_to_hex(value: int) -> str:
+    """Palette index (color int 0-15) -> single hex char.
+
+    Mirrors ``grid_to_image``'s ``% len(_PALETTE)`` wraparound so out-of-range
+    values map the same way pixels do.
+    """
+    return _HEX_DIGITS[int(value) % 16]
+
+
+def grid_to_hex_lines(grid: Sequence[Sequence[int]]) -> list[str]:
+    """2D int grid -> list[str], one dense hex string per row."""
+    return ["".join(color_to_hex(v) for v in row) for row in grid]
+
+
+def frame_to_hex(frame: Sequence[Sequence[Sequence[int]]] | None) -> list[list[str]]:
+    """3D int frame stack -> list[list[str]] (hex line-grid per layer)."""
+    return [grid_to_hex_lines(g) for g in (frame or [])]
+
+
+def hex_line_to_ints(line: str) -> list[int]:
+    """Inverse of one hex line-string -> list of color ints (for numpy/render)."""
+    return [int(ch, 16) for ch in line]
+
 # Reasoning is a required tool-level field on every action: forces Gemini to
 # emit a short justification before choosing, captured separately from action_data.
 _REASONING_PROP: dict[str, Any] = {

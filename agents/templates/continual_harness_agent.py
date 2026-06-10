@@ -21,6 +21,7 @@ from .continual_harness.context import (
 )
 from .continual_harness.helpers import (
     available_game_actions,
+    frame_to_hex,
     frame_to_images,
     grid_to_image,
     validate_action_sequence,
@@ -89,6 +90,7 @@ from .continual_harness.trajectory import (
     TrajectoryStore,
     default_trajectory_path,
     format_full_history,
+    hexify_record_colors,
     render_recent_history,
     summarize_grid_transitions,
 )
@@ -156,18 +158,66 @@ def _format_action_list(specs: Any) -> str:
 def _safe_frame_dump(frame: FrameData) -> dict[str, Any]:
     """JSON-safe dump of a FrameData for return to a sandboxed skill.
 
+    The `frame` field is hex-rendered (list[list[str]]) so a skill reading
+    `tools.take_actions(...).last_frame.frame` sees the same representation as
+    `state.latest_frame.frame` and the working prompt. int→hex boundary.
+
     Falls back to a hand-built dict if model_dump fails (defensive — same
     pattern used when building the sandbox state at the top of an iter).
     """
     try:
-        return frame.model_dump(mode="json")
+        dump = frame.model_dump(mode="json")
     except (AttributeError, TypeError):
-        return {
+        dump = {
             "state": frame.state.name,
             "score": frame.levels_completed,
             "frame": frame.frame,
             "available_actions": list(frame.available_actions),
         }
+    dump["frame"] = frame_to_hex(dump.get("frame"))
+    return dump
+
+
+def _build_sandbox_observations(
+    pending: list[PendingActionObservation],
+    frames: list[FrameData],
+) -> list[dict[str, Any]]:
+    """One hex entry per action since the last VLM query (mirrors OBSERVATIONS).
+
+    Each entry is ``{step, action, source, state, score, frame}`` where ``frame``
+    is the FULL hex animation stack (``list[list[str]]``) for that action —
+    richer than the prompt's subsampled keyframes. int→hex boundary.
+    """
+    out: list[dict[str, Any]] = []
+    n = len(frames)
+    for obs in pending:
+        idx = obs.post_frame_index
+        if not (0 <= idx < n):
+            continue
+        post = frames[idx]
+        data = obs.action_data or {}
+        if "x" in data and "y" in data:
+            label = f"{obs.action_name}(x={data['x']}, y={data['y']})"
+        elif data:
+            label = (
+                obs.action_name
+                + "("
+                + ", ".join(f"{k}={v}" for k, v in data.items())
+                + ")"
+            )
+        else:
+            label = obs.action_name
+        out.append(
+            {
+                "step": obs.action_counter,
+                "action": label,
+                "source": obs.source,
+                "state": post.state.name,
+                "score": post.levels_completed,
+                "frame": frame_to_hex(post.frame),
+            }
+        )
+    return out
 
 
 def _optional_str_list_arg(args: dict[str, Any], key: str) -> list[str] | None:
@@ -1245,9 +1295,20 @@ class ContinualHarness(Agent):
                 "score": latest_frame.levels_completed,
                 "frame": latest_frame.frame,
             }
+        # int→hex boundary: the sandbox `state` mirrors the working prompt's hex
+        # view. `latest_frame.frame` becomes a hex stack; `observations` carries
+        # the per-action hex frames; recent_trajectory colors are hex-mapped
+        # (counts/coords stay int). Engine storage / trajectory.jsonl stay int.
+        frame_dump["frame"] = frame_to_hex(frame_dump.get("frame"))
         self._current_sandbox_state = SandboxState(
             latest_frame=frame_dump,
-            recent_trajectory=self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT),
+            observations=_build_sandbox_observations(
+                self._pending_observations, self.frames
+            ),
+            recent_trajectory=[
+                hexify_record_colors(r)
+                for r in self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT)
+            ],
             memory_entries=[asdict(e) for e in self.memory.all_entries()],
             skill_entries=[asdict(e) for e in self.skills.all_entries()],
         )
