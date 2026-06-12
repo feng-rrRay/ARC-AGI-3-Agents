@@ -32,6 +32,7 @@ from agents.templates.utils.vlm_backend import (
     AnthropicBackend,
     GeminiBackend,
     OpenAIBackend,
+    estimate_vlm_usage_cost,
 )
 
 
@@ -525,3 +526,54 @@ class TestTokenUsage:
             "cached": None,
             "tool_use": None,
         }
+
+    def test_estimate_vlm_usage_cost_supported_gemini_tiers(self) -> None:
+        low = estimate_vlm_usage_cost(
+            "gemini-3.1-pro-preview",
+            {
+                "prompt": 100_000,
+                "output": 1_000,
+                "thoughts": 500,
+                "total": 101_500,
+                "cached": 20_000,
+            },
+        )
+        high = estimate_vlm_usage_cost(
+            "gemini-3.1-pro-preview",
+            {
+                "prompt": 250_000,
+                "output": 1_000,
+                "thoughts": 0,
+                "total": 251_000,
+                "cached": 50_000,
+            },
+            cumulative_usd_before=float(low["current_usd"]),
+        )
+
+        assert low is not None and low["tier"] == "le_200k"
+        assert high is not None and high["tier"] == "gt_200k"
+        assert low["billable_output_tokens"] == 1_500
+        assert low["current_usd"] == pytest.approx(
+            ((80_000 * 2.00) + (20_000 * 0.20) + (1_500 * 12.00)) / 1_000_000
+        )
+        assert high["current_usd"] == pytest.approx(
+            ((200_000 * 4.00) + (50_000 * 0.40) + (1_000 * 18.00)) / 1_000_000
+        )
+        assert high["cumulative_usd"] == pytest.approx(
+            float(low["current_usd"]) + float(high["current_usd"])
+        )
+
+    def test_estimate_vlm_usage_cost_unsupported_model_returns_none(self) -> None:
+        assert (
+            estimate_vlm_usage_cost(
+                "gemini-2.5-pro",
+                {
+                    "prompt": 100,
+                    "output": 20,
+                    "thoughts": 5,
+                    "total": 125,
+                    "cached": 0,
+                },
+            )
+            is None
+        )

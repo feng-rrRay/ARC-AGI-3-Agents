@@ -479,20 +479,72 @@ def build_observation_section(
 
 
 
-def _render_tool_results(records: Iterable[ToolCallRecord]) -> str:
-    payload = [
-        {
-            "name": r.name,
-            "args": r.args,
-            "result": r.result,
-            "error": r.error,
-            "actions_taken_inline": r.actions_taken_inline,
-        }
-        for r in records
+# Keys whose multi-line string values are lifted out of the JSON skeleton and
+# rendered as fenced blocks so the model reads them print-style, not escaped.
+_CODE_KEYS = {"code"}
+_TEXT_KEYS = {"stdout", "stderr", "instructions", "body", "description", "error"}
+
+
+def _fence(text: str, lang: str = "") -> str:
+    return f"```{lang}\n{text}\n```"
+
+
+def _lift_long_text(
+    value: Any, blocks: list[tuple[str, str, str]], key: str | None = None
+) -> Any:
+    """Recursively pull multi-line code/text string values out of ``value`` into
+    ``blocks`` (label, lang, text), replacing each in the returned JSON skeleton
+    with a short pointer. Keeps code (e.g. a skill's source) print-style in a
+    ```python fence instead of a ``\\n``-escaped JSON string."""
+    if isinstance(value, dict):
+        return {k: _lift_long_text(v, blocks, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_lift_long_text(v, blocks, key) for v in value]
+    if (
+        isinstance(value, str)
+        and key in (_CODE_KEYS | _TEXT_KEYS)
+        and ("\n" in value or len(value) > 80)
+    ):
+        lang = "python" if key in _CODE_KEYS else ""
+        label = f"{key} [{len(blocks) + 1}]"
+        blocks.append((label, lang, value))
+        return f"<{label} — printed below>"
+    return value
+
+
+def format_tool_record_md(r: ToolCallRecord) -> str:
+    """Render one tool-call record as a labelled markdown block: the JSON fields
+    plus any code/text lifted into fenced blocks. For run_skill the skill's source
+    is included in the result and surfaces as a ```python section."""
+    blocks: list[tuple[str, str, str]] = []
+    args_skel = _lift_long_text(r.args, blocks)
+    result_skel = _lift_long_text(r.result, blocks) if r.result is not None else None
+
+    lines = [
+        "### TOOL RESULT",
+        f"name: {r.name}",
+        f"args: {json.dumps(args_skel, default=str)}",
+        "",
+        "result:",
+        _fence(json.dumps(result_skel, default=str, indent=2), "json")
+        if result_skel is not None
+        else "(none)",
+        "",
+        "error:",
+        str(r.error) if r.error else "(none)",
+        "",
+        "actions_taken_inline:",
+        str(r.actions_taken_inline),
     ]
-    if not payload:
+    for label, lang, text in blocks:
+        lines += ["", f"{label}:", _fence(text, lang)]
+    return "\n".join(lines)
+
+
+def format_tool_results_markdown(records: Sequence[ToolCallRecord]) -> str:
+    if not records:
         return "(none)"
-    return json.dumps(payload, default=str, indent=2)
+    return "\n\n".join(format_tool_record_md(r) for r in records)
 
 
 def _format_available_actions(actions: Sequence[GameAction]) -> str:
@@ -525,6 +577,7 @@ def build_working_prompt(
     subagent_overview: str,
     observation_block: str = "",
     base_prompt: str = "",
+    previous_no_action_reason: str | None = None,
 ) -> str:
     """Assemble the per-VLM-call working prompt."""
     available = available_game_actions(latest_frame.available_actions)
@@ -562,8 +615,13 @@ def build_working_prompt(
         sections.append("## OBSERVATIONS SINCE LAST QUERY\n" + observation_block.rstrip())
     sections.append(
         "## TOOL RESULTS FROM PREVIOUS STEP\n"
-        + _render_tool_results(recent_tool_results)
+        + format_tool_results_markdown(recent_tool_results)
     )
+    if previous_no_action_reason:
+        sections.append(
+            "## PREVIOUS CONVERSATION STOPPED WITHOUT ACTION\n"
+            f"Reason: {previous_no_action_reason.strip()}"
+        )
     state_block = (
         "## CURRENT STATE\n"
         f"state: {latest_frame.state.name}\n"
@@ -575,8 +633,10 @@ def build_working_prompt(
 
     sections.append(
         "## TURN\n"
-        "Decide your next move. Keep responses to at most 2 tool calls, "
-        "and predict each action's effect before committing."
+        "This is a running conversation about the frame above. For tools not emitting an action, the "
+        "frame stays fixed and you may chain a few across turns to read or update"
+        "your notes. Emitting action ends this turn and you will receive a fresh observation next."
+        "Gather what you need, predict each action's effect, then commit the actions"
     )
     return "\n\n".join(sections)
 

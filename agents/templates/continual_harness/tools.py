@@ -522,7 +522,17 @@ class ContinualToolRouter:
             )
         try:
             result = handler(call.args)
-            return ToolCallRecord(name=call.name, args=call.args, result=result)
+            record = ToolCallRecord(name=call.name, args=call.args, result=result)
+            # Hoist the inline-action count the handler reports inside its result
+            # (run_skill / run_subagent) onto the record field the orchestrator
+            # reads, so skill/subagent-fired actions count toward the loop's
+            # actions_executed (and the conversation breaks to re-observe).
+            if isinstance(result, dict) and "actions_taken_inline" in result:
+                try:
+                    record.actions_taken_inline = int(result.get("actions_taken_inline") or 0)
+                except (TypeError, ValueError):
+                    record.actions_taken_inline = 0
+            return record
         except Exception as exc:
             logger.warning("tool %s raised: %s", call.name, exc)
             return ToolCallRecord(name=call.name, args=call.args, error=repr(exc))
