@@ -36,8 +36,8 @@ HARNESS_SYSTEM_INSTRUCTION: str = _read("harness_system.md")
 # while the system instruction (HARNESS_SYSTEM_INSTRUCTION) stays fixed.
 BASE_ORCHESTRATOR_POLICY: str = _read("base_orchestrator_policy.md")
 
-# Evolution prompts — meta-prompt used by ContinualHarness's prompt-evolution
-# step. Only loaded when --prompt-evolve-frequency > 0.
+# Evolution prompts — meta-prompt used by ContinualHarness's event/stagnation
+# prompt-evolution step.
 EVOLUTION_SYSTEM_INSTRUCTION: str = _read("evolution_system.md")
 EVOLUTION_USER_PROMPT: str = _read("evolution_user.md")
 

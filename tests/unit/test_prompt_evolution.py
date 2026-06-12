@@ -235,12 +235,12 @@ class TestPromptEvolutionFrequencyParsing:
     fixture just to exercise this codepath.
     """
 
-    def test_default_is_75(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_default_is_100(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY", raising=False)
         # Default in the class — verified via direct attribute access.
         from agents.templates.continual_harness_agent import ContinualHarness
 
-        assert ContinualHarness.DEFAULT_PROMPT_EVOLVE_FREQUENCY == 75
+        assert ContinualHarness.DEFAULT_PROMPT_EVOLVE_FREQUENCY == 100
 
     def test_zero_disables(self) -> None:
         # The hook condition `self._prompt_evolve_frequency > 0` ensures 0 disables.
@@ -272,9 +272,12 @@ class TestGameOverPromptEvolutionHook:
         from agents.templates.continual_harness_agent import ContinualHarness
 
         agent = ContinualHarness.__new__(ContinualHarness)
+        agent.game_id = "game-over-evo-test"
+        agent.model_name = "test-model"
         agent._prompt_evolve_frequency = frequency
         agent._last_evolution_step = 0
         agent._last_game_over_evolution_step = -1
+        agent._last_progress_step = 0
         agent.action_counter = action_counter
         return agent
 
@@ -286,11 +289,19 @@ class TestGameOverPromptEvolutionHook:
             levels_completed=0,
         )
 
+    def _playing_frame(self) -> FrameData:
+        return FrameData(
+            game_id="game-over-evo-test",
+            frame=[[[0]]],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+        )
+
     def test_game_over_evolves_once_and_resets_frequency_counter(self) -> None:
         agent = self._agent(action_counter=12)
         frame = self._frame()
         calls: list[FrameData] = []
-        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+        agent._evolve_system_prompt = lambda latest, **_: calls.append(latest)
 
         agent._evolve_on_game_over(frame)
 
@@ -302,7 +313,7 @@ class TestGameOverPromptEvolutionHook:
         agent = self._agent(frequency=0, action_counter=12)
         frame = self._frame()
         calls: list[FrameData] = []
-        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+        agent._evolve_system_prompt = lambda latest, **_: calls.append(latest)
 
         agent._evolve_on_game_over(frame)
 
@@ -313,21 +324,127 @@ class TestGameOverPromptEvolutionHook:
         agent = self._agent(action_counter=12)
         frame = self._frame()
         calls: list[FrameData] = []
-        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+        agent._evolve_system_prompt = lambda latest, **_: calls.append(latest)
 
         agent._evolve_on_game_over(frame)
         agent._evolve_on_game_over(frame)
 
         assert calls == [frame]
 
-    def test_game_over_reset_counter_blocks_immediate_periodic_evolution(self) -> None:
-        agent = self._agent(frequency=75, action_counter=12)
+    def test_game_over_reset_counter_blocks_immediate_stagnation_evolution(self) -> None:
+        agent = self._agent(frequency=10, action_counter=12)
         frame = self._frame()
         calls: list[FrameData] = []
-        agent._evolve_system_prompt = lambda latest: calls.append(latest)
+        agent._evolve_system_prompt = lambda latest, **_: calls.append(latest)
+        agent._last_progress_step = -100
+        agent.trajectory = _TrajectoryStub(_noop_records(30))
 
         agent._evolve_on_game_over(frame)
         agent.action_counter = 13
-        agent._maybe_evolve_prompt(frame)
+        agent._maybe_evolve_on_stagnation(self._playing_frame())
 
         assert calls == [frame]
+
+
+class _TrajectoryStub:
+    def __init__(self, records: list[dict[str, object]]) -> None:
+        self.records = records
+        self.requested: list[int] = []
+
+    def tail(self, n: int) -> list[dict[str, object]]:
+        self.requested.append(n)
+        return self.records[-n:]
+
+
+def _noop_records(n: int, *, action: str = "ACTION1") -> list[dict[str, object]]:
+    return [
+        {
+            "action_counter": i,
+            "state": "NOT_FINISHED",
+            "state_after": "NOT_FINISHED",
+            "score": 0,
+            "score_delta": 0,
+            "chosen_action": action,
+            "chosen_action_data": {},
+            "source": "vlm",
+            "grid_delta": None,
+            "grid_change": None,
+        }
+        for i in range(n)
+    ]
+
+
+@pytest.mark.unit
+class TestStagnationPromptEvolutionHook:
+    def _agent(self, *, frequency: int = 100, action_counter: int = 130):
+        from agents.templates.continual_harness_agent import ContinualHarness
+
+        agent = ContinualHarness.__new__(ContinualHarness)
+        agent.game_id = "stagnation-evo-test"
+        agent.model_name = "test-model"
+        agent._prompt_evolve_frequency = frequency
+        agent._last_evolution_step = 0
+        agent._last_game_over_evolution_step = -1
+        agent._last_progress_step = 0
+        agent.action_counter = action_counter
+        agent.trajectory = _TrajectoryStub(_noop_records(30))
+        return agent
+
+    def _frame(self) -> FrameData:
+        return FrameData(
+            game_id="stagnation-evo-test",
+            frame=[[[0]]],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+        )
+
+    def test_stagnation_evolves_when_no_progress_and_noop_window(self) -> None:
+        agent = self._agent()
+        frame = self._frame()
+        calls: list[tuple[FrameData, dict[str, object]]] = []
+
+        def evolve(latest: FrameData, **kwargs: object) -> None:
+            calls.append((latest, kwargs))
+
+        agent._evolve_system_prompt = evolve
+
+        agent._maybe_evolve_on_stagnation(frame)
+
+        assert len(calls) == 1
+        assert calls[0][0] == frame
+        assert calls[0][1]["trigger"] == "stagnation"
+        assert "no-op/invalid" in " ".join(calls[0][1]["trigger_evidence"])
+        assert agent._last_evolution_step == 130
+        assert agent.trajectory.requested == [agent.STAGNATION_WINDOW]
+
+    def test_stagnation_requires_progress_gap(self) -> None:
+        agent = self._agent(action_counter=130)
+        agent._last_progress_step = 80
+        frame = self._frame()
+        calls: list[FrameData] = []
+        agent._evolve_system_prompt = lambda latest, **_: calls.append(latest)
+
+        agent._maybe_evolve_on_stagnation(frame)
+
+        assert calls == []
+
+    def test_stagnation_requires_pattern_evidence(self) -> None:
+        agent = self._agent()
+        agent.trajectory = _TrajectoryStub(
+            [
+                {
+                    **record,
+                    "chosen_action": f"ACTION{i}",
+                    "grid_delta": [[0, 0, 1, 2]],
+                    "grid_change": [[1, 2, 1, 0, 0, 0, 0]],
+                }
+                for i, record in enumerate(_noop_records(30))
+            ]
+        )
+        frame = self._frame()
+        calls: list[FrameData] = []
+        agent._evolve_system_prompt = lambda latest, **_: calls.append(latest)
+
+        agent._maybe_evolve_on_stagnation(frame)
+
+        assert calls == []

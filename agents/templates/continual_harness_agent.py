@@ -260,11 +260,12 @@ class ContinualHarness(Agent):
       1. If state is NOT_PLAYED, emit RESET and continue. If state is
          GAME_OVER, evolve the base prompt once for that terminal state, then
          emit RESET and continue.
-      2. Maybe evolve the system prompt (boundary-gated by action_counter).
-      3. Make ONE VLM call via `_vlm_loop_inner`. The response may contain
+      2. Make ONE VLM call via `_vlm_loop_inner`. The response may contain
          analysis tool calls (process_memory, run_skill, etc.) and/or one
          `take_actions(actions=[...])` call. All are dispatched in emission
          order. take_actions executes its action list synchronously.
+      3. If the action result advances a level, evolve immediately. Otherwise,
+         evolve only when recent trajectory evidence shows stagnation.
       4. If any actions were executed (orchestrator OR via a skill's inline
          tools.take_actions RPC), clear the carried tool-result block.
          Otherwise carry results forward to the next iteration's prompt
@@ -287,11 +288,19 @@ class ContinualHarness(Agent):
     MAX_CONVERSATION_TURNS = 12  # max tool-only VLM turns per decision before forcing a break
     CONVERSATION_CONTEXT_GUARD_RATIO = 0.80
     SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
-    # Prompt-evolution defaults; the actual frequency is read from
+    # Prompt-evolution defaults; the stagnation threshold is read from
     # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
-    # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
-    DEFAULT_PROMPT_EVOLVE_FREQUENCY = 75
+    # --prompt-evolve-frequency). 0 disables all prompt evolution; positive N
+    # means evolve on stagnation after N actions without score/level progress.
+    DEFAULT_PROMPT_EVOLVE_FREQUENCY = 100
     PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
+    STAGNATION_MIN_ACTIONS_SINCE_EVOLUTION = 50
+    STAGNATION_WINDOW = 30
+    STAGNATION_MIN_WINDOW_RECORDS = 10
+    STAGNATION_NOOP_RATIO = 0.45
+    STAGNATION_REPEAT_ACTION_RATIO = 0.60
+    STAGNATION_MAX_CYCLE = 8
+    STAGNATION_MIN_CYCLE_REPEATS = 3
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Must resolve model_name BEFORE super().__init__(): Agent.__init__
@@ -326,6 +335,7 @@ class ContinualHarness(Agent):
         self._prompt_generation: int = 0
         self._last_evolution_step: int = -1
         self._last_game_over_evolution_step: int = -1
+        self._last_progress_step: int = 0
         self.prompt_evolution = PromptEvolutionStore(
             active_prompt_evolution_path(self.game_id)
         )
@@ -1063,7 +1073,7 @@ class ContinualHarness(Agent):
             len(self.subagents.all_entries()),
         )
         logger.info(
-            "[%s] Prompt evolution: frequency=%d, baseline at %s, log at %s",
+            "[%s] Prompt evolution: stagnation_after=%d, baseline at %s, log at %s",
             self.name,
             self._prompt_evolve_frequency,
             self._base_prompt_file.path,
@@ -1128,7 +1138,23 @@ class ContinualHarness(Agent):
             return m.group(1).strip()
         return text
 
-    def _evolve_system_prompt(self, latest_frame: FrameData) -> None:
+    @staticmethod
+    def _format_evolution_trigger_context(
+        trigger: str,
+        trigger_evidence: list[str] | None,
+    ) -> str:
+        evidence = [line for line in (trigger_evidence or []) if line]
+        lines = [f"Trigger: {trigger}"]
+        lines.extend(f"- {line}" for line in evidence)
+        return "\n".join(lines)
+
+    def _evolve_system_prompt(
+        self,
+        latest_frame: FrameData,
+        *,
+        trigger: str = "manual",
+        trigger_evidence: list[str] | None = None,
+    ) -> None:
         """One meta-VLM call that may rewrite the agent's base prompt.
 
         Spawns a fresh VLM with EVOLUTION_SYSTEM_INSTRUCTION. The model returns
@@ -1142,6 +1168,9 @@ class ContinualHarness(Agent):
 
         steps_since = max(1, self.action_counter - max(self._last_evolution_step, 0))
         trajectory_rows = self.trajectory.tail(steps_since)
+        trigger_context = self._format_evolution_trigger_context(
+            trigger, trigger_evidence
+        )
         user_prompt = build_evolution_prompt(
             system_prompt=self._system_instruction,
             current_base_prompt=previous,
@@ -1149,6 +1178,7 @@ class ContinualHarness(Agent):
             memory_overview=format_memory_full(self.memory.all_entries()),
             skill_overview=format_skill_overview(self.skills.all_entries()),
             subagent_overview=format_subagent_overview(self.subagents.all_entries()),
+            trigger_context=trigger_context,
         )
 
         evolution_system = EVOLUTION_SYSTEM_INSTRUCTION.replace(
@@ -1206,7 +1236,7 @@ class ContinualHarness(Agent):
                 generation=gen,
                 action_counter=self.action_counter,
                 accepted=accepted,
-                reasoning="",
+                reasoning=trigger_context,
                 proposed_prompt=proposed,
                 previous_prompt=previous,
                 new_prompt=self._current_base_prompt,
@@ -1226,6 +1256,8 @@ class ContinualHarness(Agent):
                     "tools_exposed": "evolution",
                     "evolution": {
                         "generation": gen,
+                        "trigger": trigger,
+                        "trigger_evidence": trigger_evidence or [],
                         "accepted": accepted,
                         "validation_error": validation_error,
                         "previous_len": len(previous),
@@ -1356,21 +1388,19 @@ class ContinualHarness(Agent):
 
             pre_step_level = latest_frame.levels_completed
 
-            # Prompt-evolution hook — boundary-gated by action_counter rather
-            # than modulo so multi-action batches that straddle a boundary
-            # still fire exactly once.
-            self._maybe_evolve_prompt(latest_frame)
-
             # `_vlm_loop_inner` runs a full conversation until an action fires and
             # owns `_recent_tool_results` (carrying the final turn's tool results
             # into the next decision's prompt), so main() no longer clears it here.
             self._vlm_loop_inner(latest_frame)
 
             # Level-up evolution: consolidate discovered rules immediately
-            # after advancing to a new level.
+            # after advancing to a new level. Otherwise, evolve only when the
+            # recent trajectory shows concrete stuck behavior.
             post_frame = self.frames[-1]
             if post_frame.levels_completed > pre_step_level:
                 self._evolve_on_level_up(post_frame)
+            else:
+                self._maybe_evolve_on_stagnation(post_frame)
 
         self.cleanup()
 
@@ -1761,6 +1791,10 @@ class ContinualHarness(Agent):
         post = frame if frame is not None else pre
         score_after = post.levels_completed
         state_after = post.state.name if frame is not None else "INVALID"
+        if frame is not None and (
+            score_after > pre_score or post.state is GameState.WIN
+        ):
+            self._last_progress_step = self.action_counter
 
         post_grid = post.frame[-1] if post.frame else None
         grid_delta = _compute_grid_delta(pre_grid, post_grid)
@@ -1924,23 +1958,142 @@ class ContinualHarness(Agent):
         tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])
         return tools
 
-    def _maybe_evolve_prompt(self, latest_frame: FrameData) -> None:
+    @staticmethod
+    def _trajectory_action_label(record: dict[str, Any]) -> str:
+        name = str(record.get("chosen_action") or "UNKNOWN")
+        data = record.get("chosen_action_data") or {}
+        if not isinstance(data, dict) or not data:
+            return name
+        if "x" in data and "y" in data and len(data) == 2:
+            return f"{name}({data['x']},{data['y']})"
+        args = ",".join(f"{k}={v}" for k, v in sorted(data.items()))
+        return f"{name}({args})"
+
+    @staticmethod
+    def _is_noop_or_invalid_record(record: dict[str, Any]) -> bool:
+        state_after = record.get("state_after")
+        if state_after == "INVALID":
+            return True
+
+        state_before = record.get("state")
+        resolved_after = state_after or state_before
+        score_delta = record.get("score_delta")
+        score_changed = isinstance(score_delta, int) and score_delta != 0
+        grid_changed = bool(record.get("grid_delta") or record.get("grid_change"))
+        return resolved_after == state_before and not score_changed and not grid_changed
+
+    def _repeated_cycle_evidence(self, labels: list[str]) -> str | None:
+        max_cycle = min(self.STAGNATION_MAX_CYCLE, len(labels) // 2)
+        for width in range(2, max_cycle + 1):
+            pattern = labels[-width:]
+            repeats = 1
+            cursor = len(labels) - width
+            while cursor - width >= 0 and labels[cursor - width : cursor] == pattern:
+                repeats += 1
+                cursor -= width
+            if repeats >= self.STAGNATION_MIN_CYCLE_REPEATS:
+                return (
+                    f"last {width * repeats} actions repeat a {width}-action cycle: "
+                    f"{', '.join(pattern)}"
+                )
+        return None
+
+    def _stagnation_evidence(self, records: list[dict[str, Any]]) -> list[str]:
+        actionable = [
+            record
+            for record in records
+            if isinstance(record, dict) and record.get("source") != "auto_reset"
+        ]
+        if len(actionable) < self.STAGNATION_MIN_WINDOW_RECORDS:
+            return []
+
+        evidence: list[str] = []
+        noops = sum(1 for record in actionable if self._is_noop_or_invalid_record(record))
+        noop_ratio = noops / len(actionable)
+        if noop_ratio >= self.STAGNATION_NOOP_RATIO:
+            evidence.append(
+                f"last {len(actionable)} actions include {noops} no-op/invalid "
+                f"results ({noop_ratio:.0%})"
+            )
+
+        labels = [self._trajectory_action_label(record) for record in actionable]
+        counts: dict[str, int] = {}
+        for label in labels:
+            counts[label] = counts.get(label, 0) + 1
+        dominant_label, dominant_count = max(counts.items(), key=lambda item: item[1])
+        repeat_ratio = dominant_count / len(labels)
+        if repeat_ratio >= self.STAGNATION_REPEAT_ACTION_RATIO:
+            evidence.append(
+                f"action {dominant_label} appears {dominant_count}/"
+                f"{len(labels)} times ({repeat_ratio:.0%})"
+            )
+
+        cycle = self._repeated_cycle_evidence(labels)
+        if cycle:
+            evidence.append(cycle)
+
+        return evidence
+
+    def _maybe_evolve_on_stagnation(self, latest_frame: FrameData) -> None:
         if self._prompt_evolve_frequency <= 0:
             return
         if self.action_counter == 0:
             return
-        gap = self.action_counter - self._last_evolution_step
-        if gap < self._prompt_evolve_frequency:
+        if latest_frame.state in {
+            GameState.GAME_OVER,
+            GameState.NOT_PLAYED,
+            GameState.WIN,
+        }:
             return
-        self._last_evolution_step = self.action_counter
-        self._evolve_system_prompt(latest_frame)
+
+        progress_gap = self.action_counter - max(
+            getattr(self, "_last_progress_step", 0), 0
+        )
+        if progress_gap < self._prompt_evolve_frequency:
+            return
+
+        evolution_gap = self.action_counter - max(self._last_evolution_step, 0)
+        if evolution_gap < self.STAGNATION_MIN_ACTIONS_SINCE_EVOLUTION:
+            return
+
+        pattern_evidence = self._stagnation_evidence(
+            self.trajectory.tail(self.STAGNATION_WINDOW)
+        )
+        if not pattern_evidence:
+            return
+
+        evidence = [
+            f"{progress_gap} actions since last score/level progress",
+            f"{evolution_gap} actions since last prompt evolution",
+            *pattern_evidence,
+        ]
+        logger.info("[%s] stagnation evolution: %s", self.name, "; ".join(evidence))
+        try:
+            self._evolve_system_prompt(
+                latest_frame,
+                trigger="stagnation",
+                trigger_evidence=evidence,
+            )
+        finally:
+            self._last_evolution_step = self.action_counter
 
     def _evolve_on_level_up(self, latest_frame: FrameData) -> None:
         """Trigger evolution unconditionally on level transition."""
         if self._prompt_evolve_frequency <= 0:
             return
-        self._last_evolution_step = self.action_counter
-        self._evolve_system_prompt(latest_frame)
+        self._last_progress_step = self.action_counter
+        evidence = [
+            f"advanced to score/level {latest_frame.levels_completed}",
+            f"action_counter={self.action_counter}",
+        ]
+        try:
+            self._evolve_system_prompt(
+                latest_frame,
+                trigger="level_up",
+                trigger_evidence=evidence,
+            )
+        finally:
+            self._last_evolution_step = self.action_counter
 
     def _evolve_on_game_over(self, latest_frame: FrameData) -> None:
         """Trigger evolution once for a GAME_OVER state before auto-reset."""
@@ -1949,8 +2102,19 @@ class ContinualHarness(Agent):
         if self._last_game_over_evolution_step == self.action_counter:
             return
         self._last_game_over_evolution_step = self.action_counter
-        self._last_evolution_step = self.action_counter
-        self._evolve_system_prompt(latest_frame)
+        evidence = [
+            "entered GAME_OVER before auto-reset",
+            f"score/level={latest_frame.levels_completed}",
+            f"action_counter={self.action_counter}",
+        ]
+        try:
+            self._evolve_system_prompt(
+                latest_frame,
+                trigger="game_over",
+                trigger_evidence=evidence,
+            )
+        finally:
+            self._last_evolution_step = self.action_counter
 
     def _mint_batch_id(self) -> str:
         self._batch_counter += 1

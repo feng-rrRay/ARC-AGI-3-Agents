@@ -1,7 +1,7 @@
 """Prompt-evolution scaffolding for ContinualHarness.
 
-The harness runs a meta-VLM call every N steps that proposes a replacement for
-its own system instruction. This module owns:
+The harness runs event- or stagnation-triggered meta-VLM calls that propose a
+replacement for its own base prompt. This module owns:
 
 - `PromptFile` — atomic read/write of the current active prompt (single .md file).
 - `PromptEvolutionStore` — append-only JSONL log of every evolution attempt
@@ -167,6 +167,7 @@ def build_evolution_prompt(
     memory_overview: str = "",
     skill_overview: str = "",
     subagent_overview: str = "",
+    trigger_context: str = "Trigger: manual",
 ) -> str:
     """Assemble the meta-call user prompt from the EVOLUTION_USER_PROMPT template.
 
@@ -184,6 +185,7 @@ def build_evolution_prompt(
         memory_overview=memory_overview,
         skill_overview=skill_overview,
         subagent_overview=subagent_overview,
+        trigger_context=trigger_context,
     )
 
 

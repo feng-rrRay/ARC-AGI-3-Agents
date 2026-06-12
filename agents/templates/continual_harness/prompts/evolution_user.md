@@ -13,6 +13,9 @@ This is the optimizable strategic guidance that gets combined with runtime conte
 ## Recent Agent Trajectories (last {n} steps):
 {trajectory}
 
+## Evolution Trigger
+{trigger_context}
+
 ## Current Agent State
 {memory_overview}
 
