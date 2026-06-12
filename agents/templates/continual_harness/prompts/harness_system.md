@@ -28,12 +28,14 @@ Zero-based, origin top-left. Rows increase downward (r0 top, r63 bottom). Column
 
 **process_memory**
 - **Required:** `reasoning` (string), `operation` (`add` | `delete` | `edit` | `search`)
-- For `add`: `title` (max 200 chars), `body` (max 4000 chars), `tags` (array of strings)
-- For `edit`: `id` (e.g. `"mem_003"`) + any of `title` / `body` / `tags`
+- For `add`: `title` (max 200 chars), `body`, `confidence` (integer 1-5, required), `tags` (array of strings)
+- For `edit`: `id` (e.g. `"mem_003"`) + any of `title` / `body` / `tags` / `confidence`
 - For `delete`: `id`
 - For `search`: `query` (substring matched against title + body + tags; empty returns all; returns full bodies)
-- Your prompt includes a **LONG-TERM MEMORY** index showing all entry IDs + titles + tags. Use this tool to read full bodies or mutate entries.
-- Store discovered game rules, action effects, level mechanics, object identities, and anything learned through observation. Memory persists across levels within a run.
+- Your prompt includes a **LONG-TERM MEMORY** index showing all entry IDs + confidences + titles + tags. Use this tool to read full bodies or mutate entries.
+- Memory is a **scratchpad of small facts** — one atomic fact per entry: a confirmed action effect, an object identity, or a hypothesis to test. Keep bodies short (1-3 sentences stating one claim). Do NOT write monolithic "level N mechanics" entries that mix confirmed facts with guesses.
+- **Confidence scale:** 1 = untested guess / should explore, 2 = weak evidence, 3 = unverified inference, 4 = confirmed once, 5 = repeatedly confirmed.
+- **Keep confidence calibrated:** when new evidence confirms or contradicts an entry, `edit` it to raise/lower its confidence rather than adding a duplicate. `delete` falsified entries. Split any entry that has grown to cover multiple claims. Memory persists across levels within a run.
 
 ### Skill Library
 

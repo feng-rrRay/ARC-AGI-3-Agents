@@ -381,13 +381,19 @@ class ContinualHarness(Agent):
                     title = args.get("title") or ""
                     body = args.get("body") or ""
                     tags = list(args.get("tags") or [])
-                    entry = self.memory.add(title=title, body=body, tags=tags)
+                    entry = self.memory.add(
+                        title=title,
+                        body=body,
+                        tags=tags,
+                        confidence=args.get("confidence"),
+                    )
                     return {
                         "success": True,
                         "operation": "add",
                         "id": entry.id,
                         "title": entry.title,
                         "tags": entry.tags,
+                        "confidence": entry.confidence,
                     }
                 if op == "delete":
                     entry_id = args.get("id") or ""
@@ -420,6 +426,7 @@ class ContinualHarness(Agent):
                         title=args.get("title"),
                         body=args.get("body"),
                         tags=list(args["tags"]) if "tags" in args else None,
+                        confidence=args.get("confidence"),
                     )
                     if edited is None:
                         return {
@@ -432,6 +439,7 @@ class ContinualHarness(Agent):
                         "success": True,
                         "operation": "edit",
                         "id": entry_id,
+                        "confidence": edited.confidence,
                         "updated_at": edited.updated_at,
                     }
                 if op == "search":

@@ -461,6 +461,7 @@ class TestRunLocalMemory:
                             "operation": "add",
                             "title": "run local",
                             "body": "available without bootstrap",
+                            "confidence": 3,
                         },
                     )
                 ),
@@ -518,6 +519,7 @@ class TestMemoryOn:
                             "body": "After ACTION1 we observed the orange block move up; "
                             "the white cross is just a target.",
                             "tags": ["player_identity"],
+                            "confidence": 4,
                         },
                     )
                 ),
@@ -532,7 +534,10 @@ class TestMemoryOn:
         # Round 2's prompt overview reflects the just-added entry.
         round2_prompt = scripted.calls[1][1]
         assert "## LONG-TERM MEMORY (1 entries)" in round2_prompt
-        assert "[mem_001] Orange block is the player (player_identity)" in round2_prompt
+        assert (
+            "[mem_001][c4] Orange block is the player (player_identity)"
+            in round2_prompt
+        )
         # Body stays out of the auto-injected overview block (it only renders
         # title + tags). The tool-result echo below carries the body since the
         # model just supplied it as an arg — that's expected, not a leak.
@@ -625,8 +630,9 @@ class TestMemoryOn:
         agent.choose_action([_make_frame([1])], _make_frame([1]))
 
         round2_prompt = scripted.calls[1][1]
-        assert "[mem_001] new title" in round2_prompt
-        assert "[mem_001] old title" not in round2_prompt
+        # Seeded entry predates the confidence field → defaults to 3 in the index.
+        assert "[mem_001][c3] new title" in round2_prompt
+        assert "old title" not in round2_prompt
 
     def test_search_returns_full_body(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -725,8 +731,9 @@ class TestMemoryOn:
 
         prompt = scripted.calls[0][1]
         assert "## LONG-TERM MEMORY (2 entries)" in prompt
-        assert "[mem_001] first preloaded" in prompt
-        assert "[mem_002] second preloaded" in prompt
+        # Bootstrap entries written before the confidence field default to c3.
+        assert "[mem_001][c3] first preloaded" in prompt
+        assert "[mem_002][c3] second preloaded" in prompt
 
     def test_bootstrap_file_is_written_back_on_mutation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -742,6 +749,7 @@ class TestMemoryOn:
                             "operation": "add",
                             "title": "persisted",
                             "body": "persisted body",
+                            "confidence": 5,
                         },
                     )
                 ),
@@ -759,6 +767,7 @@ class TestMemoryOn:
         entries = reopened.all_entries()
         assert len(entries) == 1
         assert entries[0].title == "persisted"
+        assert entries[0].confidence == 5
 
 
 # --- skill / sandbox orchestrator tests --------------------------------------

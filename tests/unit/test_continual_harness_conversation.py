@@ -563,6 +563,7 @@ class TestConversationLoop:
                     "operation": "add",
                     "title": "fresh-memory",
                     "body": "body",
+                    "confidence": 4,
                 },
             ),
             _fc_part(
@@ -580,6 +581,33 @@ class TestConversationLoop:
         assert had_fcs is True
         assert [r.name for r in records] == ["process_memory", "run_skill"]
         assert records[1].result["result"] == ["fresh-memory"]  # type: ignore[index]
+
+    def test_memory_add_without_confidence_is_error_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        frame = _make_frame()
+        agent.frames = [frame]
+        response = _response(
+            _fc_part(
+                "process_memory",
+                {
+                    "reasoning": "remember without committing to a belief",
+                    "operation": "add",
+                    "title": "uncalibrated",
+                    "body": "body",
+                },
+            )
+        )
+
+        actions, records, _logs, _terminal, _had_fcs = agent._dispatch_response(
+            response
+        )
+
+        assert actions == 0
+        assert records[0].result["success"] is False  # type: ignore[index]
+        assert "confidence" in records[0].result["error"]  # type: ignore[index]
+        assert agent.memory.all_entries() == []
 
 
 @pytest.mark.unit

@@ -50,7 +50,7 @@ class FunctionCall:
 
 PROCESS_MEMORY_TOOL: dict[str, Any] = {
     "name": "process_memory",
-    "description": "Manage long-term memory (add/edit/delete/search). Store discovered rules, action effects, level mechanics. Memory index is auto-injected into every prompt; use search to read full bodies.",
+    "description": "Manage the fact scratchpad (add/edit/delete/search). One small fact per entry — a confirmed action effect, an object identity, or a hypothesis to test — each with a confidence score. Do NOT write monolithic entries that mix confirmed facts with guesses. Memory index is auto-injected into every prompt; use search to read full bodies.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -69,7 +69,11 @@ PROCESS_MEMORY_TOOL: dict[str, Any] = {
             },
             "body": {
                 "type": "string",
-                "description": "Full memory content (returned by search). Required for add; optional for edit. Max 4000 chars.",
+                "description": "The fact itself (returned by search). Keep it short — 1-3 sentences stating one claim. Required for add; optional for edit.",
+            },
+            "confidence": {
+                "type": "integer",
+                "description": "How sure you are this fact is true: 1=untested guess/should explore, 2=weak evidence, 3=unverified inference, 4=confirmed once, 5=repeatedly confirmed. Required for add; optional for edit (update it as evidence accrues).",
             },
             "tags": {
                 "type": "array",
