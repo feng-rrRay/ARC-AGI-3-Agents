@@ -486,7 +486,7 @@ class GeminiBackend(VLMBackend):
             response = self.client.models.count_tokens(
                 model=self.model_name,
                 contents=contents,
-                config=self._count_tokens_config(),
+                # config=self._count_tokens_config(),
             )
             total = getattr(response, "total_tokens", None)
             if total is None:

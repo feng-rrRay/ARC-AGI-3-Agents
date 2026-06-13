@@ -541,10 +541,84 @@ def format_tool_record_md(r: ToolCallRecord) -> str:
     return "\n".join(lines)
 
 
-def format_tool_results_markdown(records: Sequence[ToolCallRecord]) -> str:
+# How many of the newest carried-over tool results render as full blocks;
+# everything older collapses to a one-line recap entry.
+TOOL_RESULTS_FULL_LAST_N = 2
+
+
+def _tool_call_brief(r: ToolCallRecord) -> str:
+    """One-line ``name(args)`` summary with the reasoning argument dropped."""
+    args = {k: v for k, v in (r.args or {}).items() if k != "reasoning"}
+    text = json.dumps(args, default=str)
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return f"{r.name}({text})"
+
+
+def _tool_outcome_brief(r: ToolCallRecord) -> str:
+    """Compact outcome: ok/failed/error tag + the start of the main output."""
+    if r.error:
+        tag, text = "error", str(r.error)
+    elif isinstance(r.result, dict):
+        tag = "ok" if r.result.get("success", True) else "failed"
+        text = (
+            r.result.get("stdout")
+            or r.result.get("error")
+            or r.result.get("message")
+            or json.dumps(r.result, default=str)
+        )
+    else:
+        tag, text = "ok", json.dumps(r.result, default=str)
+    text = " ".join(str(text).split())
+    if len(text) > 160:
+        text = f"{text[:160]}... [+{len(text) - 160} chars]"
+    return f"{tag}: {text}"
+
+
+def _tool_dedup_key(r: ToolCallRecord) -> str:
+    args = {k: v for k, v in (r.args or {}).items() if k != "reasoning"}
+    return json.dumps([r.name, args, r.result, r.error], default=str, sort_keys=True)
+
+
+def format_tool_results_markdown(
+    records: Sequence[ToolCallRecord],
+    *,
+    full_last_n: int = TOOL_RESULTS_FULL_LAST_N,
+) -> str:
+    """Render carried-over tool results from the previous turn's deliberation.
+
+    The newest ``full_last_n`` records render as full blocks; older ones
+    collapse to a one-line recap each. A call whose output is identical to an
+    earlier call's collapses to a pointer, so the model sees that re-running
+    it returned nothing new.
+    """
     if not records:
         return "(none)"
-    return "\n\n".join(format_tool_record_md(r) for r in records)
+    if full_last_n <= 0 or len(records) <= full_last_n:
+        return "\n\n".join(format_tool_record_md(r) for r in records)
+
+    cut = len(records) - full_last_n
+    recap: list[str] = [
+        f"{len(records)} tool calls ran during the previous turn's deliberation. "
+        f"Recap below (oldest first); the last {full_last_n} results are printed "
+        "in full. Do NOT re-run a recapped call to re-read its output — the full "
+        "output was already shown when it ran."
+    ]
+    first_seen: dict[str, int] = {}
+    for i, r in enumerate(records):
+        first = first_seen.setdefault(_tool_dedup_key(r), i)
+        if i >= cut:
+            continue
+        brief = _tool_call_brief(r)
+        if first != i:
+            recap.append(
+                f"- {i + 1}. {brief} -> identical output to call {first + 1} "
+                "(re-running returned nothing new)"
+            )
+        else:
+            recap.append(f"- {i + 1}. {brief} -> {_tool_outcome_brief(r)}")
+    full_blocks = [format_tool_record_md(r) for r in records[cut:]]
+    return "\n".join(recap) + "\n\n" + "\n\n".join(full_blocks)
 
 
 def _format_available_actions(actions: Sequence[GameAction]) -> str:
@@ -578,6 +652,7 @@ def build_working_prompt(
     observation_block: str = "",
     base_prompt: str = "",
     previous_no_action_reason: str | None = None,
+    max_deliberation_turns: int | None = None,
 ) -> str:
     """Assemble the per-VLM-call working prompt."""
     available = available_game_actions(latest_frame.available_actions)
@@ -614,7 +689,7 @@ def build_working_prompt(
     if observation_block.strip():
         sections.append("## OBSERVATIONS SINCE LAST QUERY\n" + observation_block.rstrip())
     sections.append(
-        "## TOOL RESULTS FROM PREVIOUS STEP\n"
+        "## TOOL RESULTS FROM PREVIOUS TURN\n"
         + format_tool_results_markdown(recent_tool_results)
     )
     if previous_no_action_reason:
@@ -631,12 +706,20 @@ def build_working_prompt(
     )
     sections.append(state_block)
 
+    budget_line = (
+        f"You have at most {max_deliberation_turns} non-action turns to decide the next action(s)."
+        if max_deliberation_turns
+        else ""
+    )
     sections.append(
         "## TURN\n"
-        "This is a running conversation about the frame above. For tools not emitting an action, the "
-        "frame stays fixed and you may chain a few across turns to read or update"
-        "your notes. Emitting action ends this turn and you will receive a fresh observation next."
-        "Gather what you need, predict each action's effect, then commit the actions"
+        "This is a running conversation about the frame above. The frame stays fixed until you act. "
+        + budget_line
+        + "Aim to act within 2-3 non-action turns. Do not re-run a tool whose "
+        "output is already in this conversation or in the recap above; record "
+        "conclusions to memory instead of re-deriving them. Only take_actions "
+        "produces new information — predict each action's effect, then commit. "
+        "An action that advances the game or disproves a hypothesis are both progress; you will receive a fresh observation next."
     )
     return "\n\n".join(sections)
 

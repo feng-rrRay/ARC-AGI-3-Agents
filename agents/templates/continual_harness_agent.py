@@ -645,8 +645,9 @@ class ContinualHarness(Agent):
         self._subagent_call_count: int = 0
 
         # Cross-iteration state for the new VLM-call-driven loop.
-        # `_recent_tool_results` carries forward analysis-tool outputs from one
-        # outer iteration to the next (PokeAgent-style — cleared on action).
+        # `_recent_tool_results` carries the previous conversation's analysis-tool
+        # outputs into the next decision's prompt (older ones as a recap line,
+        # the newest in full — see format_tool_results_markdown).
         # `_pending_observations` carries action transition/result frames from
         # executed actions into the next successful orchestrator VLM prompt.
         # `_consecutive_vlm_errors` is bookkeeping for hard failure detection.
@@ -1397,8 +1398,9 @@ class ContinualHarness(Agent):
             pre_step_level = latest_frame.levels_completed
 
             # `_vlm_loop_inner` runs a full conversation until an action fires and
-            # owns `_recent_tool_results` (carrying the final turn's tool results
-            # into the next decision's prompt), so main() no longer clears it here.
+            # owns `_recent_tool_results` (carrying all of the conversation's tool
+            # results into the next decision's prompt as recap + full tail), so
+            # main() no longer clears it here.
             self._vlm_loop_inner(latest_frame)
 
             # Level-up evolution: consolidate discovered rules immediately
@@ -1486,7 +1488,7 @@ class ContinualHarness(Agent):
         contents: list[Any] = [self.vlm.build_user_turn(prompt, vlm_images)]
 
         actions_executed = 0
-        final_new_results: list[ToolCallRecord] = []
+        all_new_results: list[ToolCallRecord] = []
         prev_results: list[ToolCallRecord] = []
         no_action_reason: str | None = None
         turn = 0
@@ -1542,7 +1544,7 @@ class ContinualHarness(Agent):
                 had_fcs,
             ) = self._dispatch_response(response)
             actions_executed += turn_actions
-            final_new_results = new_results
+            all_new_results.extend(new_results)
 
             usage_cost = self._record_vlm_usage(usage)
 
@@ -1599,10 +1601,11 @@ class ContinualHarness(Agent):
                 logger.warning("[%s] conv=%d %s", self.game_id, conversation_id, no_action_reason)
                 break
 
-        # Carry only the final turn's non-action tool results into the next
-        # working prompt's TOOL RESULTS block. Intermediate results already lived
-        # in the cached conversation the model saw, so they are not re-sent.
-        self._recent_tool_results = final_new_results[-self.RECENT_RESULTS_CAP:]
+        # Carry every non-action tool result from this conversation into the next
+        # working prompt's TOOL RESULTS block: the newest render in full, older
+        # ones as a one-line recap (see format_tool_results_markdown), so the
+        # next decision does not re-run tools to re-derive outputs it already saw.
+        self._recent_tool_results = all_new_results[-self.RECENT_RESULTS_CAP:]
         if actions_executed > 0 or self.frames[-1].state in (
             GameState.WIN,
             GameState.GAME_OVER,
@@ -1950,6 +1953,7 @@ class ContinualHarness(Agent):
             observation_block=observation_block,
             base_prompt=self._current_base_prompt,
             previous_no_action_reason=self._previous_no_action_reason,
+            max_deliberation_turns=self.MAX_CONVERSATION_TURNS,
         )
         return prompt, rendered_grids
 

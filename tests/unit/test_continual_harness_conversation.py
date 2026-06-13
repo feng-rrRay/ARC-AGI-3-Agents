@@ -20,7 +20,10 @@ import pytest
 from arcengine import ActionInput, FrameData, FrameDataRaw, GameState
 from PIL import Image
 
-from agents.templates.continual_harness.context import format_tool_record_md
+from agents.templates.continual_harness.context import (
+    format_tool_record_md,
+    format_tool_results_markdown,
+)
 from agents.templates.continual_harness.models import (
     PendingActionObservation,
     ToolCallRecord,
@@ -365,8 +368,9 @@ class TestConversationLoop:
         # Observation block delivered on turn 0 then cleared.
         assert "OBSERVATIONS SINCE LAST QUERY" in rows[0]["input"]["user_prompt"]
         assert agent._pending_observations == []
-        # Final turn's non-action results carry forward (none on the action turn).
-        assert agent._recent_tool_results == []
+        # ALL non-action results from the conversation carry forward: turn 0's
+        # process_memory record (the action turn itself adds none).
+        assert [r.name for r in agent._recent_tool_results] == ["process_memory"]
 
     def test_immediate_action_is_single_turn(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -537,6 +541,8 @@ class TestConversationLoop:
         assert {r["conversation_id"] for r in rows} == {rows[0]["conversation_id"]}
         assert [r["conversation_turn"] for r in rows] == [0, 1, 2]
         assert "max_conversation_turns" in (agent._previous_no_action_reason or "")
+        # Every turn's tool record carries into the next decision's prompt.
+        assert [r.name for r in agent._recent_tool_results] == ["process_memory"] * 3
 
     def test_run_skill_sees_memory_added_earlier_in_same_response(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -656,3 +662,71 @@ class TestToolResultMarkdown:
         assert "error:\n(none)" in out  # top-level field is None...
         assert '"success": false' in out  # ...but the failure shows in result
         assert "no entry with id=mem_9" in out
+
+    @staticmethod
+    def _run_skill_record(skill_id: str, stdout: str) -> ToolCallRecord:
+        return ToolCallRecord(
+            name="run_skill",
+            args={"reasoning": "look", "id": skill_id},
+            result={"success": True, "stdout": stdout, "id": skill_id},
+            actions_taken_inline=0,
+        )
+
+    def test_few_records_render_all_full(self) -> None:
+        records = [
+            self._run_skill_record("skill_001", "a"),
+            self._run_skill_record("skill_002", "b"),
+        ]
+        out = format_tool_results_markdown(records)
+        assert out.count("### TOOL RESULT") == 2
+        assert "Recap" not in out
+
+    def test_older_records_collapse_to_recap_lines(self) -> None:
+        records = [
+            self._run_skill_record("skill_001", "GREEN SHAPES: " + "x" * 300),
+            self._run_skill_record("skill_002", "short output"),
+            self._run_skill_record("skill_003", "newest-1"),
+            self._run_skill_record("skill_004", "newest-2"),
+        ]
+        out = format_tool_results_markdown(records)
+        # Newest 2 in full, older 2 as one-line recap entries.
+        assert out.count("### TOOL RESULT") == 2
+        assert "newest-1" in out and "newest-2" in out
+        assert '- 1. run_skill({"id": "skill_001"}) -> ok: GREEN SHAPES:' in out
+        assert "[+" in out  # long stdout is truncated with a remaining-chars note
+        assert '- 2. run_skill({"id": "skill_002"}) -> ok: short output' in out
+        # The reasoning arg never appears in recap lines.
+        assert '"reasoning"' not in out.split("### TOOL RESULT")[0]
+
+    def test_identical_rerun_collapses_to_pointer(self) -> None:
+        records = [
+            self._run_skill_record("skill_001", "same output"),
+            self._run_skill_record("skill_001", "same output"),
+            self._run_skill_record("skill_002", "tail-1"),
+            self._run_skill_record("skill_003", "tail-2"),
+        ]
+        out = format_tool_results_markdown(records)
+        assert (
+            "- 2. run_skill({\"id\": \"skill_001\"}) -> identical output to call 1 "
+            "(re-running returned nothing new)" in out
+        )
+
+    def test_working_prompt_turn_block_and_recap_title(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        agent._recent_tool_results = [
+            self._run_skill_record(f"skill_{i:03d}", f"out-{i}") for i in range(4)
+        ]
+        frame = _make_frame()
+        agent.frames = [frame]
+
+        prompt, _grids = agent._build_working_prompt(frame)
+
+        assert "## TOOL RESULTS FROM PREVIOUS TURN" in prompt
+        assert "## TOOL RESULTS FROM PREVIOUS STEP" not in prompt
+        assert "4 tool calls ran during the previous turn's deliberation." in prompt
+        assert (
+            f"at most {agent.MAX_CONVERSATION_TURNS} non-action turns" in prompt
+        )
+        assert "Aim to act within 2-3 non-action turns." in prompt
