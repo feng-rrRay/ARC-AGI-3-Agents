@@ -142,6 +142,67 @@ def test_decode_action_input_rejects_boolean_id() -> None:
 
 
 @pytest.mark.unit
+def test_resolve_operation_mode_honors_uppercase_competition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPERATION_MODE", "COMPETITION")
+
+    assert replay_scorecard._resolve_operation_mode() == "competition"
+
+
+@pytest.mark.unit
+def test_resolve_operation_mode_defaults_to_online(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPERATION_MODE", raising=False)
+
+    assert replay_scorecard._resolve_operation_mode() == "online"
+
+
+@pytest.mark.unit
+def test_resolve_operation_mode_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPERATION_MODE", "invalid")
+
+    with pytest.raises(SystemExit, match="OPERATION_MODE must be one of"):
+        replay_scorecard._resolve_operation_mode()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["offline", "normal"])
+def test_resolve_operation_mode_rejects_non_api_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    monkeypatch.setenv("OPERATION_MODE", mode)
+
+    with pytest.raises(SystemExit, match="competition, online"):
+        replay_scorecard._resolve_operation_mode()
+
+
+@pytest.mark.unit
+def test_scorecard_payload_includes_url_in_competition_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARC_BASE_URL", "https://three.arcprize.org")
+    arc = SimpleNamespace(operation_mode=arc_agi.OperationMode.COMPETITION)
+
+    payload = replay_scorecard._scorecard_payload(
+        arc,
+        FakeScorecard("card-competition"),
+        "card-competition",
+        "https://fallback.example",
+        {},
+    )
+
+    assert (
+        payload["scorecard_url"]
+        == "https://three.arcprize.org/scorecards/card-competition"
+    )
+
+
+@pytest.mark.unit
 def test_replay_one_decodes_numeric_actions_and_writes_scorecard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -167,7 +228,7 @@ def test_replay_one_decodes_numeric_actions_and_writes_scorecard(
 
     assert ok is True
     arcade = FakeArcade.instances[0]
-    assert arcade.open_tags == [["hermes-eval", "replay", "ka59-38d34dbb"]]
+    assert arcade.open_tags == [["agent", "ContinualHarness"]]
     assert arcade.make_calls == [("ka59-38d34dbb", "card-1", False)]
     assert arcade.closed_cards == ["card-1"]
     assert [(action.name, data) for action, data, _ in arcade.envs[0].steps] == [
@@ -213,7 +274,7 @@ def test_single_scorecard_replays_multiple_runs_into_one_scorecard(
 
     assert ok is True
     arcade = FakeArcade.instances[0]
-    assert arcade.open_tags == [["v1-logs", "continualharness", "replay"]]
+    assert arcade.open_tags == [["agent", "ContinualHarness"]]
     assert arcade.make_calls == [
         ("ka59-38d34dbb", "card-1", False),
         ("ls20-9607627b", "card-1", False),

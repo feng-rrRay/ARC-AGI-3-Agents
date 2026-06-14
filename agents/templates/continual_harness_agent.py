@@ -30,7 +30,6 @@ from .continual_harness.helpers import (
 from .continual_harness.memory import (
     MemoryStore,
     active_memory_path,
-    format_memory_full,
     format_memory_overview,
 )
 from .continual_harness.models import (
@@ -38,20 +37,11 @@ from .continual_harness.models import (
     RenderedGrid,
     StepRecord,
     ToolCallRecord,
+    ToolEvidenceRecord,
 )
-from .continual_harness.prompt_evolution import (
-    PromptEvolutionRecord,
-    PromptEvolutionStore,
-    PromptFile,
-    active_prompt_evolution_path,
-    active_prompt_path,
-    build_evolution_prompt,
-    now_iso,
-    validate_evolved_prompt,
-)
+from .continual_harness.harness_evolver import HarnessEvolver
 from .continual_harness.prompts import (
     BASE_ORCHESTRATOR_POLICY,
-    EVOLUTION_SYSTEM_INSTRUCTION,
     HARNESS_SYSTEM_INSTRUCTION,
 )
 from .continual_harness.sandbox import SandboxState, run_python_snippet
@@ -285,22 +275,14 @@ class ContinualHarness(Agent):
     MAX_SUBAGENT_ROUNDS_PER_CALL = 20  # inner VLM rounds per invocation
     SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
     RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
-    MAX_CONVERSATION_TURNS = 12  # max tool-only VLM turns per decision before forcing a break
+    TOOL_EVIDENCE_CAP = 512  # non-action tool records retained for evolution windows
+    MAX_CONVERSATION_TURNS = 24  # max tool-only VLM turns per decision before forcing a break
     CONVERSATION_CONTEXT_GUARD_RATIO = 0.80
     SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
-    # Prompt-evolution defaults; the stagnation threshold is read from
-    # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
-    # --prompt-evolve-frequency). 0 disables all prompt evolution; positive N
-    # means evolve on stagnation after N actions without score/level progress.
-    DEFAULT_PROMPT_EVOLVE_FREQUENCY = 100
-    PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
-    STAGNATION_MIN_ACTIONS_SINCE_EVOLUTION = 50
-    STAGNATION_WINDOW = 30
-    STAGNATION_MIN_WINDOW_RECORDS = 10
-    STAGNATION_NOOP_RATIO = 0.45
-    STAGNATION_REPEAT_ACTION_RATIO = 0.60
-    STAGNATION_MAX_CYCLE = 8
-    STAGNATION_MIN_CYCLE_REPEATS = 3
+    # Prompt/skill/subagent/memory evolution is owned by HarnessEvolver, which
+    # reads CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
+    # --prompt-evolve-frequency; 0 disables all evolution) and holds the
+    # stagnation thresholds.
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Must resolve model_name BEFORE super().__init__(): Agent.__init__
@@ -310,35 +292,19 @@ class ContinualHarness(Agent):
 
         # Three-layer prompt architecture:
         # 1. _system_instruction: fixed, never evolved (tool schemas, game context)
-        # 2. _current_base_prompt: evolved strategic guidance (rules, strategy)
+        # 2. base orchestrator policy: evolved strategic guidance — owned by the
+        #    HarnessEvolver (read via get_current_prompt()), constructed below
+        #    once the memory/skill/subagent/trajectory stores exist.
         # 3. Per-step user prompt: game state, history, tool results
-        freq_raw = os.getenv(
-            self.PROMPT_EVOLVE_FREQUENCY_ENV,
-            str(self.DEFAULT_PROMPT_EVOLVE_FREQUENCY),
-        )
-        try:
-            self._prompt_evolve_frequency = max(0, int(freq_raw))
-        except ValueError:
-            self._prompt_evolve_frequency = self.DEFAULT_PROMPT_EVOLVE_FREQUENCY
 
         # Fixed system instruction — NEVER evolved. {game_name} substituted here.
         self._system_instruction: str = HARNESS_SYSTEM_INSTRUCTION.replace(
             "{game_name}", self.game_id
         )
 
-        # Evolvable base prompt — strategic guidance, rule discoveries. Stored
-        # per-game so parallel games evolve independent prompts.
-        self._base_prompt_file = PromptFile(
-            active_prompt_path(self.game_id), baseline=BASE_ORCHESTRATOR_POLICY
-        )
-        self._current_base_prompt: str = self._base_prompt_file.read()
-        self._prompt_generation: int = 0
-        self._last_evolution_step: int = -1
-        self._last_game_over_evolution_step: int = -1
+        # Action at which score/level last advanced; updated inline on progress
+        # and read by the evolver's stagnation trigger.
         self._last_progress_step: int = 0
-        self.prompt_evolution = PromptEvolutionStore(
-            active_prompt_evolution_path(self.game_id)
-        )
 
         self.vlm = VLM(
             self.model_name,
@@ -648,6 +614,7 @@ class ContinualHarness(Agent):
         # `_recent_tool_results` carries the previous conversation's analysis-tool
         # outputs into the next decision's prompt (older ones as a recap line,
         # the newest in full — see format_tool_results_markdown).
+        # `_tool_evidence` keeps a longer window for harness evolution prompts.
         # `_pending_observations` carries action transition/result frames from
         # executed actions into the next successful orchestrator VLM prompt.
         # `_consecutive_vlm_errors` is bookkeeping for hard failure detection.
@@ -656,6 +623,7 @@ class ContinualHarness(Agent):
         # `_batch_counter` mints unique batch IDs for tagging trajectory rows.
         # `_vlm_call_count` is a monotonic counter set on `_current_outer_round`.
         self._recent_tool_results: list[ToolCallRecord] = []
+        self._tool_evidence: list[ToolEvidenceRecord] = []
         self._pending_observations: list[PendingActionObservation] = []
         self._consecutive_vlm_errors: int = 0
         self._sandbox_terminal_seen: bool = False
@@ -1081,12 +1049,28 @@ class ContinualHarness(Agent):
             self.subagents.path,
             len(self.subagents.all_entries()),
         )
+        # All evolution state (base prompt file, evolution log, generation
+        # counters) lives in the evolver; it shares the stores built above so
+        # inline orchestrator edits and meta-level edits hit the same files.
+        self.harness_evolver = HarnessEvolver(
+            model_name=self.model_name,
+            system_instruction=self._system_instruction,
+            game_id=self.game_id,
+            agent_name=self.name,
+            memory=self.memory,
+            skills=self.skills,
+            subagents=self.subagents,
+            trajectory=self.trajectory,
+            trace=self.trace,
+            record_usage=self._record_vlm_usage,
+            baseline_prompt=BASE_ORCHESTRATOR_POLICY,
+        )
         logger.info(
-            "[%s] Prompt evolution: stagnation_after=%d, baseline at %s, log at %s",
+            "[%s] Harness evolution: stagnation_after=%d, base prompt at %s, log at %s",
             self.name,
-            self._prompt_evolve_frequency,
-            self._base_prompt_file.path,
-            self.prompt_evolution.path,
+            self.harness_evolver.stagnation_after,
+            self.harness_evolver.base_prompt_path,
+            self.harness_evolver.evolution_log_path,
         )
 
         # Cumulative token usage; logged once on cleanup().
@@ -1122,180 +1106,6 @@ class ContinualHarness(Agent):
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return latest_frame.state is GameState.WIN
-
-    @staticmethod
-    def _extract_text(response: Any) -> str:
-        """Extract plain text from a Gemini response or string.
-
-        When no tools are set, the VLM backend returns a plain string. When
-        tools are set, it returns a response object with candidates/parts.
-        Handles preamble text before markdown fences.
-        """
-        import re
-        if isinstance(response, str):
-            text = response.strip()
-        else:
-            text = ""
-            for cand in getattr(response, "candidates", None) or []:
-                for part in getattr(getattr(cand, "content", None), "parts", []) or []:
-                    t = getattr(part, "text", None)
-                    if t:
-                        text += t
-            text = text.strip()
-        m = re.search(r"```(?:markdown)?\s*\n(.*?)```", text, re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        return text
-
-    @staticmethod
-    def _format_evolution_trigger_context(
-        trigger: str,
-        trigger_evidence: list[str] | None,
-    ) -> str:
-        evidence = [line for line in (trigger_evidence or []) if line]
-        lines = [f"Trigger: {trigger}"]
-        lines.extend(f"- {line}" for line in evidence)
-        return "\n".join(lines)
-
-    def _evolve_system_prompt(
-        self,
-        latest_frame: FrameData,
-        *,
-        trigger: str = "manual",
-        trigger_evidence: list[str] | None = None,
-    ) -> None:
-        """One meta-VLM call that may rewrite the agent's base prompt.
-
-        Spawns a fresh VLM with EVOLUTION_SYSTEM_INSTRUCTION. The model returns
-        the improved prompt as plain text. Accepted only if
-        `validate_evolved_prompt` returns ok=True; on accept, the new text is
-        written through `self._base_prompt_file`. Every attempt is logged.
-        """
-        self._prompt_generation += 1
-        gen = self._prompt_generation
-        previous = self._current_base_prompt
-
-        steps_since = max(1, self.action_counter - max(self._last_evolution_step, 0))
-        trajectory_rows = self.trajectory.tail(steps_since)
-        trigger_context = self._format_evolution_trigger_context(
-            trigger, trigger_evidence
-        )
-        user_prompt = build_evolution_prompt(
-            system_prompt=self._system_instruction,
-            current_base_prompt=previous,
-            trajectory_rows=trajectory_rows,
-            memory_overview=format_memory_full(self.memory.all_entries()),
-            skill_overview=format_skill_overview(self.skills.all_entries()),
-            subagent_overview=format_subagent_overview(self.subagents.all_entries()),
-            trigger_context=trigger_context,
-        )
-
-        evolution_system = EVOLUTION_SYSTEM_INSTRUCTION.replace(
-            "{game_name}", self.game_id
-        )
-        meta_vlm = VLM(
-            self.model_name,
-            backend="gemini",
-            system_instruction=evolution_system,
-        )
-
-        images = list(frame_to_images(latest_frame))
-        payload: Any = images if len(images) > 1 else (images[0] if images else None)
-
-        proposed = ""
-        accepted = False
-        validation_error: str | None = None
-        usage: dict[str, int | None] | None = None
-        output: dict[str, Any] = {}
-        error: str | None = None
-
-        try:
-            response = meta_vlm.get_query(
-                payload,
-                user_prompt,
-                module_name=f"{self.name}.evolve.{gen}",
-            )
-            output = serialize_response(response)
-            usage = meta_vlm.extract_usage(response)
-            proposed = self._extract_text(response)
-            if not proposed:
-                validation_error = "model returned empty text"
-            else:
-                ok, err = validate_evolved_prompt(proposed)
-                accepted = ok
-                validation_error = err
-                if accepted:
-                    self._current_base_prompt = proposed
-                    self._base_prompt_file.write(proposed)
-        except Exception as exc:
-            error = repr(exc)
-            logger.warning("Prompt evolution gen=%d failed: %s", gen, exc)
-        finally:
-            usage_cost = self._record_vlm_usage(usage)
-            if usage is not None:
-                logger.info(
-                    "[%s] prompt_evolution gen=%d tokens=%d%s",
-                    self.game_id,
-                    gen,
-                    usage_token_count(usage, "total"),
-                    _cost_log_suffix(usage_cost),
-                )
-
-            record = PromptEvolutionRecord(
-                generation=gen,
-                action_counter=self.action_counter,
-                accepted=accepted,
-                reasoning=trigger_context,
-                proposed_prompt=proposed,
-                previous_prompt=previous,
-                new_prompt=self._current_base_prompt,
-                validation_error=validation_error or error,
-                usage=usage,
-                timestamp=now_iso(),
-            )
-            self.prompt_evolution.append(record)
-
-            self.trace.write(
-                {
-                    "agent": self.name,
-                    "model": self.model_name,
-                    "game_id": self.game_id,
-                    "action_counter": self.action_counter,
-                    "round": 0,
-                    "tools_exposed": "evolution",
-                    "evolution": {
-                        "generation": gen,
-                        "trigger": trigger,
-                        "trigger_evidence": trigger_evidence or [],
-                        "accepted": accepted,
-                        "validation_error": validation_error,
-                        "previous_len": len(previous),
-                        "new_len": len(self._current_base_prompt),
-                    },
-                    "input": {
-                        "system_instruction": evolution_system,
-                        "user_prompt": user_prompt,
-                        "images": [
-                            {"width": img.width, "height": img.height, "mode": img.mode}
-                            for img in images
-                        ],
-                    },
-                    "output": output,
-                    "usage": usage,
-                    "usage_cost": usage_cost,
-                    "error": error,
-                }
-            )
-
-            logger.info(
-                "[%s] Prompt evolution gen=%d accepted=%s len=%d (prev=%d) error=%s",
-                self.name,
-                gen,
-                accepted,
-                len(self._current_base_prompt),
-                len(previous),
-                validation_error or error,
-            )
 
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
@@ -1384,7 +1194,11 @@ class ContinualHarness(Agent):
 
             # Terminal failure: consolidate the failed trajectory before reset.
             if latest_frame.state is GameState.GAME_OVER:
-                self._evolve_on_game_over(latest_frame)
+                self.harness_evolver.evolve_on_game_over(
+                    latest_frame,
+                    self.action_counter,
+                    tool_evidence_records=list(self._tool_evidence),
+                )
                 self._execute_one(GameAction.RESET, source="auto_reset")
                 self._recent_tool_results = []
                 continue
@@ -1405,12 +1219,23 @@ class ContinualHarness(Agent):
 
             # Level-up evolution: consolidate discovered rules immediately
             # after advancing to a new level. Otherwise, evolve only when the
-            # recent trajectory shows concrete stuck behavior.
+            # recent trajectory shows concrete stuck behavior. Progress tracking
+            # stays on the agent (also set inline in dispatch on score gains).
             post_frame = self.frames[-1]
             if post_frame.levels_completed > pre_step_level:
-                self._evolve_on_level_up(post_frame)
+                self._last_progress_step = self.action_counter
+                self.harness_evolver.evolve_on_level_up(
+                    post_frame,
+                    self.action_counter,
+                    tool_evidence_records=list(self._tool_evidence),
+                )
             else:
-                self._maybe_evolve_on_stagnation(post_frame)
+                self.harness_evolver.maybe_evolve_on_stagnation(
+                    post_frame,
+                    self.action_counter,
+                    self._last_progress_step,
+                    tool_evidence_records=list(self._tool_evidence),
+                )
 
         self.cleanup()
 
@@ -1536,6 +1361,7 @@ class ContinualHarness(Agent):
             if turn == 0:
                 self._pending_observations = []
 
+            action_counter_before = self.action_counter
             (
                 turn_actions,
                 new_results,
@@ -1543,6 +1369,13 @@ class ContinualHarness(Agent):
                 terminal,
                 had_fcs,
             ) = self._dispatch_response(response)
+            self._append_tool_evidence(
+                new_results,
+                conversation_id=conversation_id,
+                conversation_turn=turn,
+                action_counter_before=action_counter_before,
+                action_counter_after=self.action_counter,
+            )
             actions_executed += turn_actions
             all_new_results.extend(new_results)
 
@@ -1616,6 +1449,30 @@ class ContinualHarness(Agent):
                 no_action_reason or "conversation ended without an action"
             )
         return actions_executed
+
+    def _append_tool_evidence(
+        self,
+        records: list[ToolCallRecord],
+        *,
+        conversation_id: int,
+        conversation_turn: int,
+        action_counter_before: int,
+        action_counter_after: int,
+    ) -> None:
+        for record in records:
+            self._tool_evidence.append(
+                ToolEvidenceRecord(
+                    conversation_id=conversation_id,
+                    conversation_turn=conversation_turn,
+                    round=self._current_outer_round,
+                    action_counter_before=action_counter_before,
+                    action_counter_after=action_counter_after,
+                    tool_call=record,
+                )
+            )
+        overflow = len(self._tool_evidence) - self.TOOL_EVIDENCE_CAP
+        if overflow > 0:
+            del self._tool_evidence[:overflow]
 
     def _dispatch_response(
         self, response: Any
@@ -1951,7 +1808,7 @@ class ContinualHarness(Agent):
             skill_overview=skill_overview,
             subagent_overview=subagent_overview,
             observation_block=observation_block,
-            base_prompt=self._current_base_prompt,
+            base_prompt=self.harness_evolver.get_current_prompt(),
             previous_no_action_reason=self._previous_no_action_reason,
             max_deliberation_turns=self.MAX_CONVERSATION_TURNS,
         )
@@ -1969,164 +1826,6 @@ class ContinualHarness(Agent):
         tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL])
         tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])
         return tools
-
-    @staticmethod
-    def _trajectory_action_label(record: dict[str, Any]) -> str:
-        name = str(record.get("chosen_action") or "UNKNOWN")
-        data = record.get("chosen_action_data") or {}
-        if not isinstance(data, dict) or not data:
-            return name
-        if "x" in data and "y" in data and len(data) == 2:
-            return f"{name}({data['x']},{data['y']})"
-        args = ",".join(f"{k}={v}" for k, v in sorted(data.items()))
-        return f"{name}({args})"
-
-    @staticmethod
-    def _is_noop_or_invalid_record(record: dict[str, Any]) -> bool:
-        state_after = record.get("state_after")
-        if state_after == "INVALID":
-            return True
-
-        state_before = record.get("state")
-        resolved_after = state_after or state_before
-        score_delta = record.get("score_delta")
-        score_changed = isinstance(score_delta, int) and score_delta != 0
-        grid_changed = bool(record.get("grid_delta") or record.get("grid_change"))
-        return resolved_after == state_before and not score_changed and not grid_changed
-
-    def _repeated_cycle_evidence(self, labels: list[str]) -> str | None:
-        max_cycle = min(self.STAGNATION_MAX_CYCLE, len(labels) // 2)
-        for width in range(2, max_cycle + 1):
-            pattern = labels[-width:]
-            repeats = 1
-            cursor = len(labels) - width
-            while cursor - width >= 0 and labels[cursor - width : cursor] == pattern:
-                repeats += 1
-                cursor -= width
-            if repeats >= self.STAGNATION_MIN_CYCLE_REPEATS:
-                return (
-                    f"last {width * repeats} actions repeat a {width}-action cycle: "
-                    f"{', '.join(pattern)}"
-                )
-        return None
-
-    def _stagnation_evidence(self, records: list[dict[str, Any]]) -> list[str]:
-        actionable = [
-            record
-            for record in records
-            if isinstance(record, dict) and record.get("source") != "auto_reset"
-        ]
-        if len(actionable) < self.STAGNATION_MIN_WINDOW_RECORDS:
-            return []
-
-        evidence: list[str] = []
-        noops = sum(1 for record in actionable if self._is_noop_or_invalid_record(record))
-        noop_ratio = noops / len(actionable)
-        if noop_ratio >= self.STAGNATION_NOOP_RATIO:
-            evidence.append(
-                f"last {len(actionable)} actions include {noops} no-op/invalid "
-                f"results ({noop_ratio:.0%})"
-            )
-
-        labels = [self._trajectory_action_label(record) for record in actionable]
-        counts: dict[str, int] = {}
-        for label in labels:
-            counts[label] = counts.get(label, 0) + 1
-        dominant_label, dominant_count = max(counts.items(), key=lambda item: item[1])
-        repeat_ratio = dominant_count / len(labels)
-        if repeat_ratio >= self.STAGNATION_REPEAT_ACTION_RATIO:
-            evidence.append(
-                f"action {dominant_label} appears {dominant_count}/"
-                f"{len(labels)} times ({repeat_ratio:.0%})"
-            )
-
-        cycle = self._repeated_cycle_evidence(labels)
-        if cycle:
-            evidence.append(cycle)
-
-        return evidence
-
-    def _maybe_evolve_on_stagnation(self, latest_frame: FrameData) -> None:
-        if self._prompt_evolve_frequency <= 0:
-            return
-        if self.action_counter == 0:
-            return
-        if latest_frame.state in {
-            GameState.GAME_OVER,
-            GameState.NOT_PLAYED,
-            GameState.WIN,
-        }:
-            return
-
-        progress_gap = self.action_counter - max(
-            getattr(self, "_last_progress_step", 0), 0
-        )
-        if progress_gap < self._prompt_evolve_frequency:
-            return
-
-        evolution_gap = self.action_counter - max(self._last_evolution_step, 0)
-        if evolution_gap < self.STAGNATION_MIN_ACTIONS_SINCE_EVOLUTION:
-            return
-
-        pattern_evidence = self._stagnation_evidence(
-            self.trajectory.tail(self.STAGNATION_WINDOW)
-        )
-        if not pattern_evidence:
-            return
-
-        evidence = [
-            f"{progress_gap} actions since last score/level progress",
-            f"{evolution_gap} actions since last prompt evolution",
-            *pattern_evidence,
-        ]
-        logger.info("[%s] stagnation evolution: %s", self.name, "; ".join(evidence))
-        try:
-            self._evolve_system_prompt(
-                latest_frame,
-                trigger="stagnation",
-                trigger_evidence=evidence,
-            )
-        finally:
-            self._last_evolution_step = self.action_counter
-
-    def _evolve_on_level_up(self, latest_frame: FrameData) -> None:
-        """Trigger evolution unconditionally on level transition."""
-        if self._prompt_evolve_frequency <= 0:
-            return
-        self._last_progress_step = self.action_counter
-        evidence = [
-            f"advanced to score/level {latest_frame.levels_completed}",
-            f"action_counter={self.action_counter}",
-        ]
-        try:
-            self._evolve_system_prompt(
-                latest_frame,
-                trigger="level_up",
-                trigger_evidence=evidence,
-            )
-        finally:
-            self._last_evolution_step = self.action_counter
-
-    def _evolve_on_game_over(self, latest_frame: FrameData) -> None:
-        """Trigger evolution once for a GAME_OVER state before auto-reset."""
-        if self._prompt_evolve_frequency <= 0:
-            return
-        if self._last_game_over_evolution_step == self.action_counter:
-            return
-        self._last_game_over_evolution_step = self.action_counter
-        evidence = [
-            "entered GAME_OVER before auto-reset",
-            f"score/level={latest_frame.levels_completed}",
-            f"action_counter={self.action_counter}",
-        ]
-        try:
-            self._evolve_system_prompt(
-                latest_frame,
-                trigger="game_over",
-                trigger_evidence=evidence,
-            )
-        finally:
-            self._last_evolution_step = self.action_counter
 
     def _mint_batch_id(self) -> str:
         self._batch_counter += 1
@@ -2164,7 +1863,7 @@ class ContinualHarness(Agent):
                 "tools_exposed": "full",
                 "input": {
                     "system_instruction": self._system_instruction,
-                    "base_prompt": self._current_base_prompt,
+                    "base_prompt": self.harness_evolver.get_current_prompt(),
                     "user_prompt": prompt,
                     "tools": tools,
                     # `images` mirrors the grids rendered in this prompt, in

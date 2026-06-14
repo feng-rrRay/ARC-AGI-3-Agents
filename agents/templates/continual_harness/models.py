@@ -18,6 +18,18 @@ class ToolCallRecord:
 
 
 @dataclass(slots=True)
+class ToolEvidenceRecord:
+    """One tool result stamped with the action-counter window where it occurred."""
+
+    conversation_id: int
+    conversation_turn: int
+    round: int
+    action_counter_before: int
+    action_counter_after: int
+    tool_call: ToolCallRecord
+
+
+@dataclass(slots=True)
 class PendingActionObservation:
     """One action result awaiting display in the next working prompt."""
 

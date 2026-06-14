@@ -21,12 +21,14 @@ from arcengine import ActionInput, FrameData, FrameDataRaw, GameState
 from PIL import Image
 
 from agents.templates.continual_harness.context import (
+    format_tool_evidence_markdown,
     format_tool_record_md,
     format_tool_results_markdown,
 )
 from agents.templates.continual_harness.models import (
     PendingActionObservation,
     ToolCallRecord,
+    ToolEvidenceRecord,
 )
 from agents.templates.continual_harness.sandbox import SandboxState
 from agents.templates.continual_harness_agent import ContinualHarness
@@ -331,6 +333,37 @@ def _trace_rows(agent: ContinualHarness) -> list[dict[str, Any]]:
 
 @pytest.mark.unit
 class TestConversationLoop:
+    def test_append_tool_evidence_stamps_and_trims(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+        agent.TOOL_EVIDENCE_CAP = 1
+        first = ToolCallRecord(name="process_memory", args={"operation": "search"})
+        second = ToolCallRecord(name="run_skill", args={"id": "skill_001"})
+
+        agent._append_tool_evidence(
+            [first],
+            conversation_id=3,
+            conversation_turn=0,
+            action_counter_before=10,
+            action_counter_after=10,
+        )
+        agent._append_tool_evidence(
+            [second],
+            conversation_id=3,
+            conversation_turn=1,
+            action_counter_before=10,
+            action_counter_after=12,
+        )
+
+        assert len(agent._tool_evidence) == 1
+        evidence = agent._tool_evidence[0]
+        assert evidence.conversation_id == 3
+        assert evidence.conversation_turn == 1
+        assert evidence.action_counter_before == 10
+        assert evidence.action_counter_after == 12
+        assert evidence.tool_call.name == "run_skill"
+
     def test_tool_then_action_is_one_conversation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -710,6 +743,31 @@ class TestToolResultMarkdown:
             "- 2. run_skill({\"id\": \"skill_001\"}) -> identical output to call 1 "
             "(re-running returned nothing new)" in out
         )
+
+    def test_tool_evidence_markdown_includes_window_metadata(self) -> None:
+        records = [
+            ToolEvidenceRecord(
+                conversation_id=7,
+                conversation_turn=1,
+                round=12,
+                action_counter_before=31,
+                action_counter_after=35,
+                tool_call=ToolCallRecord(
+                    name="run_skill",
+                    args={"id": "skill_003", "reasoning": "scan gates"},
+                    result={"success": True, "stdout": "opened gate"},
+                    actions_taken_inline=4,
+                ),
+            )
+        ]
+
+        out = format_tool_evidence_markdown(records)
+
+        assert "[conv 7.t1 | before step 31 | after step 35 | round 12]" in out
+        assert "tool: run_skill" in out
+        assert '"id": "skill_003"' in out
+        assert "opened gate" in out
+        assert "actions_taken_inline: 4" in out
 
     def test_working_prompt_turn_block_and_recap_title(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

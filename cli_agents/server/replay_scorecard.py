@@ -36,6 +36,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+SCORECARD_TAGS = ["agent", "ContinualHarness"]
+
 
 @dataclass(frozen=True, slots=True)
 class ReplaySource:
@@ -70,6 +72,18 @@ def _load_env(env_file: str | None) -> None:
     from dotenv import load_dotenv
 
     load_dotenv(str(p))
+
+
+def _resolve_operation_mode(default: str = "online") -> str:
+    from arc_agi import OperationMode
+
+    raw = os.environ.get("OPERATION_MODE", "").strip()
+    mode = raw.lower() if raw else default
+    api_modes = {OperationMode.ONLINE.value, OperationMode.COMPETITION.value}
+    if mode not in api_modes:
+        valid = ", ".join(sorted(api_modes))
+        raise SystemExit(f"OPERATION_MODE must be one of: {valid}")
+    return mode
 
 
 def _find_recording(run_dir: Path) -> Path | None:
@@ -332,7 +346,7 @@ def _scorecard_payload(
     from arc_agi import OperationMode
 
     payload: dict[str, Any] = scorecard.model_dump()
-    if arc.operation_mode == OperationMode.ONLINE:
+    if arc.operation_mode in (OperationMode.ONLINE, OperationMode.COMPETITION):
         base = os.environ.get("ARC_BASE_URL", base_url)
         payload["scorecard_url"] = f"{base}/scorecards/{card_id}"
     payload.update(extra)
@@ -356,8 +370,8 @@ def replay_one(run_dir: Path, base_url: str, *, force: bool = False) -> bool:
         print(f"[skip] {run_dir.name}: no recording found")
         return False
 
-    arc = Arcade()  # ONLINE via env: ARC_API_KEY / ARC_BASE_URL / OPERATION_MODE
-    card_id = arc.open_scorecard(tags=["hermes-eval", "replay", source.game_id])
+    arc = Arcade()  # API mode via env: ARC_API_KEY / ARC_BASE_URL / OPERATION_MODE
+    card_id = arc.open_scorecard(tags=SCORECARD_TAGS)
     print(f"  opened NEW scorecard {card_id}")
 
     try:
@@ -449,8 +463,8 @@ def replay_single_scorecard(
         print("[error] no replayable recordings found")
         return False
 
-    arc = Arcade()  # ONLINE via env: ARC_API_KEY / ARC_BASE_URL / OPERATION_MODE
-    card_id = arc.open_scorecard(tags=["v1-logs", "continualharness", "replay"])
+    arc = Arcade()  # API mode via env: ARC_API_KEY / ARC_BASE_URL / OPERATION_MODE
+    card_id = arc.open_scorecard(tags=SCORECARD_TAGS)
     print(f"opened NEW aggregate scorecard {card_id} for {len(sources)} recording(s)")
 
     for source in sources:
@@ -531,12 +545,14 @@ def main() -> None:
     args = ap.parse_args()
 
     _load_env(args.env_file)
-    # Force the host + online mode regardless of the .env value.
+    # Force the host, but preserve OPERATION_MODE from .env so competition
+    # submissions can set OPERATION_MODE=COMPETITION. Default remains online.
     os.environ["ARC_BASE_URL"] = args.base_url
-    os.environ["OPERATION_MODE"] = "online"
+    operation_mode = _resolve_operation_mode()
+    os.environ["OPERATION_MODE"] = operation_mode
     if not os.environ.get("ARC_API_KEY"):
         raise SystemExit("ARC_API_KEY not set (provide via --env-file or environment)")
-    print(f"Using ARC_BASE_URL={args.base_url}  OPERATION_MODE=online")
+    print(f"Using ARC_BASE_URL={args.base_url}  OPERATION_MODE={operation_mode}")
 
     run_dirs = [Path(d) for d in args.run_dirs]
     aggregate_scorecard = args.single_scorecard or (

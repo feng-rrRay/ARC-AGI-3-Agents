@@ -19,35 +19,6 @@ class FunctionCall:
     args: dict[str, Any]
 
 
-# --- Analysis tool specs ------------------------------------------------------
-# Schema shape matches build_action_tools so the backend treats them uniformly.
-
-# --- COMMENTED OUT: get_recent_trajectory removed ---
-# Superseded by the always-in-prompt RECENT HISTORY block (render_recent_history),
-# which now spans the whole run. The full reasoning/tool-result deep-dive this
-# tool exposed is no longer worth a tool round (findings live in memory).
-# Removed from the orchestrator analysis tools AND the subagent tool surface.
-# `format_full_history` (trajectory.py) is kept — prompt_evolution.py still uses it.
-# GET_RECENT_TRAJECTORY_TOOL: dict[str, Any] = {
-#     "name": "get_recent_trajectory",
-#     "description": "Retrieve full step history (reasoning + tool calls + results) beyond the compact view in the prompt. Use to look further back or inspect older reasoning.",
-#     "parameters": {
-#         "type": "object",
-#         "properties": {
-#             "reasoning": {
-#                 "type": "string",
-#                 "description": "Why the compact view isn't enough. Required.",
-#             },
-#             "limit": {
-#                 "type": "integer",
-#                 "description": "How many recent actions to retrieve (1-80). Defaults to 40.",
-#             },
-#         },
-#         "required": ["reasoning"],
-#     },
-# }
-
-
 PROCESS_MEMORY_TOOL: dict[str, Any] = {
     "name": "process_memory",
     "description": "Manage the fact scratchpad (add/edit/delete/search). One small fact per entry — a confirmed action effect, an object identity, or a hypothesis to test — each with a confidence score. Do NOT write monolithic entries that mix confirmed facts with guesses. Memory index is auto-injected into every prompt; use search to read full bodies.",
@@ -56,37 +27,37 @@ PROCESS_MEMORY_TOOL: dict[str, Any] = {
         "properties": {
             "reasoning": {
                 "type": "string",
-                "description": "Why this memory operation is worth a turn. Required.",
+            "description": "Required. Brief justification for this memory operation (what you are trying to learn or change and why)",
             },
             "operation": {
                 "type": "string",
                 "enum": ["add", "delete", "edit", "search"],
-                "description": "Which memory operation to perform. Required.",
+                "description": "Required. Which memory operation to perform.",
             },
             "title": {
                 "type": "string",
-                "description": "Short label shown in the auto-injected overview. Required for add; optional for edit. Max 200 chars.",
+                "description": "Required for add; optional for edit. Max 200 chars. Short label shown in the auto-injected overview.",
             },
             "body": {
                 "type": "string",
-                "description": "The fact itself (returned by search). Keep it short — 1-3 sentences stating one claim. Required for add; optional for edit.",
+                "description": "Required for add; optional for edit. The fact itself (returned by search). Keep it short — 1-3 sentences stating one claim.",
             },
             "confidence": {
                 "type": "integer",
-                "description": "How sure you are this fact is true: 1=untested guess/should explore, 2=weak evidence, 3=unverified inference, 4=confirmed once, 5=repeatedly confirmed. Required for add; optional for edit (update it as evidence accrues).",
+                "description": "Required for add; optional for edit. How sure you are this fact is true: 1=untested guess/should explore, 2=weak evidence, 3=unverified inference, 4=confirmed once, 5=repeatedly confirmed. Update it as evidence accrues.",
             },
             "tags": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional labels for grouping/search (e.g. ['player_identity', 'action6']).",
+                "description": "Optional. Labels for grouping/search (e.g. ['player_identity', 'action6']).",
             },
             "id": {
                 "type": "string",
-                "description": "Existing entry id (e.g. 'mem_003'). Required for delete and edit.",
+                "description": "Required for delete and edit. Existing entry id (e.g. 'mem_003').",
             },
             "query": {
                 "type": "string",
-                "description": "Substring matched case-insensitively against title + body + tags. Required for search; empty string returns all.",
+                "description": "Required for search. Substring matched case-insensitively against title + body + tags. Empty string returns all.",
             },
         },
         "required": ["reasoning", "operation"],
@@ -102,7 +73,7 @@ PROCESS_SKILL_TOOL: dict[str, Any] = {
         "properties": {
             "reasoning": {
                 "type": "string",
-                "description": "Why this skill operation is worth a turn. Required.",
+                "description": "Required. Brief justification for this skill operation (what strategy you are recording or updating and why)",
             },
             "operation": {
                 "type": "string",
@@ -204,11 +175,7 @@ RUN_CODE_TOOL: dict[str, Any] = {
 }
 
 
-# --- Subagent tool surface ---------------------------------------------------
-# The single source of truth for what a subagent's inner loop may call.
-# process_subagent and run_subagent are intentionally excluded: no recursion.
-# run_code is intentionally excluded for now (see continual_harness_agent.py
-# for the rationale: too many wasted rounds on schema/import failures).
+# --- Subagent tool surface ---
 SUBAGENT_TOOL_ENUM: frozenset[str] = frozenset(
     {
         # "get_recent_trajectory",  # removed — superseded by RECENT HISTORY block

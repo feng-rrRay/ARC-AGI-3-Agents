@@ -13,6 +13,9 @@ This is the optimizable strategic guidance that gets combined with runtime conte
 ## Recent Agent Trajectories (last {n} steps):
 {trajectory}
 
+## Recent Tool Evidence (same evolution window):
+{tool_evidence}
+
 ## Evolution Trigger
 {trigger_context}
 

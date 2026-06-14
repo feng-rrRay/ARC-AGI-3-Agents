@@ -133,6 +133,7 @@ class TestEvolutionPromptContent:
             "{current_base_prompt}",
             "{n}",
             "{trajectory}",
+            "{tool_evidence}",
             "{memory_overview}",
             "{skill_overview}",
             "{subagent_overview}",

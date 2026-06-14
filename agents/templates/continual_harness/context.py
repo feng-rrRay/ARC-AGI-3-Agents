@@ -8,7 +8,12 @@ from arcengine import FrameData, GameAction
 
 from .action_descriptions import ACTION_DESCRIPTIONS
 from .helpers import available_game_actions, color_to_hex, grid_to_hex_lines
-from .models import PendingActionObservation, RenderedGrid, ToolCallRecord
+from .models import (
+    PendingActionObservation,
+    RenderedGrid,
+    ToolCallRecord,
+    ToolEvidenceRecord,
+)
 
 
 CURRENT_STATE_GRID_LABEL = "current_state_frame"
@@ -619,6 +624,50 @@ def format_tool_results_markdown(
             recap.append(f"- {i + 1}. {brief} -> {_tool_outcome_brief(r)}")
     full_blocks = [format_tool_record_md(r) for r in records[cut:]]
     return "\n".join(recap) + "\n\n" + "\n\n".join(full_blocks)
+
+
+def _compact_json(value: Any, *, max_chars: int) -> str:
+    text = json.dumps(value, default=str, sort_keys=True)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars - 24]}... [+{len(text) - max_chars + 24} chars]"
+
+
+def format_tool_evidence_markdown(
+    records: Sequence[ToolEvidenceRecord],
+    *,
+    max_chars: int = 20000,
+    value_chars: int = 1200,
+) -> str:
+    """Render tool results for harness evolution, grouped by conversation turn."""
+    if not records:
+        return "(none)"
+
+    blocks: list[str] = []
+    for item in records:
+        r = item.tool_call
+        lines = [
+            (
+                f"[conv {item.conversation_id}.t{item.conversation_turn} | "
+                f"before step {item.action_counter_before} | "
+                f"after step {item.action_counter_after} | round {item.round}]"
+            ),
+            f"tool: {r.name}",
+            f"args: {_compact_json(r.args or {}, max_chars=value_chars)}",
+        ]
+        if r.result is not None:
+            lines.append(f"result: {_compact_json(r.result, max_chars=value_chars)}")
+        if r.error:
+            lines.append(f"error: {r.error}")
+        if r.actions_taken_inline:
+            lines.append(f"actions_taken_inline: {r.actions_taken_inline}")
+        blocks.append("\n".join(lines))
+
+    while blocks and len("\n\n".join(blocks)) > max_chars:
+        blocks.pop(0)
+    if not blocks:
+        return "(tool evidence omitted: all records exceeded max_chars)"
+    return "\n\n".join(blocks)
 
 
 def _format_available_actions(actions: Sequence[GameAction]) -> str:
