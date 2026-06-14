@@ -210,9 +210,26 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
                 "type": "string",
                 "description": "What the subagent does + when to invoke it. Required for add; optional for edit. Max 500 chars.",
             },
-            "instructions": {
+            "system_instructions": {
                 "type": "string",
-                "description": "The subagent's system prompt: how it should approach its task. Required for add; optional for edit. Max 4000 chars.",
+                "description": "The subagent's system prompt: who it is and how it should approach its task (static across invocations). Required for add; optional for edit. Max 4000 chars.",
+            },
+            "directive": {
+                "type": "string",
+                "description": "Default per-invocation task framing for this subagent. Optional; run_subagent(task=...) overrides it at call time. Max 4000 chars.",
+            },
+            "return_condition": {
+                "type": "string",
+                "description": "Narrative cue for when the subagent should call subagent_return. Optional. Max 1000 chars.",
+            },
+            "handler_type": {
+                "type": "string",
+                "enum": ["looping", "one_step"],
+                "description": "'looping' (default): bounded action loop until subagent_return or max_turns. 'one_step': a single VLM analysis turn that auto-returns.",
+            },
+            "max_turns": {
+                "type": "integer",
+                "description": "Inner-loop bound for looping subagents (clamped to 1-50, default 25). Ignored for one_step.",
             },
             "allowed_tools": {
                 "type": "array",
@@ -247,7 +264,7 @@ PROCESS_SUBAGENT_TOOL: dict[str, Any] = {
 
 RUN_SUBAGENT_TOOL: dict[str, Any] = {
     "name": "run_subagent",
-    "description": "Invoke a registered subagent on a task. Runs a bounded inner loop (up to 20 rounds) using its allowed tools. Mutations to memory/skills persist immediately. Max 1 per step.",
+    "description": "Invoke a registered subagent. Runs a bounded inner loop (up to the subagent's max_turns; one_step subagents run a single turn) using its allowed tools. Mutations to memory/skills persist immediately. Max 1 per step.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -261,14 +278,14 @@ RUN_SUBAGENT_TOOL: dict[str, Any] = {
             },
             "task": {
                 "type": "string",
-                "description": "Natural-language description of the one task to perform. Required.",
+                "description": "Natural-language directive for this invocation. Optional: falls back to the subagent's stored directive when omitted.",
             },
             "context": {
                 "type": "object",
                 "description": "Optional free-form dict bound into the subagent's prompt as JSON.",
             },
         },
-        "required": ["reasoning", "id", "task"],
+        "required": ["reasoning", "id"],
     },
 }
 

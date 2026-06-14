@@ -272,7 +272,7 @@ class ContinualHarness(Agent):
     FULL_HISTORY_DEFAULT_LIMIT = 40
     FULL_HISTORY_MAX_LIMIT = 80
     MAX_SUBAGENT_CALLS_PER_STEP = 1  # distinct run_subagent invocations per outer step
-    MAX_SUBAGENT_ROUNDS_PER_CALL = 20  # inner VLM rounds per invocation
+    MAX_SUBAGENT_ROUNDS_CEILING = 50  # hard cap on inner VLM rounds (runaway protection)
     SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
     RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
     TOOL_EVIDENCE_CAP = 512  # non-action tool records retained for evolution windows
@@ -641,21 +641,32 @@ class ContinualHarness(Agent):
                 if op == "add":
                     name = args.get("name") or ""
                     description = args.get("description") or ""
-                    instructions = args.get("instructions") or ""
+                    system_instructions = args.get("system_instructions") or ""
                     allowed_tools = _optional_str_list_arg(args, "allowed_tools")
                     tags = _optional_str_list_arg(args, "tags") or []
+                    add_kwargs: dict[str, Any] = {
+                        "directive": args.get("directive") or "",
+                        "return_condition": args.get("return_condition") or "",
+                    }
+                    if args.get("handler_type"):
+                        add_kwargs["handler_type"] = args["handler_type"]
+                    if args.get("max_turns") is not None:
+                        add_kwargs["max_turns"] = args["max_turns"]
                     entry = self.subagents.add(
                         name=name,
                         description=description,
-                        instructions=instructions,
+                        system_instructions=system_instructions,
                         allowed_tools=allowed_tools,
                         tags=tags,
+                        **add_kwargs,
                     )
                     return {
                         "success": True,
                         "operation": "add",
                         "id": entry.id,
                         "name": entry.name,
+                        "handler_type": entry.handler_type,
+                        "max_turns": entry.max_turns,
                         "allowed_tools": entry.allowed_tools,
                         "tags": entry.tags,
                     }
@@ -689,7 +700,11 @@ class ContinualHarness(Agent):
                         sub_id,
                         name=args.get("name"),
                         description=args.get("description"),
-                        instructions=args.get("instructions"),
+                        system_instructions=args.get("system_instructions"),
+                        directive=args.get("directive"),
+                        return_condition=args.get("return_condition"),
+                        handler_type=args.get("handler_type"),
+                        max_turns=args.get("max_turns"),
                         allowed_tools=_optional_str_list_arg(args, "allowed_tools"),
                         tags=_optional_str_list_arg(args, "tags"),
                     )
@@ -750,15 +765,32 @@ class ContinualHarness(Agent):
                     "error": "run_subagent invoked before choose_action stash; refusing",
                 }
 
-            task = str(args.get("task") or "")
+            directive = (str(args.get("task") or "").strip()) or entry.directive
+            if not directive.strip():
+                return {
+                    "success": False,
+                    "id": sub_id,
+                    "error": (
+                        "run_subagent requires a task, or the subagent must have a "
+                        "stored directive"
+                    ),
+                }
             raw_context = args.get("context") or {}
             context = dict(raw_context) if isinstance(raw_context, dict) else {}
+
+            # one_step runs a single analysis turn; looping runs a bounded action
+            # loop, clamped to the runaway ceiling.
+            inner_rounds = (
+                1
+                if entry.handler_type == "one_step"
+                else max(1, min(entry.max_turns, self.MAX_SUBAGENT_ROUNDS_CEILING))
+            )
 
             tools = build_subagent_tools(entry.allowed_tools)
             sub_vlm = VLM(
                 self.model_name,
                 backend="gemini",
-                system_instruction=entry.instructions,
+                system_instruction=entry.system_instructions,
             )
             sub_vlm.set_tools(tools)
 
@@ -767,7 +799,8 @@ class ContinualHarness(Agent):
                 max_chars=self.HISTORY_MAX_CHARS,
             )
             base_prompt = build_subagent_prompt(
-                task=task,
+                directive=directive,
+                return_condition=entry.return_condition,
                 context=context,
                 latest_frame=self._current_latest_frame,
                 memory_overview=format_memory_overview(self.memory.all_entries()),
@@ -788,8 +821,10 @@ class ContinualHarness(Agent):
             forced_return = False
             inner_round = 0
             total_subagent_actions = 0
+            last_output: dict[str, Any] = {}
+            completed_response = False
 
-            for inner_round in range(1, self.MAX_SUBAGENT_ROUNDS_PER_CALL + 1):
+            for inner_round in range(1, inner_rounds + 1):
                 round_records: list[ToolCallRecord] = []
                 output: dict[str, Any] = {}
                 usage: dict[str, int | None] | None = None
@@ -804,6 +839,8 @@ class ContinualHarness(Agent):
                         module_name=f"{self.name}.subagent.{entry.name}",
                     )
                     output = serialize_response(response)
+                    last_output = output
+                    completed_response = True
                     usage = sub_vlm.extract_usage(response)
                     fcs = extract_function_calls(response)
 
@@ -866,7 +903,7 @@ class ContinualHarness(Agent):
                         "Subagent %s inner round %d/%d failed: %s",
                         entry.name,
                         inner_round,
-                        self.MAX_SUBAGENT_ROUNDS_PER_CALL,
+                        inner_rounds,
                         exc,
                     )
                 finally:
@@ -883,11 +920,12 @@ class ContinualHarness(Agent):
                                 "id": entry.id,
                                 "name": entry.name,
                                 "version": entry.version,
+                                "handler_type": entry.handler_type,
                                 "inner_round": inner_round,
-                                "max_inner_rounds": self.MAX_SUBAGENT_ROUNDS_PER_CALL,
+                                "max_inner_rounds": inner_rounds,
                             },
                             "input": {
-                                "system_instruction": entry.instructions,
+                                "system_instruction": entry.system_instructions,
                                 "user_prompt": working_prompt,
                                 "tools": tools,
                                 "images": [
@@ -916,7 +954,7 @@ class ContinualHarness(Agent):
                             self.game_id,
                             entry.name,
                             inner_round,
-                            self.MAX_SUBAGENT_ROUNDS_PER_CALL,
+                            inner_rounds,
                             usage_token_count(usage, "total"),
                             round_actions,
                             len(round_records),
@@ -945,6 +983,8 @@ class ContinualHarness(Agent):
                 if round_error is not None:
                     break
                 if not round_records:
+                    if entry.handler_type == "one_step":
+                        break
                     last_error = "subagent produced no tool calls and did not return"
                     break
 
@@ -963,7 +1003,8 @@ class ContinualHarness(Agent):
                         max_chars=self.HISTORY_MAX_CHARS,
                     )
                     base_prompt = build_subagent_prompt(
-                        task=task,
+                        directive=directive,
+                        return_condition=entry.return_condition,
                         context=context,
                         latest_frame=latest,
                         memory_overview=format_memory_overview(
@@ -981,19 +1022,38 @@ class ContinualHarness(Agent):
 
             if (
                 final_answer is None
+                and entry.handler_type == "one_step"
                 and last_error is None
-                and inner_round >= self.MAX_SUBAGENT_ROUNDS_PER_CALL
+                and completed_response
+            ):
+                # one_step subagents are read-only analysers: they either call
+                # subagent_return or simply produce a text analysis. Either way,
+                # surface their output as a successful return rather than treating
+                # the absence of subagent_return as a failure.
+                answer_text = (
+                    str(last_output.get("text") or "").strip()
+                    or "(one_step subagent produced no analysis)"
+                )
+                final_answer = {
+                    "answer": answer_text,
+                    "status": "success",
+                    "reasoning": "one_step auto-return",
+                }
+            elif (
+                final_answer is None
+                and last_error is None
+                and inner_round >= inner_rounds
             ):
                 warning = (
                     f"subagent exhausted max inner rounds "
-                    f"({self.MAX_SUBAGENT_ROUNDS_PER_CALL}) without "
+                    f"({inner_rounds}) without "
                     f"subagent_return; forcing return to orchestrator"
                 )
                 logger.warning(
                     "Subagent %s exhausted max inner rounds (%d) without "
                     "subagent_return; forcing return to orchestrator",
                     entry.name,
-                    self.MAX_SUBAGENT_ROUNDS_PER_CALL,
+                    inner_rounds,
                 )
                 last_error = warning
                 forced_return = True

@@ -756,7 +756,7 @@ def build_working_prompt(
     sections.append(state_block)
 
     budget_line = (
-        f"You have at most {max_deliberation_turns} non-action turns to decide the next action(s)."
+        f"You have at most {max_deliberation_turns} non-action turns to decide the next action(s). "
         if max_deliberation_turns
         else ""
     )
@@ -764,35 +764,40 @@ def build_working_prompt(
         "## TURN\n"
         "This is a running conversation about the frame above. The frame stays fixed until you act. "
         + budget_line
-        + "Aim to act within 2-3 non-action turns. Do not re-run a tool whose "
-        "output is already in this conversation or in the recap above; record "
-        "conclusions to memory instead of re-deriving them. Only take_actions "
-        "produces new information — predict each action's effect, then commit. "
-        "An action that advances the game or disproves a hypothesis are both progress; you will receive a fresh observation next."
+        + "Balance analysis with action: reason only as much as needed to predict "
+        "the next useful move, then use take_actions or run action emitting skills. Do not repeat tools whose output is already in this conversation or recap; save conclusions to memory instead. Progress includes advancing the game and disproving a hypothesis; each action gives a fresh observation."
     )
     return "\n\n".join(sections)
 
 
 def build_subagent_prompt(
     *,
-    task: str,
+    directive: str,
     context: dict[str, Any] | None,
     latest_frame: FrameData,
     memory_overview: str,
     skill_overview: str,
     compact_history: str,
+    return_condition: str = "",
 ) -> str:
     """Assemble the user-prompt half of a subagent invocation.
 
-    The subagent's `instructions` are passed as system_instruction by the
+    The subagent's `system_instructions` are passed as system_instruction by the
     orchestrator; this function only builds the per-call user prompt. The
-    termination cue at the bottom mirrors how the orchestrator's USER_PROMPT
-    ends with `# TURN:` — keeping the action cue last (here, subagent_return).
+    `directive` is the effective per-invocation task (run_subagent.task or the
+    subagent's stored directive). The termination cue at the bottom mirrors how
+    the orchestrator's USER_PROMPT ends with `# TURN:` — keeping the action cue
+    last (here, subagent_return).
     """
     parts: list[str] = []
-    parts.append("## TASK")
-    parts.append((task or "").strip() or "(no task supplied)")
+    parts.append("## DIRECTIVE")
+    parts.append((directive or "").strip() or "(no directive supplied)")
     parts.append("")
+
+    if (return_condition or "").strip():
+        parts.append("## RETURN CONDITION")
+        parts.append(return_condition.strip())
+        parts.append("")
 
     parts.append("## CONTEXT")
     if context:

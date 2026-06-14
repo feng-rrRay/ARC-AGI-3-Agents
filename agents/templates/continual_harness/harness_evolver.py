@@ -294,13 +294,17 @@ a skill id (e.g. "skill_003") or its unique name."""
 SUBAGENT_EVOLUTION_PROMPT = """\
 ## Your job: analyze recent trajectories and recommend changes to the agent's subagent library
 
-A subagent is a focused inner agent with its own instructions and a small
-allowlist of tools; it runs a bounded loop, then calls `subagent_return`. From
-the recent trajectory and the current registry:
+A subagent is a focused inner agent with its own static `system_instructions`, a
+per-invocation `directive`, and a small allowlist of tools. A `looping` subagent
+runs a bounded action loop (up to `max_turns`) until it calls `subagent_return`;
+a `one_step` subagent runs a single analysis turn and auto-returns. From the
+recent trajectory and the current registry:
 1. ADD a subagent when the orchestrator repeatedly did the same multi-step
    sub-task by hand that a focused inner agent should own (e.g. systematic
-   exploration of the action space, a recurring analyze-then-act routine).
-2. EDIT a subagent whose instructions led it astray or whose toolset was wrong.
+   exploration of the action space → a `looping` subagent; a recurring
+   analyze-the-state routine → a `one_step` subagent).
+2. EDIT a subagent whose `system_instructions`/`directive` led it astray, whose
+   `handler_type`/`max_turns` was wrong, or whose toolset was wrong.
 3. DELETE subagents that are unused or consistently fail.
 
 ## `allowed_tools` MUST be a subset of:
@@ -323,17 +327,23 @@ __TRIGGER__
   "analysis": "one short paragraph: what you changed and the evidence for it",
   "add": [
     {"name": "explore_actions", "description": "what it is for",
-     "instructions": "Full system prompt for the inner agent: what to do, what to observe, and when to call subagent_return(answer, status).",
+     "system_instructions": "Static system prompt for the inner agent: who it is and how to approach its task, ending with when to call subagent_return(answer, status).",
+     "directive": "Default per-invocation task framing (optional).",
+     "return_condition": "When to return control (optional narrative).",
+     "handler_type": "looping",
+     "max_turns": 25,
      "allowed_tools": ["take_actions", "process_memory"], "tags": ["exploration"]}
   ],
   "edit": [
-    {"id": "subagent_002", "instructions": "improved instructions",
+    {"id": "subagent_002", "system_instructions": "improved system prompt",
+     "directive": "optional", "handler_type": "one_step", "max_turns": 1,
      "allowed_tools": ["take_actions"], "description": "optional"}
   ],
   "delete": ["subagent_004"]
 }
-Rules: empty arrays are fine; `name` must match [A-Za-z][A-Za-z0-9_]*; `id` is an
-existing subagent id (e.g. "subagent_002")."""
+Rules: empty arrays are fine; `name` must match [A-Za-z][A-Za-z0-9_]*;
+`handler_type` is "looping" or "one_step"; `max_turns` is an integer 1-50; `id`
+is an existing subagent id (e.g. "subagent_002")."""
 
 MEMORY_EVOLUTION_PROMPT = """\
 ## Your job: review the agent's memory store and recent trajectories, then recommend targeted improvements. Be conservative — the agent itself writes memory during gameplay. You fill gaps and clean up.
@@ -981,16 +991,26 @@ class HarnessEvolver:
 
         for spec in rec.get("add", []) or []:
             try:
+                add_kwargs: dict[str, Any] = {
+                    "directive": spec.get("directive", ""),
+                    "return_condition": spec.get("return_condition", ""),
+                    "source": "evolved",
+                }
+                if spec.get("handler_type"):
+                    add_kwargs["handler_type"] = spec["handler_type"]
+                if spec.get("max_turns") is not None:
+                    add_kwargs["max_turns"] = spec["max_turns"]
                 entry = self.subagents.add(
                     name=spec.get("name", ""),
                     description=spec.get("description", ""),
-                    instructions=spec.get("instructions", ""),
+                    system_instructions=spec.get("system_instructions", ""),
                     allowed_tools=list(spec.get("allowed_tools") or []),
                     tags=list(spec.get("tags") or []),
+                    **add_kwargs,
                 )
                 out["added"].append(entry.id)
                 logger.info("evolved subagent added: %s (%s)", entry.id, entry.name)
-            except ValueError as exc:  # invalid allowed_tools / name
+            except ValueError as exc:  # invalid allowed_tools / name / handler_type
                 logger.info("evolved subagent add rejected: %s", exc)
             except Exception as exc:
                 logger.error("evolved subagent add failed (%s): %s", spec.get("name"), exc)
@@ -1004,7 +1024,11 @@ class HarnessEvolver:
                     sid,
                     name=upd.get("name"),
                     description=upd.get("description"),
-                    instructions=upd.get("instructions"),
+                    system_instructions=upd.get("system_instructions"),
+                    directive=upd.get("directive"),
+                    return_condition=upd.get("return_condition"),
+                    handler_type=upd.get("handler_type"),
+                    max_turns=upd.get("max_turns"),
                     allowed_tools=(
                         list(upd["allowed_tools"]) if "allowed_tools" in upd else None
                     ),

@@ -320,13 +320,26 @@ class _RecordingSubagentStore(_StoreStub):
         self.edited: list[tuple[str, object]] = []
         self.deleted: list[str] = []
 
-    def add(self, name, description, instructions, allowed_tools=None, tags=None):  # type: ignore[no-untyped-def]
-        self.added.append({"name": name, "allowed_tools": allowed_tools})
+    def add(  # type: ignore[no-untyped-def]
+        self, name, description, system_instructions, *,
+        directive="", return_condition="", handler_type="looping",
+        max_turns=25, allowed_tools=None, tags=None, source="orchestrator",
+    ):
+        self.added.append(
+            {
+                "name": name,
+                "system_instructions": system_instructions,
+                "allowed_tools": allowed_tools,
+                "handler_type": handler_type,
+                "source": source,
+            }
+        )
         return SimpleNamespace(id=f"subagent_{len(self.added):03d}", name=name)
 
     def edit(  # type: ignore[no-untyped-def]
         self, subagent_id, *, name=None, description=None,
-        instructions=None, allowed_tools=None, tags=None,
+        system_instructions=None, directive=None, return_condition=None,
+        handler_type=None, max_turns=None, allowed_tools=None, tags=None,
     ):
         self.edited.append((subagent_id, allowed_tools))
         return SimpleNamespace(id=subagent_id)
@@ -743,8 +756,9 @@ class TestComponentEvolutionPasses:
                 "analysis": "x",
                 "add": [
                     {
-                        "name": "explore", "description": "d", "instructions": "i",
-                        "allowed_tools": ["take_actions"], "tags": [],
+                        "name": "explore", "description": "d",
+                        "system_instructions": "i", "handler_type": "one_step",
+                        "max_turns": 1, "allowed_tools": ["take_actions"], "tags": [],
                     }
                 ],
                 "edit": [{"id": "subagent_001", "allowed_tools": ["process_memory"]}],
@@ -756,6 +770,8 @@ class TestComponentEvolutionPasses:
         out = ev._evolve_subagents([], "traj", "trigger")
 
         assert [s["name"] for s in store.added] == ["explore"]
+        assert store.added[0]["handler_type"] == "one_step"
+        assert store.added[0]["source"] == "evolved"
         assert store.edited == [("subagent_001", ["process_memory"])]
         assert store.deleted == ["subagent_002"]
         assert len(out["added"]) == 1
@@ -784,6 +800,11 @@ class TestComponentEvolutionPasses:
         assert "subagent_002" in SUBAGENT_EVOLUTION_PROMPT
         assert "subagent_004" in SUBAGENT_EVOLUTION_PROMPT
         assert "sa_002" not in SUBAGENT_EVOLUTION_PROMPT
+
+    def test_subagent_prompt_uses_new_field_names(self) -> None:
+        assert "system_instructions" in SUBAGENT_EVOLUTION_PROMPT
+        assert "handler_type" in SUBAGENT_EVOLUTION_PROMPT
+        assert '"instructions"' not in SUBAGENT_EVOLUTION_PROMPT
         assert "sa_004" not in SUBAGENT_EVOLUTION_PROMPT
 
     def test_pass_returns_error_on_malformed_json(

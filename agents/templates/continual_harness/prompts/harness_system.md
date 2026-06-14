@@ -124,17 +124,18 @@ result = {"objects": {c: len(p) for c, p in objects.items()}, "changes": changes
 
 **process_subagent**
 - **Required:** `reasoning` (string), `operation` (`add` | `delete` | `edit` | `search`)
-- For `add`: `name` (max 100 chars), `description` (max 500 chars), `instructions` (system prompt, max 4000 chars), `allowed_tools` (optional), `tags` (optional)
+- For `add`: `name` (max 100 chars), `description` (max 500 chars), `system_instructions` (static system prompt, max 4000 chars), plus optional `directive` (default per-invocation task framing), `return_condition` (when to return), `handler_type` (`looping` default | `one_step`), `max_turns` (1-50, default 25), `allowed_tools`, `tags`
+- `handler_type`: `looping` runs a bounded action loop until `subagent_return` or `max_turns`; `one_step` runs a single analysis turn and auto-returns.
 - `allowed_tools`: subset of `process_memory`, `process_skill`, `run_skill`, `take_actions`. Defaults to `[]` (reason-and-return only) if omitted — the subagent already receives the compact recent-steps history in its prompt.
 - For `edit`: `id` + any fields
 - For `delete`: `id`
 - For `search`: `query`
-- Your prompt includes a **SUBAGENTS** index showing id + name + allowed tools + description.
+- Your prompt includes a **SUBAGENTS** index showing id + name + handler type + allowed tools + description.
 
 **run_subagent**
-- **Required:** `reasoning` (string), `id` (subagent id), `task` (natural-language task description)
-- **Optional:** `context` (object — injected into the subagent's prompt as JSON)
-- The subagent runs a bounded inner loop (up to 20 rounds) using only its allowed tools, then calls `subagent_return(answer, status)` to terminate. Returns `{success, result, rounds_used, ...}`.
+- **Required:** `reasoning` (string), `id` (subagent id)
+- **Optional:** `task` (natural-language directive for this invocation — falls back to the subagent's stored `directive` when omitted), `context` (object — injected into the subagent's prompt as JSON)
+- The subagent runs a bounded inner loop (up to its `max_turns`; `one_step` runs a single turn) using only its allowed tools, then calls `subagent_return(answer, status)` to terminate. Returns `{success, result, rounds_used, ...}`.
 - Max 1 subagent invocation per step.
 
 ### Soft guideline

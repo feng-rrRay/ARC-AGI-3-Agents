@@ -1019,7 +1019,7 @@ class TestSubagentHandlers:
                             "operation": "add",
                             "name": "summarizer",
                             "description": "Summarize current state.",
-                            "instructions": "Return a concise summary.",
+                            "system_instructions": "Return a concise summary.",
                         },
                     )
                 ),
@@ -1048,7 +1048,7 @@ class TestSubagentHandlers:
                             "game_id": "orch-test",
                             "name": "summarizer",
                             "description": "Summarize.",
-                            "instructions": "Return the answer.",
+                            "system_instructions": "Return the answer.",
                             "allowed_tools": [],
                             "tags": [],
                             "version": 1,
@@ -1113,6 +1113,138 @@ class TestSubagentHandlers:
         assert result["steps"][0]["subagent_return"]["answer"] == "summary"
         assert result["steps"][0]["tool_calls"] == []
 
+    def test_one_step_subagent_auto_returns_text_response(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return text only.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _TextSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                return _response(
+                    SimpleNamespace(text="concise summary", function_call=None)
+                )
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _TextSubVLM)
+        agent._current_latest_frame = _make_frame([1])
+        agent._current_images = []
+        agent._current_outer_round = 1
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        result = record.result
+        assert result["success"] is True
+        assert result["error"] is None
+        assert result["result"]["answer"] == "concise summary"
+        assert result["result"]["reasoning"] == "one_step auto-return"
+
+    def test_one_step_subagent_preserves_vlm_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return text only.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _FailingSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                raise RuntimeError("quota exhausted")
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _FailingSubVLM)
+        agent._current_latest_frame = _make_frame([1])
+        agent._current_images = []
+        agent._current_outer_round = 1
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        result = record.result
+        assert result["success"] is False
+        assert result["result"] is None
+        assert "quota exhausted" in result["error"]
+        assert result["steps"][0]["error"] == result["error"]
+
     def test_run_subagent_forces_failure_return_on_max_rounds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1126,7 +1258,9 @@ class TestSubagentHandlers:
                             "game_id": "orch-test",
                             "name": "looper",
                             "description": "Loops.",
-                            "instructions": "Keep using tools.",
+                            "system_instructions": "Keep using tools.",
+                            "handler_type": "looping",
+                            "max_turns": 2,
                             "allowed_tools": ["get_recent_trajectory"],
                             "tags": [],
                             "version": 1,
@@ -1138,7 +1272,6 @@ class TestSubagentHandlers:
             )
         )
         agent = _make_agent(tmp_path, monkeypatch)
-        monkeypatch.setattr(agent, "MAX_SUBAGENT_ROUNDS_PER_CALL", 2)
 
         class _LoopingSubVLM:
             def __init__(self, *_: Any, **__: Any) -> None:
