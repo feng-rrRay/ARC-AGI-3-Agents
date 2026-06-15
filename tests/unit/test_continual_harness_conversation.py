@@ -532,6 +532,8 @@ class TestConversationLoop:
         assert agent.total_tokens == 352_500
         assert agent.total_priced_calls == 2
         assert agent.total_vlm_cost_usd == pytest.approx(high["cumulative_usd"])
+        assert agent.usage_by_scope["orchestrator"]["calls"] == 2
+        assert agent.usage_by_scope["orchestrator"]["total_tokens"] == 352_500
 
     def test_vlm_usage_pricing_unsupported_model_still_counts_tokens(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -548,6 +550,26 @@ class TestConversationLoop:
         assert agent.total_tokens == 125
         assert agent.total_priced_calls == 0
         assert agent.total_vlm_cost_usd == 0.0
+        assert agent.usage_by_scope["orchestrator"]["calls"] == 1
+        assert agent.usage_by_scope["orchestrator"]["priced_calls"] == 0
+
+    def test_harness_evolution_usage_callback_uses_own_scope(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        cost = agent.harness_evolver.record_usage(
+            {"prompt": 100, "output": 20, "thoughts": 5, "total": 125, "cached": 0}
+        )
+
+        assert cost is not None
+        assert agent.total_calls == 1
+        assert agent.total_tokens == 125
+        assert agent.usage_by_scope["harness_evolution"]["calls"] == 1
+        assert agent.usage_by_scope["harness_evolution"]["total_tokens"] == 125
+        assert agent.usage_by_scope["harness_evolution"]["cost_usd"] == pytest.approx(
+            cost["current_usd"]
+        )
 
     def test_runaway_cap_forces_break(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

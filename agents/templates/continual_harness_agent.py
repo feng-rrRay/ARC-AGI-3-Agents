@@ -910,7 +910,7 @@ class ContinualHarness(Agent):
                         exc,
                     )
                 finally:
-                    usage_cost = self._record_vlm_usage(usage)
+                    usage_cost = self._record_vlm_usage(usage, scope="subagent")
                     self.trace.write(
                         {
                             "agent": self.name,
@@ -945,6 +945,8 @@ class ContinualHarness(Agent):
                             },
                             "output": output,
                             "usage": usage,
+                            "usage_scope": "subagent",
+                            "usage_accounted": usage is not None,
                             "usage_cost": usage_cost,
                             "chosen_action": None,
                             "reasoning": None,
@@ -1116,6 +1118,15 @@ class ContinualHarness(Agent):
             self.subagents.path,
             len(self.subagents.all_entries()),
         )
+        # Cumulative token usage; logged once on cleanup().
+        self.total_calls = 0
+        self.total_prompt_tokens = 0
+        self.total_output_tokens = 0
+        self.total_tokens = 0
+        self.total_vlm_cost_usd = 0.0
+        self.total_priced_calls = 0
+        self.usage_by_scope: dict[str, dict[str, Any]] = {}
+
         # All evolution state (base prompt file, evolution log, generation
         # counters) lives in the evolver; it shares the stores built above so
         # inline orchestrator edits and meta-level edits hit the same files.
@@ -1129,7 +1140,9 @@ class ContinualHarness(Agent):
             subagents=self.subagents,
             trajectory=self.trajectory,
             trace=self.trace,
-            record_usage=self._record_vlm_usage,
+            record_usage=lambda usage: self._record_vlm_usage(
+                usage, scope="harness_evolution"
+            ),
             baseline_prompt=BASE_ORCHESTRATOR_POLICY,
         )
         logger.info(
@@ -1139,14 +1152,6 @@ class ContinualHarness(Agent):
             self.harness_evolver.base_prompt_path,
             self.harness_evolver.evolution_log_path,
         )
-
-        # Cumulative token usage; logged once on cleanup().
-        self.total_calls = 0
-        self.total_prompt_tokens = 0
-        self.total_output_tokens = 0
-        self.total_tokens = 0
-        self.total_vlm_cost_usd = 0.0
-        self.total_priced_calls = 0
 
     @property
     def name(self) -> str:
@@ -1220,7 +1225,10 @@ class ContinualHarness(Agent):
         return reason, usage
 
     def _record_vlm_usage(
-        self, usage: dict[str, Any] | None
+        self,
+        usage: dict[str, Any] | None,
+        *,
+        scope: str = "orchestrator",
     ) -> dict[str, Any] | None:
         if usage is None:
             return None
@@ -1234,6 +1242,22 @@ class ContinualHarness(Agent):
         self.total_output_tokens += output_tokens
         self.total_tokens += total_tokens
 
+        bucket = self.usage_by_scope.setdefault(
+            scope,
+            {
+                "calls": 0,
+                "prompt_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "priced_calls": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        bucket["calls"] += 1
+        bucket["prompt_tokens"] += prompt_tokens
+        bucket["output_tokens"] += output_tokens
+        bucket["total_tokens"] += total_tokens
+
         cost = estimate_vlm_usage_cost(
             self.model_name,
             usage,
@@ -1244,6 +1268,8 @@ class ContinualHarness(Agent):
 
         self.total_vlm_cost_usd = float(cost["cumulative_usd"])
         self.total_priced_calls += 1
+        bucket["priced_calls"] += 1
+        bucket["cost_usd"] += float(cost["current_usd"])
         return cost
 
     # ------------------------------------------------------------------
@@ -1411,6 +1437,7 @@ class ContinualHarness(Agent):
                 response = self.vlm.get_query_contents(contents, module_name=self.name)
                 output = serialize_response(response)
                 usage = self.vlm.extract_usage(response)
+                usage_cost = self._record_vlm_usage(usage, scope="orchestrator")
             except Exception as exc:
                 self._consecutive_vlm_errors += 1
                 no_action_reason = f"vlm_error: {exc!r}"
@@ -1447,14 +1474,12 @@ class ContinualHarness(Agent):
             actions_executed += turn_actions
             all_new_results.extend(new_results)
 
-            usage_cost = self._record_vlm_usage(usage)
-
             self._write_orchestrator_trace(
                 prompt=turn_prompt, output=output, usage=usage, tools=tools,
                 tool_calls=new_results, actions_executed=turn_actions,
                 rendered_grids=turn_grids, error=None,
                 conversation_id=conversation_id, conversation_turn=turn,
-                usage_cost=usage_cost,
+                usage_cost=usage_cost, usage_accounted=usage is not None,
             )
 
             # Per-VLM-call run.log summary. One line per conversation turn.
@@ -1915,6 +1940,7 @@ class ContinualHarness(Agent):
         conversation_id: int | None = None,
         conversation_turn: int | None = None,
         usage_cost: dict[str, Any] | None = None,
+        usage_accounted: bool = False,
     ) -> None:
         self.trace.write(
             {
@@ -1949,6 +1975,8 @@ class ContinualHarness(Agent):
                 },
                 "output": output,
                 "usage": usage,
+                "usage_scope": "orchestrator",
+                "usage_accounted": usage_accounted,
                 "usage_cost": usage_cost,
                 "actions_executed": actions_executed,
                 "tool_calls": [asdict(r) for r in tool_calls],
@@ -1971,6 +1999,20 @@ class ContinualHarness(Agent):
                 self.name,
                 self.total_priced_calls,
                 self.total_vlm_cost_usd,
+            )
+        for scope in sorted(self.usage_by_scope):
+            bucket = self.usage_by_scope[scope]
+            logger.info(
+                "[%s] Token usage scope=%s: calls=%d prompt=%d output=%d "
+                "total=%d priced_calls=%d cost=$%.6f",
+                self.name,
+                scope,
+                bucket["calls"],
+                bucket["prompt_tokens"],
+                bucket["output_tokens"],
+                bucket["total_tokens"],
+                bucket["priced_calls"],
+                bucket["cost_usd"],
             )
         logger.info(
             "[%s] Trajectory: %d steps recorded at %s",

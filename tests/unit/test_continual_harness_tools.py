@@ -1113,6 +1113,101 @@ class TestSubagentHandlers:
         assert result["steps"][0]["subagent_return"]["answer"] == "summary"
         assert result["steps"][0]["tool_calls"] == []
 
+    def test_run_subagent_usage_counts_in_scoped_totals_and_trace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return the answer.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _UsageSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                return _response(
+                    _fc_part(
+                        "subagent_return",
+                        {
+                            "reasoning": "done",
+                            "answer": "summary",
+                            "status": "success",
+                        },
+                    )
+                )
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return {
+                    "prompt": 100,
+                    "output": 20,
+                    "thoughts": 5,
+                    "total": 125,
+                    "cached": 0,
+                }
+
+        monkeypatch.setattr(harness_module, "VLM", _UsageSubVLM)
+        frame = _make_frame([1])
+        agent.frames = [frame]
+        agent._current_latest_frame = frame
+        agent._current_images = []
+        agent._current_outer_round = 7
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        assert record.result["success"] is True
+        assert agent.total_calls == 1
+        assert agent.total_tokens == 125
+        assert agent.usage_by_scope["subagent"]["calls"] == 1
+        assert agent.usage_by_scope["subagent"]["total_tokens"] == 125
+        assert agent.usage_by_scope["subagent"]["priced_calls"] == 1
+
+        trace_rows = [
+            json.loads(line)
+            for line in (tmp_path / "run.trace.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        assert trace_rows[-1]["tools_exposed"] == "subagent"
+        assert trace_rows[-1]["usage_scope"] == "subagent"
+        assert trace_rows[-1]["usage_accounted"] is True
+        assert trace_rows[-1]["usage"]["total"] == 125
+        assert trace_rows[-1]["usage_cost"]["current_usd"] > 0
+
     def test_run_subagent_images_match_prompt_rendered_grids(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

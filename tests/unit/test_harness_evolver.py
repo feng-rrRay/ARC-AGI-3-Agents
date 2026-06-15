@@ -874,6 +874,8 @@ class TestComponentEvolutionPasses:
             assert row["evolution"]["result"]["analysis"] == "trace me"
             assert row["input"]["user_prompt"]
             assert row["output"]["text"] == payload
+            assert row["usage_scope"] == "harness_evolution"
+            assert row["usage_accounted"] is False
 
     def test_pass_returns_error_on_malformed_json(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

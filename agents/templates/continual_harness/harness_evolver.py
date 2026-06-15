@@ -803,6 +803,8 @@ class HarnessEvolver:
                     },
                     "output": output,
                     "usage": usage,
+                    "usage_scope": "harness_evolution",
+                    "usage_accounted": usage is not None,
                     "usage_cost": usage_cost,
                     "error": error,
                 }
@@ -914,6 +916,8 @@ class HarnessEvolver:
                     },
                     "output": output,
                     "usage": usage,
+                    "usage_scope": "harness_evolution",
+                    "usage_accounted": usage is not None,
                     "usage_cost": usage_cost,
                     "error": error,
                 }
