@@ -91,6 +91,17 @@ from .utils.vlm_backend import VLM, estimate_vlm_usage_cost, usage_token_count
 logger = logging.getLogger(__name__)
 
 
+def _float_env(name: str, default: float) -> float:
+    """Read a float env var, falling back to ``default`` on unset/blank/invalid."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _compute_grid_delta(
     pre_grid: list[list[int]] | None,
     post_grid: list[list[int]] | None,
@@ -267,6 +278,9 @@ class ContinualHarness(Agent):
     """
 
     MAX_ACTIONS = 5000
+    MAX_COST_USD = 100.0  # cumulative VLM-cost ceiling (USD); 0 disables
+    MIN_LEVEL_SCORE = 4.0  # abandon current level when best-case score < this; 0 disables
+    MIN_LEVEL_ACTIONS = 100  # don't apply the efficiency stop before this many actions on a level
     MODEL = "gemini-3.1-pro-preview"  # default; override via GEMINI_MODEL
     HISTORY_MAX_CHARS = 12000  # budget for the RECENT HISTORY block
     HISTORY_BATCH_WINDOW = 5  # last N batches shown in compact history
@@ -1127,6 +1141,38 @@ class ContinualHarness(Agent):
         self.total_priced_calls = 0
         self.usage_by_scope: dict[str, dict[str, Any]] = {}
 
+        # Stop conditions beyond MAX_ACTIONS (env-overridable).
+        self.max_cost_usd = _float_env(
+            "CONTINUAL_HARNESS_MAX_COST_USD", self.MAX_COST_USD
+        )
+        self.min_level_score = _float_env(
+            "CONTINUAL_HARNESS_MIN_LEVEL_SCORE", self.MIN_LEVEL_SCORE
+        )
+        self.min_level_actions = int(
+            _float_env("CONTINUAL_HARNESS_MIN_LEVEL_ACTIONS", self.MIN_LEVEL_ACTIONS)
+        )
+        # action_counter at which the CURRENT level began; updated on any level
+        # change (progress, or post-GAME_OVER reset). Drives the per-level
+        # efficiency stop via actions_this_level = action_counter - this.
+        self._level_start_action: int = 0
+        # Per-level human baseline action counts (one per level), used to judge
+        # whether the current level can still meaningfully score. Reachable live
+        # off the env wrapper; falls back to None (efficiency stop then no-ops).
+        try:
+            self._baseline_actions: list[int] | None = self.arc_env.info.baseline_actions
+        except Exception:
+            self._baseline_actions = None
+        logger.info(
+            "[%s] Stop conditions: MAX_ACTIONS=%d max_cost=$%.2f min_level_score=%.2f "
+            "min_level_actions=%d baseline_actions=%s",
+            self.name,
+            self.MAX_ACTIONS,
+            self.max_cost_usd,
+            self.min_level_score,
+            self.min_level_actions,
+            self._baseline_actions,
+        )
+
         # All evolution state (base prompt file, evolution log, generation
         # counters) lives in the evolver; it shares the stores built above so
         # inline orchestrator edits and meta-level edits hit the same files.
@@ -1273,16 +1319,71 @@ class ContinualHarness(Agent):
         return cost
 
     # ------------------------------------------------------------------
+    # Stop conditions — checked once per decision at the top of main().
+    # ------------------------------------------------------------------
+
+    def _level_score_ceiling(self) -> float | None:
+        """Best-case score for the CURRENT level given actions already spent.
+
+        Mirrors the scorecard formula ((baseline/actions)^2 * 100, capped 115).
+        Assumes the level is completed right now — more actions only lower it,
+        so this is an upper bound on what the level can still contribute.
+        Returns None when no baseline is known for the current level.
+        """
+        baselines = self._baseline_actions
+        if not baselines:
+            return None
+        level = self.frames[-1].levels_completed  # 0-based index of level in play
+        if level < 0 or level >= len(baselines):
+            return None
+        baseline = baselines[level]
+        actions_this_level = self.action_counter - self._level_start_action
+        if baseline <= 0 or actions_this_level <= 0:
+            return None
+        return min((baseline / actions_this_level) ** 2 * 100.0, 115.0)
+
+    def _stop_reason(self) -> str | None:
+        """Return a human-readable reason to abandon the game, or None to go on.
+
+        WIN is handled separately via is_done(); this owns the budget/give-up
+        stops: action cap, cumulative-cost cap, and per-level efficiency.
+        """
+        if self.action_counter > self.MAX_ACTIONS:
+            return (
+                f"action budget exhausted (action_counter={self.action_counter} "
+                f"> MAX_ACTIONS={self.MAX_ACTIONS})"
+            )
+        if self.max_cost_usd > 0 and self.total_vlm_cost_usd >= self.max_cost_usd:
+            return (
+                f"cost cap reached (cum_cost=${self.total_vlm_cost_usd:.2f} "
+                f">= ${self.max_cost_usd:.2f})"
+            )
+        if self.min_level_score > 0:
+            actions_this_level = self.action_counter - self._level_start_action
+            if actions_this_level >= self.min_level_actions:
+                ceiling = self._level_score_ceiling()
+                if ceiling is not None and ceiling < self.min_level_score:
+                    level = self.frames[-1].levels_completed
+                    return (
+                        f"level {level} unlikely to contribute (best-case score "
+                        f"{ceiling:.1f} < {self.min_level_score:.1f}; "
+                        f"actions_this_level={actions_this_level}, "
+                        f"baseline={self._baseline_actions[level]})"
+                    )
+        return None
+
+    # ------------------------------------------------------------------
     # Main loop — overrides Agent.main() with @trace_agent_session re-applied.
     # ------------------------------------------------------------------
 
     @trace_agent_session
     def main(self) -> None:
         self.timer = time.time()
-        while (
-            not self.is_done(self.frames, self.frames[-1])
-            and self.action_counter <= self.MAX_ACTIONS
-        ):
+        while not self.is_done(self.frames, self.frames[-1]):
+            stop_reason = self._stop_reason()
+            if stop_reason is not None:
+                logger.info("[%s] Stopping early: %s", self.game_id, stop_reason)
+                break
             latest_frame = self.frames[-1]
 
             # Terminal failure: consolidate the failed trajectory before reset.
@@ -1756,6 +1857,10 @@ class ContinualHarness(Agent):
             score_after > pre_score or post.state is GameState.WIN
         ):
             self._last_progress_step = self.action_counter
+        if frame is not None and score_after != pre_score:
+            # Level changed — up on progress, or down to 0 on a post-GAME_OVER
+            # reset. Reset the per-level action counter either way.
+            self._level_start_action = self.action_counter
 
         post_grid = post.frame[-1] if post.frame else None
         grid_delta = _compute_grid_delta(pre_grid, post_grid)

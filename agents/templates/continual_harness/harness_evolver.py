@@ -743,9 +743,14 @@ class HarnessEvolver:
         self, system: str, user: str, images: list[Any], tag: Any
     ) -> tuple[Any, dict[str, Any] | None, dict[str, Any] | None]:
         vlm = VLM(self.model_name, backend="gemini", system_instruction=system)
-        payload: Any = images if len(images) > 1 else (images[0] if images else None)
-        response = vlm.get_query(
-            payload, user, module_name=f"{self.agent_name}.evolve.{tag}"
+        # Use the multi-turn contents API: it always returns the raw response
+        # object, so extract_usage() can read usage_metadata. `vlm.get_query`
+        # returns plain text when no tools are set — which the evolver never
+        # sets — and extract_usage(<str>) is None, silently dropping all
+        # evolution cost from the usage totals.
+        user_turn = vlm.build_user_turn(user, images)
+        response = vlm.get_query_contents(
+            [user_turn], module_name=f"{self.agent_name}.evolve.{tag}"
         )
         usage = vlm.extract_usage(response)
         usage_cost = self.record_usage(usage)
