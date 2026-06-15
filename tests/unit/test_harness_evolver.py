@@ -17,20 +17,20 @@ from types import SimpleNamespace
 import pytest
 from arcengine import FrameData, GameState
 
-from agents.templates.continual_harness.models import ToolCallRecord, ToolEvidenceRecord
 from agents.templates.continual_harness.harness_evolver import (
     PROMPT_MAX_CHARS,
     PROMPT_MIN_CHARS,
+    SUBAGENT_EVOLUTION_PROMPT,
     HarnessEvolver,
     PromptEvolutionRecord,
     PromptEvolutionStore,
     PromptFile,
-    SUBAGENT_EVOLUTION_PROMPT,
     active_prompt_evolution_path,
     active_prompt_path,
     build_evolution_prompt,
     validate_evolved_prompt,
 )
+from agents.templates.continual_harness.models import ToolCallRecord, ToolEvidenceRecord
 
 
 @pytest.mark.unit
@@ -516,7 +516,7 @@ class TestGameOverEvolutionTrigger:
         ev.evolve = lambda latest, action_counter, **_: calls.append(action_counter)  # type: ignore[method-assign]
 
         ev.evolve_on_game_over(self._frame(), 12)
-        # Only 1 action later: blocked by STAGNATION_MIN_ACTIONS_SINCE_EVOLUTION.
+        # Only 1 action later: blocked by the configured prompt-evolve frequency.
         ev.maybe_evolve_on_stagnation(self._playing_frame(), 13, last_progress_step=-100)
 
         assert calls == [12]
@@ -546,7 +546,7 @@ class TestStagnationEvolutionTrigger:
             state=GameState.NOT_FINISHED, levels_completed=0,
         )
 
-    def test_stagnation_evolves_when_no_progress_and_noop_window(
+    def test_stagnation_evolves_when_no_progress_reaches_frequency(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ev = self._evolver(tmp_path, monkeypatch)
@@ -562,9 +562,12 @@ class TestStagnationEvolutionTrigger:
         assert len(calls) == 1
         assert calls[0][0] == frame
         assert calls[0][1]["trigger"] == "stagnation"
-        assert "no-op/invalid" in " ".join(calls[0][1]["trigger_evidence"])  # type: ignore[arg-type]
+        evidence = " ".join(calls[0][1]["trigger_evidence"])  # type: ignore[arg-type]
+        assert "130 actions since last score/level progress" in evidence
+        assert "130 actions since last harness evolution" in evidence
+        assert "prompt-evolve frequency=100" in evidence
         assert ev._last_evolution_step == 130
-        assert ev.trajectory.requested == [HarnessEvolver.STAGNATION_WINDOW]
+        assert ev.trajectory.requested == []
 
     def test_stagnation_requires_progress_gap(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -578,7 +581,20 @@ class TestStagnationEvolutionTrigger:
 
         assert calls == []
 
-    def test_stagnation_requires_pattern_evidence(
+    def test_stagnation_requires_frequency_since_last_evolution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ev = self._evolver(tmp_path, monkeypatch)
+        ev._last_evolution_step = 80
+        calls: list[FrameData] = []
+        ev.evolve = lambda latest, action_counter, **_: calls.append(latest)  # type: ignore[method-assign]
+
+        # No progress for 130 actions, but only 50 since last evolution.
+        ev.maybe_evolve_on_stagnation(self._frame(), 130, last_progress_step=0)
+
+        assert calls == []
+
+    def test_stagnation_does_not_require_pattern_evidence(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         moving = _TrajectoryStub(
@@ -593,12 +609,14 @@ class TestStagnationEvolutionTrigger:
             ]
         )
         ev = self._evolver(tmp_path, monkeypatch, trajectory=moving)
+        frame = self._frame()
         calls: list[FrameData] = []
         ev.evolve = lambda latest, action_counter, **_: calls.append(latest)  # type: ignore[method-assign]
 
-        ev.maybe_evolve_on_stagnation(self._frame(), 130, last_progress_step=0)
+        ev.maybe_evolve_on_stagnation(frame, 130, last_progress_step=0)
 
-        assert calls == []
+        assert calls == [frame]
+        assert moving.requested == []
 
 
 @pytest.mark.unit
@@ -807,6 +825,56 @@ class TestComponentEvolutionPasses:
         assert '"instructions"' not in SUBAGENT_EVOLUTION_PROMPT
         assert "sa_004" not in SUBAGENT_EVOLUTION_PROMPT
 
+    def test_subagent_prompt_explains_action_capable_tool_policy(self) -> None:
+        assert "reason-and-return only" in SUBAGENT_EVOLUTION_PROMPT
+        assert "Include `take_actions` only for bounded action-capable subagents" in (
+            SUBAGENT_EVOLUTION_PROMPT
+        )
+
+    def test_component_passes_trace_parsed_json_and_applied_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ev = _make_evolver(
+            tmp_path,
+            monkeypatch,
+            skills=_RecordingSkillStore(),
+            subagents=_RecordingSubagentStore(),
+            memory=_RecordingMemoryStore(),
+        )
+        payload = json.dumps(
+            {"analysis": "trace me", "add": [], "edit": [], "delete": []}
+        )
+        monkeypatch.setattr(ev, "_meta_query", lambda *a, **k: (payload, None, None))
+
+        ev._evolve_skills([], "traj", "trigger", action_counter=12, gen=3)
+        ev._evolve_subagents([], "traj", "trigger", action_counter=12, gen=3)
+        ev._evolve_memory([], "traj", "trigger", action_counter=12, gen=3)
+
+        traces = [
+            row
+            for row in ev.trace.entries
+            if row.get("tools_exposed") == "evolution"
+            and row.get("evolution", {}).get("pass")
+            in {"skills", "subagents", "memory"}
+        ]
+        assert [row["evolution"]["pass"] for row in traces] == [
+            "skills",
+            "subagents",
+            "memory",
+        ]
+        for row in traces:
+            assert row["action_counter"] == 12
+            assert row["evolution"]["generation"] == 3
+            assert row["evolution"]["parsed_json"] == {
+                "analysis": "trace me",
+                "add": [],
+                "edit": [],
+                "delete": [],
+            }
+            assert row["evolution"]["result"]["analysis"] == "trace me"
+            assert row["input"]["user_prompt"]
+            assert row["output"]["text"] == payload
+
     def test_pass_returns_error_on_malformed_json(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -818,3 +886,8 @@ class TestComponentEvolutionPasses:
 
         assert out == {"error": "failed_to_parse_response"}
         assert store.added == []
+        trace = ev.trace.entries[-1]
+        assert trace["evolution"]["pass"] == "skills"
+        assert trace["evolution"]["parsed_json"] is None
+        assert trace["evolution"]["result"] == {"error": "failed_to_parse_response"}
+        assert trace["output"]["text"] == "not json"

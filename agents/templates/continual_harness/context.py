@@ -15,9 +15,9 @@ from .models import (
     ToolEvidenceRecord,
 )
 
-
 CURRENT_STATE_GRID_LABEL = "current_state_frame"
 MAX_OBSERVATION_TEXT_GRIDS = 4
+MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS = 3
 
 
 def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
@@ -95,6 +95,14 @@ class _ObservationRenderPlan:
     observation: PendingActionObservation
     lines: list[str]
     candidates: list[_ObservationGridCandidate]
+
+
+@dataclass(slots=True)
+class _SubagentFrameRenderPlan:
+    current_grid: RenderedGrid | None
+    animation_summary: str | None
+    transient_indices: list[int]
+    rendered_grids: list[RenderedGrid]
 
 
 def _frame_state_name(frame: FrameData | None) -> str:
@@ -482,6 +490,146 @@ def build_observation_section(
     return "\n".join(lines), rendered_grids
 
 
+def _current_frame_animation_summary(
+    grids: Sequence[list[list[int]]],
+    final_grid: list[list[int]],
+) -> tuple[str, list[int], list[_DiffStats], list[_DiffStats]]:
+    diff_to_final = [_grid_diff_stats(final_grid, grid) for grid in grids]
+    diff_to_prev = [_DiffStats(count=0, bbox=None, colors=set())]
+    for i in range(1, len(grids)):
+        diff_to_prev.append(_grid_diff_stats(grids[i - 1], grids[i]))
+
+    final_index = len(grids) - 1
+    transient_indices = [
+        i for i, stats in enumerate(diff_to_final[:final_index]) if stats.count > 0
+    ]
+    if transient_indices:
+        peak = max(
+            transient_indices,
+            key=lambda i: (diff_to_final[i].count, -i),
+        )
+        motion_indices = [i for i in range(1, len(diff_to_prev))]
+        max_motion = (
+            max(motion_indices, key=lambda i: (diff_to_prev[i].count, -i))
+            if motion_indices
+            else 0
+        )
+        bbox = _merge_bbox(diff_to_final[i].bbox for i in transient_indices)
+        colors: set[int] = set()
+        for i in transient_indices:
+            colors.update(diff_to_final[i].colors or set())
+        colors_text = "[" + ",".join(color_to_hex(c) for c in sorted(colors)) + "]"
+        transient_text = (
+            f"{_format_index_ranges(transient_indices)} "
+            f"({len(transient_indices)}/{len(grids)})"
+        )
+        summary = (
+            "ANIMATION SUMMARY: "
+            f"frame_count={len(grids)}; "
+            f"current_grid={final_index}; "
+            f"transient_frames={transient_text}; "
+            f"peak_difference={diff_to_final[peak].count} cells "
+            f"at grid {peak}; "
+            f"max_motion={diff_to_prev[max_motion].count} cells "
+            f"at grid {max_motion}; "
+            f"bbox={_format_bbox(bbox)}; "
+            f"colors_seen(hex)={colors_text}"
+        )
+    else:
+        summary = (
+            "ANIMATION SUMMARY: "
+            f"frame_count={len(grids)}; "
+            f"current_grid={final_index}; "
+            "transient_frames=none; "
+            "peak_difference=0 cells; max_motion=0 cells; "
+            "bbox=none; colors_seen(hex)=[]"
+        )
+
+    return summary, transient_indices, diff_to_final, diff_to_prev
+
+
+def _build_subagent_frame_render_plan(
+    latest_frame: FrameData,
+    *,
+    max_transient_keyframes: int = MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS,
+) -> _SubagentFrameRenderPlan:
+    current_grid = current_state_rendered_grid(latest_frame)
+    if current_grid is None:
+        return _SubagentFrameRenderPlan(None, None, [], [])
+
+    rendered_grids = [current_grid]
+    grids = [_normalise_grid(grid) for grid in latest_frame.frame]
+    if len(grids) <= 1:
+        return _SubagentFrameRenderPlan(current_grid, None, [], rendered_grids)
+
+    summary, transient_indices, diff_to_final, diff_to_prev = (
+        _current_frame_animation_summary(grids, current_grid.grid)
+    )
+    selected: list[int] = []
+    if transient_indices:
+        selected = _select_transient_keyframes(
+            diff_to_final,
+            diff_to_prev,
+            transient_indices,
+            limit=max_transient_keyframes,
+        )
+        for frame_index in selected:
+            label = f"current_frame_transient_{frame_index}"
+            rendered_grids.append(RenderedGrid(label=label, grid=grids[frame_index]))
+
+    return _SubagentFrameRenderPlan(
+        current_grid,
+        summary,
+        selected,
+        rendered_grids,
+    )
+
+
+def subagent_current_frame_rendered_grids(
+    latest_frame: FrameData,
+    *,
+    max_transient_keyframes: int = MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS,
+) -> list[RenderedGrid]:
+    """Return the exact grids whose PNGs should accompany a subagent prompt."""
+    plan = _build_subagent_frame_render_plan(
+        latest_frame,
+        max_transient_keyframes=max_transient_keyframes,
+    )
+    return plan.rendered_grids
+
+
+def format_subagent_current_frame(
+    latest_frame: FrameData,
+    *,
+    max_transient_keyframes: int = MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS,
+) -> str:
+    """Render the subagent current frame using the orchestrator frame contract."""
+    plan = _build_subagent_frame_render_plan(
+        latest_frame,
+        max_transient_keyframes=max_transient_keyframes,
+    )
+    if plan.current_grid is None:
+        return "current grid (latest_frame.frame[-1]):\n(empty frame)"
+
+    lines = [
+        "current grid (latest_frame.frame[-1]):",
+        pretty_print_grid(plan.current_grid.grid, plan.current_grid.label),
+    ]
+    if plan.animation_summary is None:
+        return "\n".join(lines)
+
+    lines.extend(["", plan.animation_summary])
+    if plan.transient_indices:
+        lines.append(
+            "SELECTED TRANSIENT KEYFRAMES: "
+            f"frame indices {plan.transient_indices}"
+        )
+        for rendered in plan.rendered_grids[1:]:
+            lines.append(pretty_print_grid(rendered.grid, rendered.label))
+    else:
+        lines.append("SELECTED TRANSIENT KEYFRAMES: none")
+
+    return "\n".join(lines)
 
 
 # Keys whose multi-line string values are lifted out of the JSON skeleton and
@@ -819,7 +967,7 @@ def build_subagent_prompt(
     parts.append(
         f"state={latest_frame.state.name} score={latest_frame.levels_completed}"
     )
-    parts.append(pretty_print_3d(latest_frame.frame))
+    parts.append(format_subagent_current_frame(latest_frame))
     parts.append("")
 
     parts.append(

@@ -408,6 +408,8 @@ class TestFormatSubagentOverview:
         assert "## SUBAGENTS (0 saved)" in out
         assert "No subagents saved yet" in out
         assert 'process_subagent(operation="add"' in out
+        assert "cannot commit ARC actions" not in out
+        assert "Include take_actions only for bounded action-capable subagents" in out
 
     def test_lists_id_name_handler_and_tools_only(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -420,6 +422,7 @@ class TestFormatSubagentOverview:
         )
         out = format_subagent_overview(store.all_entries())
         assert "[subagent_001] summarizer" in out
+        assert "Only subagents whose allowed_tools include take_actions" in out
         assert "(looping, process_memory, run_skill)" in out
         assert "Compact the trajectory" in out  # description IS shown
         assert "SECRET_INSTRUCTION_TEXT" not in out  # instructions never leak

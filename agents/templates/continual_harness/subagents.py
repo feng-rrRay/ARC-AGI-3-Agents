@@ -446,9 +446,14 @@ def format_subagent_overview(entries: list[SubagentEntry]) -> str:
             'handler_type="looping"|"one_step", max_turns=..., allowed_tools=[...]) to '
             "register a focused inner agent for a complex task. If allowed_tools is "
             "omitted, it defaults to an empty allowlist (reason-and-return only). Then "
-            "run_subagent(id, task) to invoke one. The inner loop cannot commit ARC actions."
+            "run_subagent(id, task) to invoke one. Include take_actions only for "
+            "bounded action-capable subagents."
         )
-    rows = [f"## SUBAGENTS ({len(entries)} saved)"]
+    rows = [
+        f"## SUBAGENTS ({len(entries)} saved)",
+        "Only subagents whose allowed_tools include take_actions may commit actions; "
+        "others analyze/use listed tools and return.",
+    ]
     for e in entries:
         tool_str = ", ".join(e.allowed_tools) if e.allowed_tools else "no tools"
         first_line = (

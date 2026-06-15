@@ -127,6 +127,7 @@ result = {"objects": {c: len(p) for c, p in objects.items()}, "changes": changes
 - For `add`: `name` (max 100 chars), `description` (max 500 chars), `system_instructions` (static system prompt, max 4000 chars), plus optional `directive` (default per-invocation task framing), `return_condition` (when to return), `handler_type` (`looping` default | `one_step`), `max_turns` (1-50, default 25), `allowed_tools`, `tags`
 - `handler_type`: `looping` runs a bounded action loop until `subagent_return` or `max_turns`; `one_step` runs a single analysis turn and auto-returns.
 - `allowed_tools`: subset of `process_memory`, `process_skill`, `run_skill`, `take_actions`. Defaults to `[]` (reason-and-return only) if omitted — the subagent already receives the compact recent-steps history in its prompt.
+- `take_actions` makes a subagent action-capable. Use it only for bounded exploration or repeated action routines; otherwise omit it so the subagent analyzes and returns.
 - For `edit`: `id` + any fields
 - For `delete`: `id`
 - For `search`: `query`
@@ -136,6 +137,7 @@ result = {"objects": {c: len(p) for c, p in objects.items()}, "changes": changes
 - **Required:** `reasoning` (string), `id` (subagent id)
 - **Optional:** `task` (natural-language directive for this invocation — falls back to the subagent's stored `directive` when omitted), `context` (object — injected into the subagent's prompt as JSON)
 - The subagent runs a bounded inner loop (up to its `max_turns`; `one_step` runs a single turn) using only its allowed tools, then calls `subagent_return(answer, status)` to terminate. Returns `{success, result, rounds_used, ...}`.
+- If it executes `take_actions`, the outer loop receives `actions_taken_inline` and re-observes before further planning.
 - Max 1 subagent invocation per step.
 
 ### Soft guideline

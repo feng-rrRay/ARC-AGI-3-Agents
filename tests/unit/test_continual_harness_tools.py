@@ -1113,6 +1113,105 @@ class TestSubagentHandlers:
         assert result["steps"][0]["subagent_return"]["answer"] == "summary"
         assert result["steps"][0]["tool_calls"] == []
 
+    def test_run_subagent_images_match_prompt_rendered_grids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return text only.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _CapturingSubVLM:
+            instances: list["_CapturingSubVLM"] = []
+
+            def __init__(self, *_: Any, **__: Any) -> None:
+                self.calls: list[tuple[Any, str]] = []
+                self.instances.append(self)
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                self.calls.append((payload, prompt))
+                return _response(
+                    SimpleNamespace(text="concise summary", function_call=None)
+                )
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _CapturingSubVLM)
+        agent._current_latest_frame = FrameData(
+            game_id="orch-test",
+            frame=[
+                [[0, 0], [0, 0]],
+                [[9, 0], [0, 0]],
+                [[9, 9], [0, 0]],
+                [[0, 0], [0, 0]],
+            ],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            win_levels=1,
+            action_input=ActionInput(),
+            available_actions=[1],
+        )
+        agent._current_images = []
+        agent._current_outer_round = 1
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        assert record.result["success"] is True
+        payload, prompt = _CapturingSubVLM.instances[0].calls[0]
+        assert isinstance(payload, list)
+        assert len(payload) == 3
+        assert [img.size for img in payload] == [(2, 2), (2, 2), (2, 2)]
+        assert "current grid (latest_frame.frame[-1]):" in prompt
+        assert "SELECTED TRANSIENT KEYFRAMES: frame indices [1, 2]" in prompt
+
+        trace_rows = [
+            json.loads(line)
+            for line in (tmp_path / "run.trace.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        image_rows = trace_rows[-1]["input"]["images"]
+        assert trace_rows[-1]["input"]["images_attached_count"] == 3
+        assert [row["label"] for row in image_rows] == [
+            "current_state_frame",
+            "current_frame_transient_1",
+            "current_frame_transient_2",
+        ]
+
     def test_one_step_subagent_auto_returns_text_response(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -53,7 +53,7 @@ HEADERS = {
     "Accept": "application/json",
 }
 PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
-DEFAULT_PROMPT_EVOLVE_FREQUENCY = 100
+DEFAULT_PROMPT_EVOLVE_FREQUENCY = 75
 
 
 def _parse_prompt_evolve_frequency(value: str | int) -> int:
@@ -215,7 +215,7 @@ def main() -> None:
         default=None,
         help=(
             "How many actions without score/level progress before the "
-            "stagnation prompt-evolution fallback can run. Default 100; "
+            "stagnation prompt-evolution fallback can run. Default 75; "
             f"also configurable via {PROMPT_EVOLVE_FREQUENCY_ENV}; "
             "0 disables all prompt evolution. Level-up and GAME_OVER still "
             "trigger evolution when enabled."

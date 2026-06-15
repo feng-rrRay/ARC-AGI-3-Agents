@@ -24,6 +24,7 @@ from typing import Any, Callable
 from arcengine import FrameData, GameState
 
 from ...run_artifacts import game_artifacts
+from ..utils.vlm_backend import VLM, usage_token_count
 from ._locks import lock_for_path
 from .context import format_tool_evidence_markdown
 from .helpers import frame_to_images
@@ -36,7 +37,6 @@ from .subagents import format_subagent_overview
 from .tools import SUBAGENT_TOOL_ENUM
 from .trace import serialize_response
 from .trajectory import format_full_history
-from ..utils.vlm_backend import VLM, usage_token_count
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +307,11 @@ recent trajectory and the current registry:
    `handler_type`/`max_turns` was wrong, or whose toolset was wrong.
 3. DELETE subagents that are unused or consistently fail.
 
+Tool policy: omitted or empty `allowed_tools` means reason-and-return only.
+Include `take_actions` only for bounded action-capable subagents that should run
+short experiments or a repeated action routine; their instructions must say to
+return after terminal states, level changes, or uncertain results.
+
 ## `allowed_tools` MUST be a subset of:
 __ALLOWED_TOOLS__
 
@@ -468,15 +473,6 @@ class HarnessEvolver:
     ``evolve`` which runs every enabled pass in one generation.
     """
 
-    # Stagnation-detection thresholds (migrated from the agent class body).
-    STAGNATION_WINDOW = 30
-    STAGNATION_MIN_WINDOW_RECORDS = 10
-    STAGNATION_MIN_ACTIONS_SINCE_EVOLUTION = 50
-    STAGNATION_NOOP_RATIO = 0.45
-    STAGNATION_REPEAT_ACTION_RATIO = 0.60
-    STAGNATION_MAX_CYCLE = 8
-    STAGNATION_MIN_CYCLE_REPEATS = 3
-
     def __init__(
         self,
         *,
@@ -506,7 +502,7 @@ class HarnessEvolver:
         # How long without progress before stagnation evolution may fire.
         # 0 disables ALL evolution. (env name unchanged for back-compat.)
         self.stagnation_after = max(
-            0, _int_env("CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY", 100)
+            0, _int_env("CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY", 75)
         )
         # Per-pass kill switches (default on) — a cost safety valve. The prompt
         # pass always runs when a trigger fires.
@@ -605,7 +601,7 @@ class HarnessEvolver:
         *,
         tool_evidence_records: list[ToolEvidenceRecord] | None = None,
     ) -> None:
-        """Evolve only when the recent trajectory shows concrete stuck behavior."""
+        """Evolve when score/level progress has stalled for the configured frequency."""
         if self.stagnation_after <= 0 or action_counter == 0:
             return
         if latest_frame.state in {
@@ -620,19 +616,13 @@ class HarnessEvolver:
             return
 
         evolution_gap = action_counter - max(self._last_evolution_step, 0)
-        if evolution_gap < self.STAGNATION_MIN_ACTIONS_SINCE_EVOLUTION:
-            return
-
-        pattern_evidence = self._stagnation_evidence(
-            self.trajectory.tail(self.STAGNATION_WINDOW)
-        )
-        if not pattern_evidence:
+        if evolution_gap < self.stagnation_after:
             return
 
         evidence = [
             f"{progress_gap} actions since last score/level progress",
-            f"{evolution_gap} actions since last prompt evolution",
-            *pattern_evidence,
+            f"{evolution_gap} actions since last harness evolution",
+            f"prompt-evolve frequency={self.stagnation_after}",
         ]
         logger.info("[%s] stagnation evolution: %s", self.agent_name, "; ".join(evidence))
         try:
@@ -696,7 +686,12 @@ class HarnessEvolver:
                 (
                     "skills",
                     lambda: self._evolve_skills(
-                        images, trajectory_text, trigger_ctx, tool_evidence_text
+                        images,
+                        trajectory_text,
+                        trigger_ctx,
+                        tool_evidence_text,
+                        action_counter=action_counter,
+                        gen=gen,
                     ),
                 )
             )
@@ -705,7 +700,12 @@ class HarnessEvolver:
                 (
                     "subagents",
                     lambda: self._evolve_subagents(
-                        images, trajectory_text, trigger_ctx, tool_evidence_text
+                        images,
+                        trajectory_text,
+                        trigger_ctx,
+                        tool_evidence_text,
+                        action_counter=action_counter,
+                        gen=gen,
                     ),
                 )
             )
@@ -714,7 +714,12 @@ class HarnessEvolver:
                 (
                     "memory",
                     lambda: self._evolve_memory(
-                        images, trajectory_text, trigger_ctx, tool_evidence_text
+                        images,
+                        trajectory_text,
+                        trigger_ctx,
+                        tool_evidence_text,
+                        action_counter=action_counter,
+                        gen=gen,
                     ),
                 )
             )
@@ -745,6 +750,67 @@ class HarnessEvolver:
         usage = vlm.extract_usage(response)
         usage_cost = self.record_usage(usage)
         return response, usage, usage_cost
+
+    @staticmethod
+    def _image_trace_rows(images: list[Any]) -> list[dict[str, Any]]:
+        return [
+            {"width": img.width, "height": img.height, "mode": img.mode}
+            for img in images
+        ]
+
+    def _write_component_evolution_trace(
+        self,
+        *,
+        pass_name: str,
+        system: str,
+        user: str,
+        images: list[Any],
+        output: dict[str, Any],
+        parsed_json: dict[str, Any] | None,
+        result: dict[str, Any] | None,
+        trigger_ctx: str,
+        usage: dict[str, Any] | None,
+        usage_cost: dict[str, Any] | None,
+        error: str | None,
+        action_counter: int | None = None,
+        gen: int | None = None,
+    ) -> None:
+        """Trace one JSON-driven component evolution pass in full.
+
+        The generation-level summary remains compact; these per-pass rows are the
+        audit trail for what the meta-call proposed and what was actually applied.
+        """
+        try:
+            self.trace.write(
+                {
+                    "agent": self.agent_name,
+                    "model": self.model_name,
+                    "game_id": self.game_id,
+                    "action_counter": action_counter,
+                    "round": 0,
+                    "tools_exposed": "evolution",
+                    "evolution": {
+                        "generation": gen,
+                        "pass": pass_name,
+                        "trigger_context": trigger_ctx,
+                        "parsed_json": parsed_json,
+                        "result": result,
+                    },
+                    "input": {
+                        "system_instruction": system,
+                        "user_prompt": user,
+                        "images": self._image_trace_rows(images),
+                    },
+                    "output": output,
+                    "usage": usage,
+                    "usage_cost": usage_cost,
+                    "error": error,
+                }
+            )
+        except Exception as exc:
+            logger.error(
+                "failed to write %s evolution trace: %s", pass_name, exc
+            )
 
     # ------------------------------------------------------------------
     # Pass 1 — base orchestrator policy (relocated _evolve_system_prompt)
@@ -834,6 +900,7 @@ class HarnessEvolver:
                     "tools_exposed": "evolution",
                     "evolution": {
                         "generation": gen,
+                        "pass": "prompt",
                         "trigger_context": trigger_ctx,
                         "accepted": accepted,
                         "validation_error": validation_error,
@@ -843,10 +910,7 @@ class HarnessEvolver:
                     "input": {
                         "system_instruction": evolution_system,
                         "user_prompt": user_prompt,
-                        "images": [
-                            {"width": img.width, "height": img.height, "mode": img.mode}
-                            for img in images
-                        ],
+                        "images": self._image_trace_rows(images),
                     },
                     "output": output,
                     "usage": usage,
@@ -882,6 +946,9 @@ class HarnessEvolver:
         trajectory_text: str,
         trigger_ctx: str,
         tool_evidence_text: str = "(none)",
+        *,
+        action_counter: int | None = None,
+        gen: int | None = None,
     ) -> dict[str, Any]:
         overview = format_skill_overview(self.skills.all_entries())
         user = _fill(
@@ -893,70 +960,99 @@ class HarnessEvolver:
             TRIGGER=trigger_ctx,
         )
         system = _fill(COMPONENT_EVOLUTION_SYSTEM, GAME=self.game_id)
-        response, _, _ = self._meta_query(system, user, images, "skills")
-        rec = self._parse_json_response(self._extract_text(response))
-        if rec is None:
-            return {"error": "failed_to_parse_response"}
+        usage: dict[str, Any] | None = None
+        usage_cost: dict[str, Any] | None = None
+        output: dict[str, Any] = {}
+        rec: dict[str, Any] | None = None
+        out: dict[str, Any] | None = None
+        error: str | None = None
 
-        out: dict[str, Any] = {
-            "added": [], "edited": [], "deleted": [],
-            "analysis": rec.get("analysis", ""),
-        }
+        try:
+            response, usage, usage_cost = self._meta_query(system, user, images, "skills")
+            output = serialize_response(response)
+            rec = self._parse_json_response(self._extract_text(response))
+            if rec is None:
+                out = {"error": "failed_to_parse_response"}
+                return out
 
-        for spec in rec.get("add", []) or []:
-            try:
-                code = (spec.get("code") or "").strip()
-                if code:
-                    bad = _validate_code(code)
-                    if bad:
-                        logger.info("evolved skill add rejected (sandbox policy): %s", bad)
-                        continue
-                entry = self.skills.add(
-                    name=spec.get("name", ""),
-                    description=spec.get("description", ""),
-                    code=code,
-                    tags=list(spec.get("tags") or []),
-                )
-                out["added"].append(entry.id)
-                logger.info("evolved skill added: %s (%s)", entry.id, entry.name)
-            except Exception as exc:
-                logger.error("evolved skill add failed (%s): %s", spec.get("name"), exc)
+            out = {
+                "added": [], "edited": [], "deleted": [],
+                "analysis": rec.get("analysis", ""),
+            }
 
-        for upd in rec.get("edit", []) or []:
-            key = upd.get("id")
-            if not key:
-                continue
-            target = self.skills.get_by_id_or_name(key)
-            if target is None:
-                continue
-            try:
-                code = upd.get("code")
-                if code:
-                    bad = _validate_code(code)
-                    if bad:
-                        logger.info("evolved skill edit rejected (sandbox policy): %s", bad)
-                        continue
-                edited = self.skills.edit(
-                    target.id,
-                    name=upd.get("name"),
-                    description=upd.get("description"),
-                    code=code,
-                    tags=list(upd["tags"]) if "tags" in upd else None,
-                )
-                if edited is not None:
-                    out["edited"].append(target.id)
-            except Exception as exc:
-                logger.error("evolved skill edit failed (%s): %s", key, exc)
+            for spec in rec.get("add", []) or []:
+                try:
+                    code = (spec.get("code") or "").strip()
+                    if code:
+                        bad = _validate_code(code)
+                        if bad:
+                            logger.info("evolved skill add rejected (sandbox policy): %s", bad)
+                            continue
+                    entry = self.skills.add(
+                        name=spec.get("name", ""),
+                        description=spec.get("description", ""),
+                        code=code,
+                        tags=list(spec.get("tags") or []),
+                    )
+                    out["added"].append(entry.id)
+                    logger.info("evolved skill added: %s (%s)", entry.id, entry.name)
+                except Exception as exc:
+                    logger.error("evolved skill add failed (%s): %s", spec.get("name"), exc)
 
-        for key in rec.get("delete", []) or []:
-            try:
+            for upd in rec.get("edit", []) or []:
+                key = upd.get("id")
+                if not key:
+                    continue
                 target = self.skills.get_by_id_or_name(key)
-                if target is not None and self.skills.delete(target.id):
-                    out["deleted"].append(target.id)
-            except Exception as exc:
-                logger.error("evolved skill delete failed (%s): %s", key, exc)
+                if target is None:
+                    continue
+                try:
+                    code = upd.get("code")
+                    if code:
+                        bad = _validate_code(code)
+                        if bad:
+                            logger.info("evolved skill edit rejected (sandbox policy): %s", bad)
+                            continue
+                    edited = self.skills.edit(
+                        target.id,
+                        name=upd.get("name"),
+                        description=upd.get("description"),
+                        code=code,
+                        tags=list(upd["tags"]) if "tags" in upd else None,
+                    )
+                    if edited is not None:
+                        out["edited"].append(target.id)
+                except Exception as exc:
+                    logger.error("evolved skill edit failed (%s): %s", key, exc)
 
-        return out
+            for key in rec.get("delete", []) or []:
+                try:
+                    target = self.skills.get_by_id_or_name(key)
+                    if target is not None and self.skills.delete(target.id):
+                        out["deleted"].append(target.id)
+                except Exception as exc:
+                    logger.error("evolved skill delete failed (%s): %s", key, exc)
+
+            return out
+        except Exception as exc:
+            error = repr(exc)
+            raise
+        finally:
+            self._write_component_evolution_trace(
+                pass_name="skills",
+                system=system,
+                user=user,
+                images=images,
+                output=output,
+                parsed_json=rec,
+                result=out,
+                trigger_ctx=trigger_ctx,
+                usage=usage,
+                usage_cost=usage_cost,
+                error=error,
+                action_counter=action_counter,
+                gen=gen,
+            )
 
     # ------------------------------------------------------------------
     # Pass 3 — subagents
@@ -968,6 +1064,9 @@ class HarnessEvolver:
         trajectory_text: str,
         trigger_ctx: str,
         tool_evidence_text: str = "(none)",
+        *,
+        action_counter: int | None = None,
+        gen: int | None = None,
     ) -> dict[str, Any]:
         overview = format_subagent_overview(self.subagents.all_entries())
         user = _fill(
@@ -979,79 +1078,110 @@ class HarnessEvolver:
             TRIGGER=trigger_ctx,
         )
         system = _fill(COMPONENT_EVOLUTION_SYSTEM, GAME=self.game_id)
-        response, _, _ = self._meta_query(system, user, images, "subagents")
-        rec = self._parse_json_response(self._extract_text(response))
-        if rec is None:
-            return {"error": "failed_to_parse_response"}
+        usage: dict[str, Any] | None = None
+        usage_cost: dict[str, Any] | None = None
+        output: dict[str, Any] = {}
+        rec: dict[str, Any] | None = None
+        out: dict[str, Any] | None = None
+        error: str | None = None
 
-        out: dict[str, Any] = {
-            "added": [], "edited": [], "deleted": [],
-            "analysis": rec.get("analysis", ""),
-        }
+        try:
+            response, usage, usage_cost = self._meta_query(
+                system, user, images, "subagents"
+            )
+            output = serialize_response(response)
+            rec = self._parse_json_response(self._extract_text(response))
+            if rec is None:
+                out = {"error": "failed_to_parse_response"}
+                return out
 
-        for spec in rec.get("add", []) or []:
-            try:
-                add_kwargs: dict[str, Any] = {
-                    "directive": spec.get("directive", ""),
-                    "return_condition": spec.get("return_condition", ""),
-                    "source": "evolved",
-                }
-                if spec.get("handler_type"):
-                    add_kwargs["handler_type"] = spec["handler_type"]
-                if spec.get("max_turns") is not None:
-                    add_kwargs["max_turns"] = spec["max_turns"]
-                entry = self.subagents.add(
-                    name=spec.get("name", ""),
-                    description=spec.get("description", ""),
-                    system_instructions=spec.get("system_instructions", ""),
-                    allowed_tools=list(spec.get("allowed_tools") or []),
-                    tags=list(spec.get("tags") or []),
-                    **add_kwargs,
-                )
-                out["added"].append(entry.id)
-                logger.info("evolved subagent added: %s (%s)", entry.id, entry.name)
-            except ValueError as exc:  # invalid allowed_tools / name / handler_type
-                logger.info("evolved subagent add rejected: %s", exc)
-            except Exception as exc:
-                logger.error("evolved subagent add failed (%s): %s", spec.get("name"), exc)
+            out = {
+                "added": [], "edited": [], "deleted": [],
+                "analysis": rec.get("analysis", ""),
+            }
 
-        for upd in rec.get("edit", []) or []:
-            sid = _canonical_subagent_id(upd.get("id"))
-            if not sid:
-                continue
-            try:
-                edited = self.subagents.edit(
-                    sid,
-                    name=upd.get("name"),
-                    description=upd.get("description"),
-                    system_instructions=upd.get("system_instructions"),
-                    directive=upd.get("directive"),
-                    return_condition=upd.get("return_condition"),
-                    handler_type=upd.get("handler_type"),
-                    max_turns=upd.get("max_turns"),
-                    allowed_tools=(
-                        list(upd["allowed_tools"]) if "allowed_tools" in upd else None
-                    ),
-                    tags=list(upd["tags"]) if "tags" in upd else None,
-                )
-                if edited is not None:
-                    out["edited"].append(edited.id)
-            except ValueError as exc:
-                logger.info("evolved subagent edit rejected: %s", exc)
-            except Exception as exc:
-                logger.error("evolved subagent edit failed (%s): %s", sid, exc)
+            for spec in rec.get("add", []) or []:
+                try:
+                    add_kwargs: dict[str, Any] = {
+                        "directive": spec.get("directive", ""),
+                        "return_condition": spec.get("return_condition", ""),
+                        "source": "evolved",
+                    }
+                    if spec.get("handler_type"):
+                        add_kwargs["handler_type"] = spec["handler_type"]
+                    if spec.get("max_turns") is not None:
+                        add_kwargs["max_turns"] = spec["max_turns"]
+                    entry = self.subagents.add(
+                        name=spec.get("name", ""),
+                        description=spec.get("description", ""),
+                        system_instructions=spec.get("system_instructions", ""),
+                        allowed_tools=list(spec.get("allowed_tools") or []),
+                        tags=list(spec.get("tags") or []),
+                        **add_kwargs,
+                    )
+                    out["added"].append(entry.id)
+                    logger.info("evolved subagent added: %s (%s)", entry.id, entry.name)
+                except ValueError as exc:  # invalid allowed_tools / name / handler_type
+                    logger.info("evolved subagent add rejected: %s", exc)
+                except Exception as exc:
+                    logger.error("evolved subagent add failed (%s): %s", spec.get("name"), exc)
 
-        for raw_sid in rec.get("delete", []) or []:
-            sid = _canonical_subagent_id(raw_sid)
-            if not sid:
-                continue
-            try:
-                if self.subagents.delete(sid):
-                    out["deleted"].append(sid)
-            except Exception as exc:
-                logger.error("evolved subagent delete failed (%s): %s", sid, exc)
+            for upd in rec.get("edit", []) or []:
+                sid = _canonical_subagent_id(upd.get("id"))
+                if not sid:
+                    continue
+                try:
+                    edited = self.subagents.edit(
+                        sid,
+                        name=upd.get("name"),
+                        description=upd.get("description"),
+                        system_instructions=upd.get("system_instructions"),
+                        directive=upd.get("directive"),
+                        return_condition=upd.get("return_condition"),
+                        handler_type=upd.get("handler_type"),
+                        max_turns=upd.get("max_turns"),
+                        allowed_tools=(
+                            list(upd["allowed_tools"]) if "allowed_tools" in upd else None
+                        ),
+                        tags=list(upd["tags"]) if "tags" in upd else None,
+                    )
+                    if edited is not None:
+                        out["edited"].append(edited.id)
+                except ValueError as exc:
+                    logger.info("evolved subagent edit rejected: %s", exc)
+                except Exception as exc:
+                    logger.error("evolved subagent edit failed (%s): %s", sid, exc)
 
-        return out
+            for raw_sid in rec.get("delete", []) or []:
+                sid = _canonical_subagent_id(raw_sid)
+                if not sid:
+                    continue
+                try:
+                    if self.subagents.delete(sid):
+                        out["deleted"].append(sid)
+                except Exception as exc:
+                    logger.error("evolved subagent delete failed (%s): %s", sid, exc)
+
+            return out
+        except Exception as exc:
+            error = repr(exc)
+            raise
+        finally:
+            self._write_component_evolution_trace(
+                pass_name="subagents",
+                system=system,
+                user=user,
+                images=images,
+                output=output,
+                parsed_json=rec,
+                result=out,
+                trigger_ctx=trigger_ctx,
+                usage=usage,
+                usage_cost=usage_cost,
+                error=error,
+                action_counter=action_counter,
+                gen=gen,
+            )
 
     # ------------------------------------------------------------------
     # Pass 4 — memory
@@ -1063,6 +1193,9 @@ class HarnessEvolver:
         trajectory_text: str,
         trigger_ctx: str,
         tool_evidence_text: str = "(none)",
+        *,
+        action_counter: int | None = None,
+        gen: int | None = None,
     ) -> dict[str, Any]:
         overview = format_memory_full(self.memory.all_entries())
         user = _fill(
@@ -1073,138 +1206,87 @@ class HarnessEvolver:
             TRIGGER=trigger_ctx,
         )
         system = _fill(COMPONENT_EVOLUTION_SYSTEM, GAME=self.game_id)
-        response, _, _ = self._meta_query(system, user, images, "memory")
-        rec = self._parse_json_response(self._extract_text(response))
-        if rec is None:
-            return {"error": "failed_to_parse_response"}
+        usage: dict[str, Any] | None = None
+        usage_cost: dict[str, Any] | None = None
+        output: dict[str, Any] = {}
+        rec: dict[str, Any] | None = None
+        out: dict[str, Any] | None = None
+        error: str | None = None
 
-        out: dict[str, Any] = {
-            "added": [], "edited": [], "deleted": [],
-            "analysis": rec.get("analysis", ""),
-        }
+        try:
+            response, usage, usage_cost = self._meta_query(system, user, images, "memory")
+            output = serialize_response(response)
+            rec = self._parse_json_response(self._extract_text(response))
+            if rec is None:
+                out = {"error": "failed_to_parse_response"}
+                return out
 
-        for spec in rec.get("add", []) or []:
-            try:
-                entry = self.memory.add(
-                    title=spec.get("title", ""),
-                    body=spec.get("body", ""),
-                    tags=list(spec.get("tags") or []),
-                    confidence=spec.get("confidence"),
-                )
-                out["added"].append(entry.id)
-                logger.info("evolved memory added: %s (%s)", entry.id, entry.title)
-            except ValueError as exc:  # invalid / missing confidence
-                logger.info("evolved memory add rejected: %s", exc)
-            except Exception as exc:
-                logger.error("evolved memory add failed: %s", exc)
+            out = {
+                "added": [], "edited": [], "deleted": [],
+                "analysis": rec.get("analysis", ""),
+            }
 
-        for upd in rec.get("edit", []) or []:
-            mid = upd.get("id")
-            if not mid:
-                continue
-            try:
-                edited = self.memory.edit(
-                    mid,
-                    title=upd.get("title"),
-                    body=upd.get("body"),
-                    tags=list(upd["tags"]) if "tags" in upd else None,
-                    confidence=upd.get("confidence"),
-                )
-                if edited is not None:
-                    out["edited"].append(mid)
-            except ValueError as exc:
-                logger.info("evolved memory edit rejected: %s", exc)
-            except Exception as exc:
-                logger.error("evolved memory edit failed (%s): %s", mid, exc)
+            for spec in rec.get("add", []) or []:
+                try:
+                    entry = self.memory.add(
+                        title=spec.get("title", ""),
+                        body=spec.get("body", ""),
+                        tags=list(spec.get("tags") or []),
+                        confidence=spec.get("confidence"),
+                    )
+                    out["added"].append(entry.id)
+                    logger.info("evolved memory added: %s (%s)", entry.id, entry.title)
+                except ValueError as exc:  # invalid / missing confidence
+                    logger.info("evolved memory add rejected: %s", exc)
+                except Exception as exc:
+                    logger.error("evolved memory add failed: %s", exc)
 
-        for mid in rec.get("delete", []) or []:
-            try:
-                if self.memory.delete(mid):
-                    out["deleted"].append(mid)
-            except Exception as exc:
-                logger.error("evolved memory delete failed (%s): %s", mid, exc)
+            for upd in rec.get("edit", []) or []:
+                mid = upd.get("id")
+                if not mid:
+                    continue
+                try:
+                    edited = self.memory.edit(
+                        mid,
+                        title=upd.get("title"),
+                        body=upd.get("body"),
+                        tags=list(upd["tags"]) if "tags" in upd else None,
+                        confidence=upd.get("confidence"),
+                    )
+                    if edited is not None:
+                        out["edited"].append(mid)
+                except ValueError as exc:
+                    logger.info("evolved memory edit rejected: %s", exc)
+                except Exception as exc:
+                    logger.error("evolved memory edit failed (%s): %s", mid, exc)
 
-        return out
+            for mid in rec.get("delete", []) or []:
+                try:
+                    if self.memory.delete(mid):
+                        out["deleted"].append(mid)
+                except Exception as exc:
+                    logger.error("evolved memory delete failed (%s): %s", mid, exc)
 
-    # ------------------------------------------------------------------
-    # Stagnation detection (migrated verbatim from the agent)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _trajectory_action_label(record: dict[str, Any]) -> str:
-        name = str(record.get("chosen_action") or "UNKNOWN")
-        data = record.get("chosen_action_data") or {}
-        if not isinstance(data, dict) or not data:
-            return name
-        if "x" in data and "y" in data and len(data) == 2:
-            return f"{name}({data['x']},{data['y']})"
-        args = ",".join(f"{k}={v}" for k, v in sorted(data.items()))
-        return f"{name}({args})"
-
-    @staticmethod
-    def _is_noop_or_invalid_record(record: dict[str, Any]) -> bool:
-        state_after = record.get("state_after")
-        if state_after == "INVALID":
-            return True
-
-        state_before = record.get("state")
-        resolved_after = state_after or state_before
-        score_delta = record.get("score_delta")
-        score_changed = isinstance(score_delta, int) and score_delta != 0
-        grid_changed = bool(record.get("grid_delta") or record.get("grid_change"))
-        return resolved_after == state_before and not score_changed and not grid_changed
-
-    def _repeated_cycle_evidence(self, labels: list[str]) -> str | None:
-        max_cycle = min(self.STAGNATION_MAX_CYCLE, len(labels) // 2)
-        for width in range(2, max_cycle + 1):
-            pattern = labels[-width:]
-            repeats = 1
-            cursor = len(labels) - width
-            while cursor - width >= 0 and labels[cursor - width : cursor] == pattern:
-                repeats += 1
-                cursor -= width
-            if repeats >= self.STAGNATION_MIN_CYCLE_REPEATS:
-                return (
-                    f"last {width * repeats} actions repeat a {width}-action cycle: "
-                    f"{', '.join(pattern)}"
-                )
-        return None
-
-    def _stagnation_evidence(self, records: list[dict[str, Any]]) -> list[str]:
-        actionable = [
-            record
-            for record in records
-            if isinstance(record, dict) and record.get("source") != "auto_reset"
-        ]
-        if len(actionable) < self.STAGNATION_MIN_WINDOW_RECORDS:
-            return []
-
-        evidence: list[str] = []
-        noops = sum(1 for record in actionable if self._is_noop_or_invalid_record(record))
-        noop_ratio = noops / len(actionable)
-        if noop_ratio >= self.STAGNATION_NOOP_RATIO:
-            evidence.append(
-                f"last {len(actionable)} actions include {noops} no-op/invalid "
-                f"results ({noop_ratio:.0%})"
+            return out
+        except Exception as exc:
+            error = repr(exc)
+            raise
+        finally:
+            self._write_component_evolution_trace(
+                pass_name="memory",
+                system=system,
+                user=user,
+                images=images,
+                output=output,
+                parsed_json=rec,
+                result=out,
+                trigger_ctx=trigger_ctx,
+                usage=usage,
+                usage_cost=usage_cost,
+                error=error,
+                action_counter=action_counter,
+                gen=gen,
             )
-
-        labels = [self._trajectory_action_label(record) for record in actionable]
-        counts: dict[str, int] = {}
-        for label in labels:
-            counts[label] = counts.get(label, 0) + 1
-        dominant_label, dominant_count = max(counts.items(), key=lambda item: item[1])
-        repeat_ratio = dominant_count / len(labels)
-        if repeat_ratio >= self.STAGNATION_REPEAT_ACTION_RATIO:
-            evidence.append(
-                f"action {dominant_label} appears {dominant_count}/"
-                f"{len(labels)} times ({repeat_ratio:.0%})"
-            )
-
-        cycle = self._repeated_cycle_evidence(labels)
-        if cycle:
-            evidence.append(cycle)
-
-        return evidence
 
     # ------------------------------------------------------------------
     # Helpers (migrated / new)

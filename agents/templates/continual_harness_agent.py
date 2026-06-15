@@ -19,7 +19,9 @@ from .continual_harness.context import (
     build_working_prompt,
     current_state_rendered_grid,
     format_tool_record_md,
+    subagent_current_frame_rendered_grids,
 )
+from .continual_harness.harness_evolver import HarnessEvolver
 from .continual_harness.helpers import (
     available_game_actions,
     frame_to_hex,
@@ -39,7 +41,6 @@ from .continual_harness.models import (
     ToolCallRecord,
     ToolEvidenceRecord,
 )
-from .continual_harness.harness_evolver import HarnessEvolver
 from .continual_harness.prompts import (
     BASE_ORCHESTRATOR_POLICY,
     HARNESS_SYSTEM_INSTRUCTION,
@@ -255,7 +256,7 @@ class ContinualHarness(Agent):
          `take_actions(actions=[...])` call. All are dispatched in emission
          order. take_actions executes its action list synchronously.
       3. If the action result advances a level, evolve immediately. Otherwise,
-         evolve only when recent trajectory evidence shows stagnation.
+         evolve after the configured frequency with no score/level progress.
       4. If any actions were executed (orchestrator OR via a skill's inline
          tools.take_actions RPC), clear the carried tool-result block.
          Otherwise carry results forward to the next iteration's prompt
@@ -601,10 +602,9 @@ class ContinualHarness(Agent):
             active_subagent_path(self.game_id), game_id=self.game_id
         )
 
-        # Per-iteration state used by _handle_run_subagent. Set at the top of
-        # every _vlm_loop_inner call so any subagent invocation in that
-        # iteration sees the live frame, images, and VLM-call counter, and
-        # shares a single per-iteration call counter.
+        # Per-iteration state used by _handle_run_subagent and skills. Set at
+        # the top of every _vlm_loop_inner call so tool handlers see the live
+        # frame, full frame images for sandbox state, and VLM-call counter.
         self._current_latest_frame: FrameData | None = None
         self._current_images: list[Any] = []
         self._current_outer_round: int = 0
@@ -808,7 +808,10 @@ class ContinualHarness(Agent):
                 compact_history=history,
             )
             working_prompt = base_prompt
-            images = self._current_images
+            rendered_grids = subagent_current_frame_rendered_grids(
+                self._current_latest_frame
+            )
+            images = [grid_to_image(item.grid) for item in rendered_grids]
             payload: Any = (
                 images if len(images) > 1 else (images[0] if images else None)
             )
@@ -930,12 +933,15 @@ class ContinualHarness(Agent):
                                 "tools": tools,
                                 "images": [
                                     {
-                                        "width": img.width,
-                                        "height": img.height,
-                                        "mode": img.mode,
+                                        "label": item.label,
+                                        "width": len(item.grid[0])
+                                        if item.grid
+                                        else 0,
+                                        "height": len(item.grid),
                                     }
-                                    for img in images
+                                    for item in rendered_grids
                                 ],
+                                "images_attached_count": len(rendered_grids),
                             },
                             "output": output,
                             "usage": usage,
@@ -992,7 +998,8 @@ class ContinualHarness(Agent):
                     latest = self.frames[-1]
                     self._current_latest_frame = latest
                     self._current_images = list(frame_to_images(latest))
-                    images = self._current_images
+                    rendered_grids = subagent_current_frame_rendered_grids(latest)
+                    images = [grid_to_image(item.grid) for item in rendered_grids]
                     payload = (
                         images
                         if len(images) > 1
@@ -1278,9 +1285,10 @@ class ContinualHarness(Agent):
             self._vlm_loop_inner(latest_frame)
 
             # Level-up evolution: consolidate discovered rules immediately
-            # after advancing to a new level. Otherwise, evolve only when the
-            # recent trajectory shows concrete stuck behavior. Progress tracking
-            # stays on the agent (also set inline in dispatch on score gains).
+            # after advancing to a new level. Otherwise, evolve after the
+            # configured frequency with no score/level progress. Progress
+            # tracking stays on the agent (also set inline in dispatch on
+            # score gains).
             post_frame = self.frames[-1]
             if post_frame.levels_completed > pre_step_level:
                 self._last_progress_step = self.action_counter
