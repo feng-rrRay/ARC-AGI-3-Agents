@@ -18,6 +18,18 @@ class ToolCallRecord:
 
 
 @dataclass(slots=True)
+class ToolEvidenceRecord:
+    """One tool result stamped with the action-counter window where it occurred."""
+
+    conversation_id: int
+    conversation_turn: int
+    round: int
+    action_counter_before: int
+    action_counter_after: int
+    tool_call: ToolCallRecord
+
+
+@dataclass(slots=True)
 class PendingActionObservation:
     """One action result awaiting display in the next working prompt."""
 
@@ -70,3 +82,8 @@ class StepRecord:
     score_delta: int | None = None
     state_after: str | None = None
     grid_delta: list[list[int]] | None = None
+    # Per-transition grid change summary, frozen at creation:
+    # [[from_color, to_color, count, r0, r1, c0, c1], ...] (uncapped, grouped by
+    # transition). Rendered by render_recent_history; immutable so old rows stay
+    # byte-identical across calls (KV-cache stable).
+    grid_change: list[list[int]] | None = None

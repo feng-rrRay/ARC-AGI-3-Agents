@@ -7,20 +7,26 @@ from typing import Any, Iterable, Sequence
 from arcengine import FrameData, GameAction
 
 from .action_descriptions import ACTION_DESCRIPTIONS
-from .helpers import available_game_actions
-from .models import PendingActionObservation, RenderedGrid, ToolCallRecord
-
+from .helpers import available_game_actions, color_to_hex, grid_to_hex_lines
+from .models import (
+    PendingActionObservation,
+    RenderedGrid,
+    ToolCallRecord,
+    ToolEvidenceRecord,
+)
 
 CURRENT_STATE_GRID_LABEL = "current_state_frame"
 MAX_OBSERVATION_TEXT_GRIDS = 4
+MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS = 3
 
 
 def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
-    """Render a 3D grid stack as integer lists, one row per line.
+    """Render a 3D grid stack as hex maps, one dense hex string per row.
 
-    Output format matches ``state.latest_frame.frame`` exactly — each row is
-    a Python-style list of ints — so the model sees the same representation
-    in the prompt and in skill code.
+    Output matches ``state.latest_frame.frame`` exactly: each cell is a single
+    hex digit ``0-f`` (= color int 0-15), and each row is one hex string — so the
+    model sees the same representation in the prompt and in skill code. Recover
+    the int with ``int(ch, 16)``.
     """
     lines: list[str] = []
     for i, block in enumerate(array_3d):
@@ -30,9 +36,8 @@ def pretty_print_3d(array_3d: list[list[list[Any]]]) -> str:
             continue
         height = len(block)
         width = max((len(row) for row in block), default=0)
-        lines.append(f"Grid {i} ({height}x{width}):")
-        for row in block:
-            lines.append("  " + str(list(row)))
+        lines.append(f"Grid {i} ({height}x{width}) [hex 0-f = color 0-15]:")
+        lines.extend(grid_to_hex_lines(block))
         lines.append("")
     return "\n".join(lines)
 
@@ -45,13 +50,16 @@ def _normalise_grid(grid: Sequence[Sequence[Any]]) -> list[list[int]]:
 
 
 def pretty_print_grid(grid: Sequence[Sequence[Any]], label: str) -> str:
-    """Render one 2D grid with a stable label."""
+    """Render one 2D grid as a hex map (one dense hex string per row).
+
+    Each cell is a single hex digit ``0-f`` = color int 0-15; this matches the
+    sandbox `state` view exactly. Recover the int with ``int(ch, 16)``.
+    """
     rows = _normalise_grid(grid)
     height = len(rows)
     width = max((len(row) for row in rows), default=0)
-    lines = [f"Grid {label} ({height}x{width}):"]
-    for row in rows:
-        lines.append("  " + str(list(row)))
+    lines = [f"Grid {label} ({height}x{width}) [hex 0-f = color 0-15]:"]
+    lines.extend(grid_to_hex_lines(rows))
     return "\n".join(lines)
 
 
@@ -87,6 +95,14 @@ class _ObservationRenderPlan:
     observation: PendingActionObservation
     lines: list[str]
     candidates: list[_ObservationGridCandidate]
+
+
+@dataclass(slots=True)
+class _SubagentFrameRenderPlan:
+    current_grid: RenderedGrid | None
+    animation_summary: str | None
+    transient_indices: list[int]
+    rendered_grids: list[RenderedGrid]
 
 
 def _frame_state_name(frame: FrameData | None) -> str:
@@ -296,7 +312,7 @@ def _animation_summary(
         colors: set[int] = set()
         for i in changed_indices:
             colors.update(diff_to_pre[i].colors or set())
-        colors_text = "[" + ",".join(str(c) for c in sorted(colors)) + "]"
+        colors_text = "[" + ",".join(color_to_hex(c) for c in sorted(colors)) + "]"
         changed_text = (
             f"{_format_index_ranges(changed_indices)} "
             f"({len(changed_indices)}/{len(grids)})"
@@ -310,14 +326,14 @@ def _animation_summary(
             f"max_motion={diff_to_prev[max_motion].count} cells "
             f"at grid {max_motion}; "
             f"bbox={_format_bbox(bbox)}; "
-            f"colors_seen={colors_text}"
+            f"colors_seen(hex)={colors_text}"
         )
     else:
         summary = (
             "ANIMATION SUMMARY: "
             f"frame_count={len(grids)}; changed_frames=none; "
             "peak_change=0 cells; max_motion=0 cells; "
-            "bbox=none; colors_seen=[]"
+            "bbox=none; colors_seen(hex)=[]"
         )
 
     return (
@@ -474,22 +490,332 @@ def build_observation_section(
     return "\n".join(lines), rendered_grids
 
 
+def _current_frame_animation_summary(
+    grids: Sequence[list[list[int]]],
+    final_grid: list[list[int]],
+) -> tuple[str, list[int], list[_DiffStats], list[_DiffStats]]:
+    diff_to_final = [_grid_diff_stats(final_grid, grid) for grid in grids]
+    diff_to_prev = [_DiffStats(count=0, bbox=None, colors=set())]
+    for i in range(1, len(grids)):
+        diff_to_prev.append(_grid_diff_stats(grids[i - 1], grids[i]))
 
-
-def _render_tool_results(records: Iterable[ToolCallRecord]) -> str:
-    payload = [
-        {
-            "name": r.name,
-            "args": r.args,
-            "result": r.result,
-            "error": r.error,
-            "actions_taken_inline": r.actions_taken_inline,
-        }
-        for r in records
+    final_index = len(grids) - 1
+    transient_indices = [
+        i for i, stats in enumerate(diff_to_final[:final_index]) if stats.count > 0
     ]
-    if not payload:
+    if transient_indices:
+        peak = max(
+            transient_indices,
+            key=lambda i: (diff_to_final[i].count, -i),
+        )
+        motion_indices = [i for i in range(1, len(diff_to_prev))]
+        max_motion = (
+            max(motion_indices, key=lambda i: (diff_to_prev[i].count, -i))
+            if motion_indices
+            else 0
+        )
+        bbox = _merge_bbox(diff_to_final[i].bbox for i in transient_indices)
+        colors: set[int] = set()
+        for i in transient_indices:
+            colors.update(diff_to_final[i].colors or set())
+        colors_text = "[" + ",".join(color_to_hex(c) for c in sorted(colors)) + "]"
+        transient_text = (
+            f"{_format_index_ranges(transient_indices)} "
+            f"({len(transient_indices)}/{len(grids)})"
+        )
+        summary = (
+            "ANIMATION SUMMARY: "
+            f"frame_count={len(grids)}; "
+            f"current_grid={final_index}; "
+            f"transient_frames={transient_text}; "
+            f"peak_difference={diff_to_final[peak].count} cells "
+            f"at grid {peak}; "
+            f"max_motion={diff_to_prev[max_motion].count} cells "
+            f"at grid {max_motion}; "
+            f"bbox={_format_bbox(bbox)}; "
+            f"colors_seen(hex)={colors_text}"
+        )
+    else:
+        summary = (
+            "ANIMATION SUMMARY: "
+            f"frame_count={len(grids)}; "
+            f"current_grid={final_index}; "
+            "transient_frames=none; "
+            "peak_difference=0 cells; max_motion=0 cells; "
+            "bbox=none; colors_seen(hex)=[]"
+        )
+
+    return summary, transient_indices, diff_to_final, diff_to_prev
+
+
+def _build_subagent_frame_render_plan(
+    latest_frame: FrameData,
+    *,
+    max_transient_keyframes: int = MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS,
+) -> _SubagentFrameRenderPlan:
+    current_grid = current_state_rendered_grid(latest_frame)
+    if current_grid is None:
+        return _SubagentFrameRenderPlan(None, None, [], [])
+
+    rendered_grids = [current_grid]
+    grids = [_normalise_grid(grid) for grid in latest_frame.frame]
+    if len(grids) <= 1:
+        return _SubagentFrameRenderPlan(current_grid, None, [], rendered_grids)
+
+    summary, transient_indices, diff_to_final, diff_to_prev = (
+        _current_frame_animation_summary(grids, current_grid.grid)
+    )
+    selected: list[int] = []
+    if transient_indices:
+        selected = _select_transient_keyframes(
+            diff_to_final,
+            diff_to_prev,
+            transient_indices,
+            limit=max_transient_keyframes,
+        )
+        for frame_index in selected:
+            label = f"current_frame_transient_{frame_index}"
+            rendered_grids.append(RenderedGrid(label=label, grid=grids[frame_index]))
+
+    return _SubagentFrameRenderPlan(
+        current_grid,
+        summary,
+        selected,
+        rendered_grids,
+    )
+
+
+def subagent_current_frame_rendered_grids(
+    latest_frame: FrameData,
+    *,
+    max_transient_keyframes: int = MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS,
+) -> list[RenderedGrid]:
+    """Return the exact grids whose PNGs should accompany a subagent prompt."""
+    plan = _build_subagent_frame_render_plan(
+        latest_frame,
+        max_transient_keyframes=max_transient_keyframes,
+    )
+    return plan.rendered_grids
+
+
+def format_subagent_current_frame(
+    latest_frame: FrameData,
+    *,
+    max_transient_keyframes: int = MAX_SUBAGENT_TRANSIENT_TEXT_GRIDS,
+) -> str:
+    """Render the subagent current frame using the orchestrator frame contract."""
+    plan = _build_subagent_frame_render_plan(
+        latest_frame,
+        max_transient_keyframes=max_transient_keyframes,
+    )
+    if plan.current_grid is None:
+        return "current grid (latest_frame.frame[-1]):\n(empty frame)"
+
+    lines = [
+        "current grid (latest_frame.frame[-1]):",
+        pretty_print_grid(plan.current_grid.grid, plan.current_grid.label),
+    ]
+    if plan.animation_summary is None:
+        return "\n".join(lines)
+
+    lines.extend(["", plan.animation_summary])
+    if plan.transient_indices:
+        lines.append(
+            "SELECTED TRANSIENT KEYFRAMES: "
+            f"frame indices {plan.transient_indices}"
+        )
+        for rendered in plan.rendered_grids[1:]:
+            lines.append(pretty_print_grid(rendered.grid, rendered.label))
+    else:
+        lines.append("SELECTED TRANSIENT KEYFRAMES: none")
+
+    return "\n".join(lines)
+
+
+# Keys whose multi-line string values are lifted out of the JSON skeleton and
+# rendered as fenced blocks so the model reads them print-style, not escaped.
+_CODE_KEYS = {"code"}
+_TEXT_KEYS = {"stdout", "stderr", "instructions", "body", "description", "error"}
+
+
+def _fence(text: str, lang: str = "") -> str:
+    return f"```{lang}\n{text}\n```"
+
+
+def _lift_long_text(
+    value: Any, blocks: list[tuple[str, str, str]], key: str | None = None
+) -> Any:
+    """Recursively pull multi-line code/text string values out of ``value`` into
+    ``blocks`` (label, lang, text), replacing each in the returned JSON skeleton
+    with a short pointer. Keeps code (e.g. a skill's source) print-style in a
+    ```python fence instead of a ``\\n``-escaped JSON string."""
+    if isinstance(value, dict):
+        return {k: _lift_long_text(v, blocks, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_lift_long_text(v, blocks, key) for v in value]
+    if (
+        isinstance(value, str)
+        and key in (_CODE_KEYS | _TEXT_KEYS)
+        and ("\n" in value or len(value) > 80)
+    ):
+        lang = "python" if key in _CODE_KEYS else ""
+        label = f"{key} [{len(blocks) + 1}]"
+        blocks.append((label, lang, value))
+        return f"<{label} — printed below>"
+    return value
+
+
+def format_tool_record_md(r: ToolCallRecord) -> str:
+    """Render one tool-call record as a labelled markdown block: the JSON fields
+    plus any code/text lifted into fenced blocks. For run_skill the skill's source
+    is included in the result and surfaces as a ```python section."""
+    blocks: list[tuple[str, str, str]] = []
+    args_skel = _lift_long_text(r.args, blocks)
+    result_skel = _lift_long_text(r.result, blocks) if r.result is not None else None
+
+    lines = [
+        "### TOOL RESULT",
+        f"name: {r.name}",
+        f"args: {json.dumps(args_skel, default=str)}",
+        "",
+        "result:",
+        _fence(json.dumps(result_skel, default=str, indent=2), "json")
+        if result_skel is not None
+        else "(none)",
+        "",
+        "error:",
+        str(r.error) if r.error else "(none)",
+        "",
+        "actions_taken_inline:",
+        str(r.actions_taken_inline),
+    ]
+    for label, lang, text in blocks:
+        lines += ["", f"{label}:", _fence(text, lang)]
+    return "\n".join(lines)
+
+
+# How many of the newest carried-over tool results render as full blocks;
+# everything older collapses to a one-line recap entry.
+TOOL_RESULTS_FULL_LAST_N = 2
+
+
+def _tool_call_brief(r: ToolCallRecord) -> str:
+    """One-line ``name(args)`` summary with the reasoning argument dropped."""
+    args = {k: v for k, v in (r.args or {}).items() if k != "reasoning"}
+    text = json.dumps(args, default=str)
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return f"{r.name}({text})"
+
+
+def _tool_outcome_brief(r: ToolCallRecord) -> str:
+    """Compact outcome: ok/failed/error tag + the start of the main output."""
+    if r.error:
+        tag, text = "error", str(r.error)
+    elif isinstance(r.result, dict):
+        tag = "ok" if r.result.get("success", True) else "failed"
+        text = (
+            r.result.get("stdout")
+            or r.result.get("error")
+            or r.result.get("message")
+            or json.dumps(r.result, default=str)
+        )
+    else:
+        tag, text = "ok", json.dumps(r.result, default=str)
+    text = " ".join(str(text).split())
+    if len(text) > 160:
+        text = f"{text[:160]}... [+{len(text) - 160} chars]"
+    return f"{tag}: {text}"
+
+
+def _tool_dedup_key(r: ToolCallRecord) -> str:
+    args = {k: v for k, v in (r.args or {}).items() if k != "reasoning"}
+    return json.dumps([r.name, args, r.result, r.error], default=str, sort_keys=True)
+
+
+def format_tool_results_markdown(
+    records: Sequence[ToolCallRecord],
+    *,
+    full_last_n: int = TOOL_RESULTS_FULL_LAST_N,
+) -> str:
+    """Render carried-over tool results from the previous turn's deliberation.
+
+    The newest ``full_last_n`` records render as full blocks; older ones
+    collapse to a one-line recap each. A call whose output is identical to an
+    earlier call's collapses to a pointer, so the model sees that re-running
+    it returned nothing new.
+    """
+    if not records:
         return "(none)"
-    return json.dumps(payload, default=str, indent=2)
+    if full_last_n <= 0 or len(records) <= full_last_n:
+        return "\n\n".join(format_tool_record_md(r) for r in records)
+
+    cut = len(records) - full_last_n
+    recap: list[str] = [
+        f"{len(records)} tool calls ran during the previous turn's deliberation. "
+        f"Recap below (oldest first); the last {full_last_n} results are printed "
+        "in full. Do NOT re-run a recapped call to re-read its output — the full "
+        "output was already shown when it ran."
+    ]
+    first_seen: dict[str, int] = {}
+    for i, r in enumerate(records):
+        first = first_seen.setdefault(_tool_dedup_key(r), i)
+        if i >= cut:
+            continue
+        brief = _tool_call_brief(r)
+        if first != i:
+            recap.append(
+                f"- {i + 1}. {brief} -> identical output to call {first + 1} "
+                "(re-running returned nothing new)"
+            )
+        else:
+            recap.append(f"- {i + 1}. {brief} -> {_tool_outcome_brief(r)}")
+    full_blocks = [format_tool_record_md(r) for r in records[cut:]]
+    return "\n".join(recap) + "\n\n" + "\n\n".join(full_blocks)
+
+
+def _compact_json(value: Any, *, max_chars: int) -> str:
+    text = json.dumps(value, default=str, sort_keys=True)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars - 24]}... [+{len(text) - max_chars + 24} chars]"
+
+
+def format_tool_evidence_markdown(
+    records: Sequence[ToolEvidenceRecord],
+    *,
+    max_chars: int = 20000,
+    value_chars: int = 1200,
+) -> str:
+    """Render tool results for harness evolution, grouped by conversation turn."""
+    if not records:
+        return "(none)"
+
+    blocks: list[str] = []
+    for item in records:
+        r = item.tool_call
+        lines = [
+            (
+                f"[conv {item.conversation_id}.t{item.conversation_turn} | "
+                f"before step {item.action_counter_before} | "
+                f"after step {item.action_counter_after} | round {item.round}]"
+            ),
+            f"tool: {r.name}",
+            f"args: {_compact_json(r.args or {}, max_chars=value_chars)}",
+        ]
+        if r.result is not None:
+            lines.append(f"result: {_compact_json(r.result, max_chars=value_chars)}")
+        if r.error:
+            lines.append(f"error: {r.error}")
+        if r.actions_taken_inline:
+            lines.append(f"actions_taken_inline: {r.actions_taken_inline}")
+        blocks.append("\n".join(lines))
+
+    while blocks and len("\n\n".join(blocks)) > max_chars:
+        blocks.pop(0)
+    if not blocks:
+        return "(tool evidence omitted: all records exceeded max_chars)"
+    return "\n\n".join(blocks)
 
 
 def _format_available_actions(actions: Sequence[GameAction]) -> str:
@@ -522,6 +848,8 @@ def build_working_prompt(
     subagent_overview: str,
     observation_block: str = "",
     base_prompt: str = "",
+    previous_no_action_reason: str | None = None,
+    max_deliberation_turns: int | None = None,
 ) -> str:
     """Assemble the per-VLM-call working prompt."""
     available = available_game_actions(latest_frame.available_actions)
@@ -531,30 +859,41 @@ def build_working_prompt(
         if current_grid is not None
         else "(empty frame)"
     )
-
     sections: list[str] = []
+
+    # Orchestrator policy
     if base_prompt.strip():
         sections.append(base_prompt.strip())
-    sections.append(f"# Step: {action_counter}")
-    sections.append(
-        "## RECENT HISTORY (batch-grouped; call get_recent_trajectory for older detail)\n"
-        + (history_block or "No previous actions recorded.")
-    )
-    sections.append(
-        "## TOOL RESULTS FROM PREVIOUS STEP\n"
-        + _render_tool_results(recent_tool_results)
-    )
+    
+    # persistent components
+    if subagent_overview.strip():
+        sections.append(subagent_overview.rstrip())
     if memory_overview.strip():
         sections.append(memory_overview.rstrip())
     if skill_overview.strip():
         sections.append(skill_overview.rstrip())
-    if subagent_overview.strip():
-        sections.append(subagent_overview.rstrip())
-    if observation_block.strip():
-        sections.append(
-            "## OBSERVATIONS SINCE LAST QUERY\n" + observation_block.rstrip()
-        )
 
+    # Append-only history sits in the cache-stable region: all lines but the
+    # newest are byte-identical across calls, so placing it above the volatile
+    # per-step blocks lets the prompt prefix (system + base + overviews +
+    # history) be served from the model's KV cache.
+    sections.append(
+        "## RECENT HISTORY\n" + (history_block or "No previous actions recorded.")
+    )
+
+    # Volatile per-step tail — re-rendered every call, never cached.
+    sections.append(f"# Step: {action_counter}")
+    if observation_block.strip():
+        sections.append("## OBSERVATIONS SINCE LAST QUERY\n" + observation_block.rstrip())
+    sections.append(
+        "## TOOL RESULTS FROM PREVIOUS TURN\n"
+        + format_tool_results_markdown(recent_tool_results)
+    )
+    if previous_no_action_reason:
+        sections.append(
+            "## PREVIOUS CONVERSATION STOPPED WITHOUT ACTION\n"
+            f"Reason: {previous_no_action_reason.strip()}"
+        )
     state_block = (
         "## CURRENT STATE\n"
         f"state: {latest_frame.state.name}\n"
@@ -564,34 +903,49 @@ def build_working_prompt(
     )
     sections.append(state_block)
 
+    budget_line = (
+        f"You have at most {max_deliberation_turns} non-action turns to decide the next action(s). "
+        if max_deliberation_turns
+        else ""
+    )
     sections.append(
         "## TURN\n"
-        "Decide your next move. Keep responses to at most 2 tool calls, "
-        "and predict each action's effect before committing."
+        "This is a running conversation about the frame above. The frame stays fixed until you act. "
+        + budget_line
+        + "Balance analysis with action: reason only as much as needed to predict "
+        "the next useful move, then use take_actions or run action emitting skills. Do not repeat tools whose output is already in this conversation or recap; save conclusions to memory instead. Progress includes advancing the game and disproving a hypothesis; each action gives a fresh observation."
     )
     return "\n\n".join(sections)
 
 
 def build_subagent_prompt(
     *,
-    task: str,
+    directive: str,
     context: dict[str, Any] | None,
     latest_frame: FrameData,
     memory_overview: str,
     skill_overview: str,
     compact_history: str,
+    return_condition: str = "",
 ) -> str:
     """Assemble the user-prompt half of a subagent invocation.
 
-    The subagent's `instructions` are passed as system_instruction by the
+    The subagent's `system_instructions` are passed as system_instruction by the
     orchestrator; this function only builds the per-call user prompt. The
-    termination cue at the bottom mirrors how the orchestrator's USER_PROMPT
-    ends with `# TURN:` — keeping the action cue last (here, subagent_return).
+    `directive` is the effective per-invocation task (run_subagent.task or the
+    subagent's stored directive). The termination cue at the bottom mirrors how
+    the orchestrator's USER_PROMPT ends with `# TURN:` — keeping the action cue
+    last (here, subagent_return).
     """
     parts: list[str] = []
-    parts.append("## TASK")
-    parts.append((task or "").strip() or "(no task supplied)")
+    parts.append("## DIRECTIVE")
+    parts.append((directive or "").strip() or "(no directive supplied)")
     parts.append("")
+
+    if (return_condition or "").strip():
+        parts.append("## RETURN CONDITION")
+        parts.append(return_condition.strip())
+        parts.append("")
 
     parts.append("## CONTEXT")
     if context:
@@ -613,7 +967,7 @@ def build_subagent_prompt(
     parts.append(
         f"state={latest_frame.state.name} score={latest_frame.levels_completed}"
     )
-    parts.append(pretty_print_3d(latest_frame.frame))
+    parts.append(format_subagent_current_frame(latest_frame))
     parts.append("")
 
     parts.append(

@@ -13,7 +13,7 @@ from agents.templates.continual_harness.trajectory import (
     TrajectoryStore,
     _frame_delta,
     default_trajectory_path,
-    format_compact_history,
+    # format_compact_history,  # commented out — superseded by render_recent_history
     format_full_history,
 )
 
@@ -103,122 +103,124 @@ class TestTrajectoryStore:
         assert first["game_id"] == "traj-test"
 
 
-@pytest.mark.unit
-class TestFormatCompactHistory:
-    def test_empty_records_returns_sentinel(self) -> None:
-        assert format_compact_history([]) == "No previous actions recorded."
+# --- COMMENTED OUT: TestFormatCompactHistory (tests removed format_compact_history) ---
+# @pytest.mark.unit
+# class TestFormatCompactHistory:
+#     def test_empty_records_returns_sentinel(self) -> None:
+#         assert format_compact_history([]) == "No previous actions recorded."
+#
+#     def test_one_line_per_step(self) -> None:
+#         records = [_rec(i, f"ACTION{i}", reasoning=f"step {i}") for i in (1, 2, 3)]
+#         out = format_compact_history(records)
+#         lines = out.splitlines()
+#         assert len(lines) == 3
+#         # No multi-line nesting (no "why:" or "tool:" line headers like format_full_history).
+#         assert all("why:" not in line for line in lines)
+#         assert all("tool:" not in line for line in lines)
+#         assert "[1] ACTION1" in lines[0]
+#         assert "[3] ACTION3" in lines[2]
+#
+#     def test_reasoning_is_omitted_from_compact_history(self) -> None:
+#         rec = _rec(7, "ACTION3", reasoning="trying to push north into the gate")
+#         out = format_compact_history([rec])
+#         assert "trying to push north into the gate" not in out
+#         assert '"' not in out
+#
+#     def test_reasoning_chars_argument_does_not_readd_reasoning(self) -> None:
+#         long_reason = "x" * 500
+#         out = format_compact_history(
+#             [_rec(1, "ACTION1", reasoning=long_reason)], reasoning_chars=50
+#         )
+#         assert long_reason not in out
+#         assert "…" not in out
+#         assert '"' not in out
+#
+#     def test_truncates_oldest_when_over_max_chars(self) -> None:
+#         records = [
+#             _rec(i, "ACTION6", chosen_action_data={"x": 12, "y": 34}) for i in range(30)
+#         ]
+#         out = format_compact_history(records, max_chars=400)
+#         assert len(out) <= 400
+#         # Newest step (29) survives; oldest steps were dropped.
+#         assert "[29]" in out
+#         assert "[0]" not in out
+#
+#     def test_includes_action_data_inline(self) -> None:
+#         out = format_compact_history(
+#             [_rec(5, "ACTION6", chosen_action_data={"x": 12, "y": 34})]
+#         )
+#         # New format is "ACTION6{x:12,y:34}", not "data={'x': 12, 'y': 34}".
+#         assert "ACTION6{x:12,y:34}" in out
 
-    def test_one_line_per_step(self) -> None:
-        records = [_rec(i, f"ACTION{i}", reasoning=f"step {i}") for i in (1, 2, 3)]
-        out = format_compact_history(records)
-        lines = out.splitlines()
-        assert len(lines) == 3
-        # No multi-line nesting (no "why:" or "tool:" line headers like format_full_history).
-        assert all("why:" not in line for line in lines)
-        assert all("tool:" not in line for line in lines)
-        assert "[1] ACTION1" in lines[0]
-        assert "[3] ACTION3" in lines[2]
 
-    def test_reasoning_is_omitted_from_compact_history(self) -> None:
-        rec = _rec(7, "ACTION3", reasoning="trying to push north into the gate")
-        out = format_compact_history([rec])
-        assert "trying to push north into the gate" not in out
-        assert '"' not in out
-
-    def test_reasoning_chars_argument_does_not_readd_reasoning(self) -> None:
-        long_reason = "x" * 500
-        out = format_compact_history(
-            [_rec(1, "ACTION1", reasoning=long_reason)], reasoning_chars=50
-        )
-        assert long_reason not in out
-        assert "…" not in out
-        assert '"' not in out
-
-    def test_truncates_oldest_when_over_max_chars(self) -> None:
-        records = [
-            _rec(i, "ACTION6", chosen_action_data={"x": 12, "y": 34}) for i in range(30)
-        ]
-        out = format_compact_history(records, max_chars=400)
-        assert len(out) <= 400
-        # Newest step (29) survives; oldest steps were dropped.
-        assert "[29]" in out
-        assert "[0]" not in out
-
-    def test_includes_action_data_inline(self) -> None:
-        out = format_compact_history(
-            [_rec(5, "ACTION6", chosen_action_data={"x": 12, "y": 34})]
-        )
-        # New format is "ACTION6{x:12,y:34}", not "data={'x': 12, 'y': 34}".
-        assert "ACTION6{x:12,y:34}" in out
-
-
-@pytest.mark.unit
-class TestEffectTags:
-    def test_no_op_when_frames_identical(self) -> None:
-        grid = [[1, 2], [3, 4]]
-        frames = [_fake_frame(grid), _fake_frame([row[:] for row in grid])]
-        out = format_compact_history([_rec(0, "ACTION1")], frames=frames)
-        assert "NO_OP" in out
-
-    def test_change_with_bbox(self) -> None:
-        pre = [[1, 1, 1], [1, 1, 1], [1, 1, 1]]
-        post = [[1, 1, 1], [1, 2, 2], [1, 1, 1]]  # 2 cells changed at row 1
-        out = format_compact_history(
-            [_rec(0, "ACTION6", chosen_action_data={"x": 1, "y": 1})],
-            frames=[_fake_frame(pre), _fake_frame(post)],
-        )
-        assert "CHANGE 2 cells" in out
-        assert "region 1 2 @ r1 c1-2 [1->2 x2]" in out
-
-    def test_change_splits_disconnected_regions_without_semantic_labels(self) -> None:
-        pre = [[0 for _ in range(8)] for _ in range(8)]
-        post = [row[:] for row in pre]
-        for r in range(2, 4):
-            for c in range(2, 5):
-                post[r][c] = 1
-        post[7][1] = 9
-
-        out = format_compact_history(
-            [_rec(0, "ACTION1")], frames=[_fake_frame(pre), _fake_frame(post)]
-        )
-
-        assert "CHANGE 7 cells" in out
-        assert "region 1 6 @ r2-3 c2-4 [0->1 x6]" in out
-        assert "region 2 1 @ r7 c1 [0->9 x1]" in out
-
-    def test_level_up_outranks_change(self) -> None:
-        # Frame also changed, but score went up — LEVEL_UP wins.
-        pre = [[0, 0], [0, 0]]
-        post = [[1, 0], [0, 0]]
-        frames = [_fake_frame(pre), _fake_frame(pre), _fake_frame(post)]
-        records = [
-            _rec(0, "ACTION1", score=0),
-            _rec(1, "ACTION1", score=1),  # score bump
-        ]
-        out = format_compact_history(records, frames=frames)
-        # Row for action_counter=1 should carry LEVEL_UP, not CHANGE.
-        line_for_1 = next(line for line in out.splitlines() if line.startswith("[1]"))
-        assert "LEVEL_UP 0->1" in line_for_1
-        assert "CHANGE" not in line_for_1
-
-    def test_state_change_outranks_change(self) -> None:
-        frames = [_fake_frame([[0]]), _fake_frame([[0]]), _fake_frame([[1]])]
-        records = [
-            _rec(0, "ACTION1", state="NOT_FINISHED"),
-            _rec(1, "ACTION1", state="GAME_OVER"),
-        ]
-        out = format_compact_history(records, frames=frames)
-        line_for_1 = next(line for line in out.splitlines() if line.startswith("[1]"))
-        assert "STATE->GAME_OVER" in line_for_1
-
-    def test_unknown_when_frames_missing(self) -> None:
-        out = format_compact_history([_rec(0, "ACTION1")], frames=None)
-        assert "UNKNOWN" in out
-
-    def test_unknown_when_frame_index_out_of_range(self) -> None:
-        # Only one frame supplied — no post-action frame for action_counter=0.
-        out = format_compact_history([_rec(0, "ACTION1")], frames=[_fake_frame([[0]])])
-        assert "UNKNOWN" in out
+# --- COMMENTED OUT: TestEffectTags (tests removed format_compact_history) ---
+# @pytest.mark.unit
+# class TestEffectTags:
+#     def test_no_op_when_frames_identical(self) -> None:
+#         grid = [[1, 2], [3, 4]]
+#         frames = [_fake_frame(grid), _fake_frame([row[:] for row in grid])]
+#         out = format_compact_history([_rec(0, "ACTION1")], frames=frames)
+#         assert "NO_OP" in out
+#
+#     def test_change_with_bbox(self) -> None:
+#         pre = [[1, 1, 1], [1, 1, 1], [1, 1, 1]]
+#         post = [[1, 1, 1], [1, 2, 2], [1, 1, 1]]  # 2 cells changed at row 1
+#         out = format_compact_history(
+#             [_rec(0, "ACTION6", chosen_action_data={"x": 1, "y": 1})],
+#             frames=[_fake_frame(pre), _fake_frame(post)],
+#         )
+#         assert "CHANGE 2 cells" in out
+#         assert "region 1 2 @ r1 c1-2 [1->2 x2]" in out
+#
+#     def test_change_splits_disconnected_regions_without_semantic_labels(self) -> None:
+#         pre = [[0 for _ in range(8)] for _ in range(8)]
+#         post = [row[:] for row in pre]
+#         for r in range(2, 4):
+#             for c in range(2, 5):
+#                 post[r][c] = 1
+#         post[7][1] = 9
+#
+#         out = format_compact_history(
+#             [_rec(0, "ACTION1")], frames=[_fake_frame(pre), _fake_frame(post)]
+#         )
+#
+#         assert "CHANGE 7 cells" in out
+#         assert "region 1 6 @ r2-3 c2-4 [0->1 x6]" in out
+#         assert "region 2 1 @ r7 c1 [0->9 x1]" in out
+#
+#     def test_level_up_outranks_change(self) -> None:
+#         # Frame also changed, but score went up — LEVEL_UP wins.
+#         pre = [[0, 0], [0, 0]]
+#         post = [[1, 0], [0, 0]]
+#         frames = [_fake_frame(pre), _fake_frame(pre), _fake_frame(post)]
+#         records = [
+#             _rec(0, "ACTION1", score=0),
+#             _rec(1, "ACTION1", score=1),  # score bump
+#         ]
+#         out = format_compact_history(records, frames=frames)
+#         # Row for action_counter=1 should carry LEVEL_UP, not CHANGE.
+#         line_for_1 = next(line for line in out.splitlines() if line.startswith("[1]"))
+#         assert "LEVEL_UP 0->1" in line_for_1
+#         assert "CHANGE" not in line_for_1
+#
+#     def test_state_change_outranks_change(self) -> None:
+#         frames = [_fake_frame([[0]]), _fake_frame([[0]]), _fake_frame([[1]])]
+#         records = [
+#             _rec(0, "ACTION1", state="NOT_FINISHED"),
+#             _rec(1, "ACTION1", state="GAME_OVER"),
+#         ]
+#         out = format_compact_history(records, frames=frames)
+#         line_for_1 = next(line for line in out.splitlines() if line.startswith("[1]"))
+#         assert "STATE->GAME_OVER" in line_for_1
+#
+#     def test_unknown_when_frames_missing(self) -> None:
+#         out = format_compact_history([_rec(0, "ACTION1")], frames=None)
+#         assert "UNKNOWN" in out
+#
+#     def test_unknown_when_frame_index_out_of_range(self) -> None:
+#         # Only one frame supplied — no post-action frame for action_counter=0.
+#         out = format_compact_history([_rec(0, "ACTION1")], frames=[_fake_frame([[0]])])
+#         assert "UNKNOWN" in out
 
 
 @pytest.mark.unit

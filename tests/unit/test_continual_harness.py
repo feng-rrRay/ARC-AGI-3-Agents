@@ -13,7 +13,9 @@ from PIL import Image
 from agents.agent import Agent
 from agents.templates.continual_harness.context import (
     build_observation_section,
+    build_subagent_prompt,
     build_working_prompt,
+    subagent_current_frame_rendered_grids,
 )
 from agents.templates.continual_harness.helpers import (
     available_game_actions,
@@ -32,6 +34,7 @@ from agents.templates.utils.vlm_backend import (
     AnthropicBackend,
     GeminiBackend,
     OpenAIBackend,
+    estimate_vlm_usage_cost,
 )
 
 
@@ -160,8 +163,85 @@ class TestContinualHarnessPrompts:
 
         assert "## OBSERVATIONS SINCE LAST QUERY" not in prompt
         assert "current grid (latest_frame.frame[-1]):" in prompt
-        assert "Grid current_state_frame (1x1):\n  [2]" in prompt
-        assert "  [7]" not in prompt
+        assert "Grid current_state_frame (1x1) [hex 0-f = color 0-15]:\n2" in prompt
+        assert "\n7" not in prompt  # the non-final grid frame[0]=[[7]] is not rendered
+
+    def test_subagent_prompt_renders_final_grid_before_transients(self) -> None:
+        frame = FrameData(
+            game_id="prompt-test",
+            frame=[
+                [[0, 0], [0, 0]],
+                [[9, 0], [0, 0]],
+                [[9, 9], [0, 0]],
+                [[0, 0], [0, 0]],
+            ],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            win_levels=1,
+            action_input=ActionInput(),
+            available_actions=[5],
+        )
+
+        prompt = build_subagent_prompt(
+            directive="inspect the current animation",
+            context=None,
+            latest_frame=frame,
+            memory_overview="",
+            skill_overview="",
+            compact_history="No previous steps.",
+        )
+
+        final_grid = (
+            "Grid current_state_frame (2x2) [hex 0-f = color 0-15]:\n00\n00"
+        )
+        transient_header = "SELECTED TRANSIENT KEYFRAMES: frame indices [1, 2]"
+        assert "current grid (latest_frame.frame[-1]):" in prompt
+        assert final_grid in prompt
+        assert prompt.index(final_grid) < prompt.index(transient_header)
+        assert (
+            "ANIMATION SUMMARY: frame_count=4; current_grid=3; "
+            "transient_frames=1-2 (2/4)"
+        ) in prompt
+        assert "Grid current_frame_transient_1" in prompt
+        assert "Grid current_frame_transient_2" in prompt
+        assert "\nGrid 0 (" not in prompt
+
+        rendered = subagent_current_frame_rendered_grids(frame)
+        assert [grid.label for grid in rendered] == [
+            "current_state_frame",
+            "current_frame_transient_1",
+            "current_frame_transient_2",
+        ]
+
+    def test_subagent_prompt_caps_large_frame_stacks(self) -> None:
+        frame = FrameData(
+            game_id="prompt-test",
+            frame=[[[i % 15 + 1]] for i in range(120)] + [[[0]]],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            win_levels=1,
+            action_input=ActionInput(),
+            available_actions=[5],
+        )
+
+        prompt = build_subagent_prompt(
+            directive="inspect the current animation",
+            context=None,
+            latest_frame=frame,
+            memory_overview="",
+            skill_overview="",
+            compact_history="No previous steps.",
+        )
+
+        assert "frame_count=121; current_grid=120" in prompt
+        assert "Grid current_state_frame (1x1) [hex 0-f = color 0-15]:\n0" in prompt
+        assert prompt.count("Grid current_frame_transient_") == 3
+        assert prompt.count("[hex 0-f = color 0-15]:") == 4
+        assert "\nGrid 42 (" not in prompt
+
+        rendered = subagent_current_frame_rendered_grids(frame)
+        assert rendered[0].label == "current_state_frame"
+        assert len(rendered) == 4
 
     def test_observation_final_change_renders_only_action_final_grid(self) -> None:
         frames = [
@@ -525,3 +605,54 @@ class TestTokenUsage:
             "cached": None,
             "tool_use": None,
         }
+
+    def test_estimate_vlm_usage_cost_supported_gemini_tiers(self) -> None:
+        low = estimate_vlm_usage_cost(
+            "gemini-3.1-pro-preview",
+            {
+                "prompt": 100_000,
+                "output": 1_000,
+                "thoughts": 500,
+                "total": 101_500,
+                "cached": 20_000,
+            },
+        )
+        high = estimate_vlm_usage_cost(
+            "gemini-3.1-pro-preview",
+            {
+                "prompt": 250_000,
+                "output": 1_000,
+                "thoughts": 0,
+                "total": 251_000,
+                "cached": 50_000,
+            },
+            cumulative_usd_before=float(low["current_usd"]),
+        )
+
+        assert low is not None and low["tier"] == "le_200k"
+        assert high is not None and high["tier"] == "gt_200k"
+        assert low["billable_output_tokens"] == 1_500
+        assert low["current_usd"] == pytest.approx(
+            ((80_000 * 2.00) + (20_000 * 0.20) + (1_500 * 12.00)) / 1_000_000
+        )
+        assert high["current_usd"] == pytest.approx(
+            ((200_000 * 4.00) + (50_000 * 0.40) + (1_000 * 18.00)) / 1_000_000
+        )
+        assert high["cumulative_usd"] == pytest.approx(
+            float(low["current_usd"]) + float(high["current_usd"])
+        )
+
+    def test_estimate_vlm_usage_cost_unsupported_model_returns_none(self) -> None:
+        assert (
+            estimate_vlm_usage_cost(
+                "gemini-2.5-pro",
+                {
+                    "prompt": 100,
+                    "output": 20,
+                    "thoughts": 5,
+                    "total": 125,
+                    "cached": 0,
+                },
+            )
+            is None
+        )

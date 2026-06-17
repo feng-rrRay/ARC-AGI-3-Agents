@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import random
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, ClassVar, Sequence, TypeAlias, cast
 
 import numpy as np
@@ -13,6 +15,102 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 ImageInput: TypeAlias = Image.Image | np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class VLMUsagePricing:
+    input_per_m: float
+    output_per_m: float
+    cached_per_m: float
+    tier: str
+
+
+def usage_token_count(usage: dict[str, Any] | None, key: str) -> int:
+    if usage is None:
+        return 0
+    try:
+        return int(usage.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _gemini_usage_pricing(
+    model_name: str, prompt_tokens: int
+) -> VLMUsagePricing | None:
+    model = model_name.lower()
+    if "gemini-3.1-pro-preview" in model:
+        if prompt_tokens > 200_000:
+            return VLMUsagePricing(
+                input_per_m=4.00,
+                output_per_m=18.00,
+                cached_per_m=0.40,
+                tier="gt_200k",
+            )
+        return VLMUsagePricing(
+            input_per_m=2.00,
+            output_per_m=12.00,
+            cached_per_m=0.20,
+            tier="le_200k",
+        )
+    if "gemini-3.5-flash" in model:
+        return VLMUsagePricing(
+            input_per_m=1.50,
+            output_per_m=9.00,
+            cached_per_m=0.15,
+            tier="flat",
+        )
+    if "gemini-3-flash-preview" in model:
+        return VLMUsagePricing(
+            input_per_m=0.50,
+            output_per_m=3.00,
+            cached_per_m=0.05,
+            tier="flat",
+        )
+    return None
+
+
+def estimate_vlm_usage_cost(
+    model_name: str,
+    usage: dict[str, Any] | None,
+    *,
+    cumulative_usd_before: float = 0.0,
+) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+
+    prompt_tokens = usage_token_count(usage, "prompt")
+    output_tokens = usage_token_count(usage, "output")
+    thoughts_tokens = usage_token_count(usage, "thoughts")
+    cached_tokens = min(usage_token_count(usage, "cached"), prompt_tokens)
+
+    pricing = _gemini_usage_pricing(model_name, prompt_tokens)
+    if pricing is None:
+        return None
+
+    uncached_input_tokens = max(0, prompt_tokens - cached_tokens)
+    billable_output_tokens = output_tokens + thoughts_tokens
+    current_cost = (
+        (uncached_input_tokens * pricing.input_per_m)
+        + (cached_tokens * pricing.cached_per_m)
+        + (billable_output_tokens * pricing.output_per_m)
+    ) / 1_000_000
+    return {
+        "model": model_name,
+        "tier": pricing.tier,
+        "current_usd": current_cost,
+        "cumulative_usd": cumulative_usd_before + current_cost,
+        "prompt_tokens": prompt_tokens,
+        "uncached_input_tokens": uncached_input_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "thoughts_tokens": thoughts_tokens,
+        "billable_output_tokens": billable_output_tokens,
+        "rates_per_m": {
+            "input": pricing.input_per_m,
+            "output": pricing.output_per_m,
+            "cached": pricing.cached_per_m,
+        },
+    }
 
 
 class VLMBackend(ABC):
@@ -57,6 +155,69 @@ class VLMBackend(ABC):
         agent/trace code never sees provider-specific field names.
         """
         return None
+
+    # --- Multi-turn conversation API ------------------------------------
+    # Used by the orchestrator's conversation-until-action loop. Provider
+    # "turn"/"content" objects are opaque to callers — build them with these
+    # helpers and feed the accumulated list back to `get_query_contents`.
+
+    def build_user_turn(self, text: str, images: Sequence[ImageInput]) -> Any:
+        """Build one user turn (prompt text + image parts)."""
+        raise NotImplementedError
+
+    def build_tool_results_turn(self, pairs: Sequence[tuple[str, dict[str, Any]]]) -> Any:
+        """Build one user turn carrying function-response parts (name -> response dict)."""
+        raise NotImplementedError
+
+    def model_turn(self, response: Any) -> Any:
+        """Extract the model turn from a response, to append back to the conversation."""
+        raise NotImplementedError
+
+    def get_query_contents(self, contents: list[Any], module_name: str = "Unknown") -> Any:
+        """Send a full multi-turn conversation (list of turns) and return the response."""
+        raise NotImplementedError
+
+    def count_input_tokens(
+        self, contents: list[Any], module_name: str = "Unknown"
+    ) -> int:
+        """Return an estimated input-token count for a generate request."""
+        return _estimate_input_tokens(contents)
+
+    def context_window_tokens(self) -> int | None:
+        """Return the model input context window in tokens, if known."""
+        return None
+
+
+def _estimate_input_tokens(value: Any) -> int:
+    """Conservative local fallback for request sizing when provider counting fails."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return max(1, (len(value) + 3) // 4)
+    if isinstance(value, Image.Image):
+        return 258
+    if isinstance(value, np.ndarray):
+        return 258
+    if isinstance(value, bytes):
+        return max(1, len(value) // 3)
+    if isinstance(value, dict):
+        return sum(_estimate_input_tokens(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_estimate_input_tokens(v) for v in value)
+
+    total = 0
+    parts = getattr(value, "parts", None)
+    if parts is not None:
+        total += _estimate_input_tokens(parts)
+    text = getattr(value, "text", None)
+    if text:
+        total += _estimate_input_tokens(str(text))
+    data = getattr(value, "data", None)
+    if data is not None:
+        total += _estimate_input_tokens(data)
+    if total:
+        return total
+    return max(1, (len(str(value)) + 3) // 4)
 
 
 class _PlaceholderBackend(VLMBackend):
@@ -308,6 +469,138 @@ class GeminiBackend(VLMBackend):
             usage.get("cached"),
         )
 
+    def _count_tokens_config(self) -> Any:
+        cfg: dict[str, Any] = {}
+        if self.system_instruction:
+            cfg["system_instruction"] = self.system_instruction
+        if self._tools_payload:
+            cfg["tools"] = self._tools_payload
+        if not cfg:
+            return None
+        return self._types.CountTokensConfig(**cfg)
+
+    def count_input_tokens(
+        self, contents: list[Any], module_name: str = "Unknown"
+    ) -> int:
+        try:
+            response = self.client.models.count_tokens(
+                model=self.model_name,
+                contents=contents,
+                # config=self._count_tokens_config(),
+            )
+            total = getattr(response, "total_tokens", None)
+            if total is None:
+                total = getattr(response, "totalTokens", None)
+            if total is None:
+                raise ValueError(f"count_tokens response missing total_tokens: {response!r}")
+            return int(total)
+        except Exception as exc:
+            estimated = _estimate_input_tokens(contents)
+            logger.warning(
+                "[%s] count_tokens failed; using local estimate=%d: %s",
+                module_name,
+                estimated,
+                exc,
+            )
+            return estimated
+
+    def context_window_tokens(self) -> int | None:
+        model = self.model_name.lower()
+        if any(
+            marker in model
+            for marker in (
+                "gemini-3.5",
+                "gemini-3.1",
+                "gemini-3",
+                "gemini-2.5"
+            )
+        ):
+            return 1_048_576
+        return None
+
+    # --- Multi-turn conversation API ------------------------------------
+
+    def _image_part(self, img: ImageInput) -> Any:
+        pil = self._prepare_image(img)
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        return self._types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
+
+    def build_user_turn(self, text: str, images: Sequence[ImageInput]) -> Any:
+        parts = [self._types.Part.from_text(text=text)]
+        parts.extend(self._image_part(img) for img in images)
+        return self._types.Content(role="user", parts=parts)
+
+    def build_tool_results_turn(
+        self, pairs: Sequence[tuple[str, dict[str, Any]]]
+    ) -> Any:
+        parts = [
+            self._types.Part.from_function_response(name=name, response=response)
+            for name, response in pairs
+        ]
+        return self._types.Content(role="user", parts=parts)
+
+    def model_turn(self, response: Any) -> Any:
+        cands = getattr(response, "candidates", None) or []
+        content = getattr(cands[0], "content", None) if cands else None
+        # Fall back to an empty model turn so the conversation stays well-formed
+        # even if a response carried no candidate content.
+        return content or self._types.Content(role="model", parts=[])
+
+    @staticmethod
+    def _initial_text_only_fallback(contents: list[Any]) -> str | None:
+        """Return initial user-turn text when a multimodal first turn can fallback."""
+        if len(contents) != 1:
+            return None
+        content = contents[0]
+        if getattr(content, "role", None) != "user":
+            return None
+
+        texts: list[str] = []
+        has_non_text_part = False
+        for part in getattr(content, "parts", None) or []:
+            text = getattr(part, "text", None)
+            data = getattr(part, "data", None)
+            if text is None and isinstance(data, dict):
+                text = data.get("text")
+            if text:
+                texts.append(str(text))
+            else:
+                has_non_text_part = True
+        if not texts or not has_non_text_part:
+            return None
+        return "\n".join(texts)
+
+    def get_query_contents(
+        self, contents: list[Any], module_name: str = "Unknown"
+    ) -> Any:
+        logger.info(
+            "[%s] Gemini conversation query (%d turns)", module_name, len(contents)
+        )
+        start = time.time()
+        response = self._generate(contents)
+        if self._is_safety_filtered(response):
+            fallback_text = self._initial_text_only_fallback(contents)
+            if fallback_text is not None:
+                logger.warning(
+                    "[%s] conversation first turn safety-filtered; "
+                    "falling back to text-only",
+                    module_name,
+                )
+                response = self._generate([fallback_text])
+                if self._is_safety_filtered(response):
+                    logger.warning(
+                        "[%s] text-only conversation fallback safety-filtered",
+                        module_name,
+                    )
+            else:
+                logger.warning("[%s] conversation turn safety-filtered", module_name)
+        logger.debug(
+            "[%s] Gemini conversation turn in %.2fs", module_name, time.time() - start
+        )
+        self._log_usage(response, module_name)
+        return response
+
 
 class VLM:
     """Provider wrapper for vision-language model backends."""
@@ -384,3 +677,29 @@ class VLM:
 
     def get_text_query(self, text: str, module_name: str = "Unknown") -> Any:
         return self.backend.get_text_query(text, module_name)
+
+    # --- Multi-turn conversation API (forwarded to the backend) ---------
+
+    def build_user_turn(self, text: str, images: Sequence[ImageInput]) -> Any:
+        return self.backend.build_user_turn(text, images)
+
+    def build_tool_results_turn(
+        self, pairs: Sequence[tuple[str, dict[str, Any]]]
+    ) -> Any:
+        return self.backend.build_tool_results_turn(pairs)
+
+    def model_turn(self, response: Any) -> Any:
+        return self.backend.model_turn(response)
+
+    def get_query_contents(
+        self, contents: list[Any], module_name: str = "Unknown"
+    ) -> Any:
+        return self.backend.get_query_contents(contents, module_name)
+
+    def count_input_tokens(
+        self, contents: list[Any], module_name: str = "Unknown"
+    ) -> int:
+        return self.backend.count_input_tokens(contents, module_name)
+
+    def context_window_tokens(self) -> int | None:
+        return self.backend.context_window_tokens()

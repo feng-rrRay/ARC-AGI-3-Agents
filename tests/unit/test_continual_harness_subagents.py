@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 
 from agents.templates.continual_harness.subagents import (
+    DEFAULT_MAX_TURNS,
     DEFAULT_SUBAGENT_ALLOWED_TOOLS,
-    INSTRUCTIONS_MAX_CHARS,
+    MAX_MAX_TURNS,
     MAX_SUBAGENTS,
     SEARCH_MAX_MATCHES,
+    SYSTEM_INSTRUCTIONS_MAX_CHARS,
     SubagentEntry,
     SubagentStore,
     active_subagent_path,
@@ -26,18 +28,20 @@ def _add_basic(
     *,
     name: str = "summarizer",
     description: str = "Summarize the last N steps.",
-    instructions: str = "Read recent steps and call subagent_return with a digest.",
+    system_instructions: str = "Read recent steps and call subagent_return with a digest.",
     allowed_tools: list[str] | None = None,
     tags: list[str] | None = None,
+    **kwargs: object,
 ) -> SubagentEntry:
     return store.add(
         name=name,
         description=description,
-        instructions=instructions,
+        system_instructions=system_instructions,
         allowed_tools=allowed_tools
         if allowed_tools is not None
-        else ["get_recent_trajectory"],
+        else ["process_memory"],
         tags=tags,
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -87,29 +91,50 @@ class TestSubagentStoreCRUD:
         entry = _add_basic(store)
         assert entry.game_id == "some-game"
 
+    def test_add_defaults_handler_and_max_turns(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        entry = _add_basic(store)
+        assert entry.handler_type == "looping"
+        assert entry.max_turns == DEFAULT_MAX_TURNS
+        assert entry.directive == ""
+        assert entry.return_condition == ""
+        assert entry.source == "orchestrator"
+        assert entry.is_builtin is False
+
     def test_add_persists_across_instances(self, tmp_path: Path) -> None:
         path = tmp_path / "subagents.json"
         SubagentStore(path, game_id="g").add(
             name="summarizer",
             description="d",
-            instructions="do thing",
-            allowed_tools=["get_recent_trajectory"],
+            system_instructions="do thing",
+            allowed_tools=["process_memory"],
+            directive="default directive",
+            return_condition="return when done",
+            handler_type="one_step",
         )
         reopened = SubagentStore(path, game_id="g")
         entries = reopened.all_entries()
         assert len(entries) == 1
         assert entries[0].name == "summarizer"
-        assert entries[0].allowed_tools == ["get_recent_trajectory"]
+        assert entries[0].allowed_tools == ["process_memory"]
+        assert entries[0].directive == "default directive"
+        assert entries[0].return_condition == "return when done"
+        assert entries[0].handler_type == "one_step"
 
     def test_add_rejects_invalid_name(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         with pytest.raises(ValueError):
-            store.add(name="", description="d", instructions="i", allowed_tools=[])
-        with pytest.raises(ValueError):
-            store.add(name="1bad", description="d", instructions="i", allowed_tools=[])
+            store.add(name="", description="d", system_instructions="i", allowed_tools=[])
         with pytest.raises(ValueError):
             store.add(
-                name="has space", description="d", instructions="i", allowed_tools=[]
+                name="1bad", description="d", system_instructions="i", allowed_tools=[]
+            )
+        with pytest.raises(ValueError):
+            store.add(
+                name="has space",
+                description="d",
+                system_instructions="i",
+                allowed_tools=[],
             )
 
     def test_add_rejects_duplicate_name(self, tmp_path: Path) -> None:
@@ -118,16 +143,30 @@ class TestSubagentStoreCRUD:
         with pytest.raises(ValueError, match="already in use"):
             _add_basic(store, name="summarizer")
 
-    def test_add_rejects_empty_instructions(self, tmp_path: Path) -> None:
+    def test_add_rejects_empty_system_instructions(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         with pytest.raises(ValueError):
-            store.add(name="s", description="d", instructions="", allowed_tools=[])
+            store.add(name="s", description="d", system_instructions="", allowed_tools=[])
 
-    def test_add_rejects_oversize_instructions(self, tmp_path: Path) -> None:
+    def test_add_rejects_oversize_system_instructions(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        big = "x" * (INSTRUCTIONS_MAX_CHARS + 1)
+        big = "x" * (SYSTEM_INSTRUCTIONS_MAX_CHARS + 1)
         with pytest.raises(ValueError):
-            store.add(name="s", description="d", instructions=big, allowed_tools=[])
+            store.add(
+                name="s", description="d", system_instructions=big, allowed_tools=[]
+            )
+
+    def test_add_rejects_invalid_handler_type(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        with pytest.raises(ValueError, match="handler_type"):
+            _add_basic(store, handler_type="weird")
+
+    def test_add_clamps_max_turns(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        high = _add_basic(store, name="high", max_turns=10_000)
+        low = _add_basic(store, name="low", max_turns=0)
+        assert high.max_turns == MAX_MAX_TURNS
+        assert low.max_turns == 1
 
     def test_add_rejects_when_full(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -140,6 +179,29 @@ class TestSubagentStoreCRUD:
         store = _store(tmp_path)
         _add_basic(store)
         assert store.delete("subagent_999") is False
+
+    def test_delete_skips_builtin(self, tmp_path: Path) -> None:
+        path = tmp_path / "subagents.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "g",
+                            "name": "builtin",
+                            "description": "seeded",
+                            "system_instructions": "do thing",
+                            "is_builtin": True,
+                        }
+                    ],
+                }
+            )
+        )
+        store = SubagentStore(path, game_id="g")
+        assert store.delete("subagent_001") is False
+        assert len(store.all_entries()) == 1
 
     def test_delete_does_not_reuse_ids(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -158,28 +220,44 @@ class TestSubagentStoreCRUD:
             store,
             name="summarizer",
             description="old desc",
-            instructions="old instructions",
+            system_instructions="old instructions",
             tags=["a"],
         )
-        edited = store.edit(original.id, instructions="new instructions")
+        edited = store.edit(original.id, system_instructions="new instructions")
         assert edited is not None
         assert edited.name == "summarizer"  # unchanged
         assert edited.description == "old desc"  # unchanged
-        assert edited.instructions == "new instructions"
+        assert edited.system_instructions == "new instructions"
         assert edited.tags == ["a"]
         assert edited.version == 2
         assert edited.updated_at >= original.updated_at
 
+    def test_edit_can_change_new_fields(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        entry = _add_basic(store)
+        edited = store.edit(
+            entry.id,
+            directive="new directive",
+            return_condition="stop now",
+            handler_type="one_step",
+            max_turns=3,
+        )
+        assert edited is not None
+        assert edited.directive == "new directive"
+        assert edited.return_condition == "stop now"
+        assert edited.handler_type == "one_step"
+        assert edited.max_turns == 3
+
     def test_edit_can_change_allowed_tools(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        entry = _add_basic(store, allowed_tools=["get_recent_trajectory"])
+        entry = _add_basic(store, allowed_tools=["process_skill"])
         edited = store.edit(entry.id, allowed_tools=["process_memory", "run_skill"])
         assert edited is not None
         assert edited.allowed_tools == ["process_memory", "run_skill"]
 
     def test_edit_returns_none_for_unknown_id(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        assert store.edit("subagent_999", instructions="x") is None
+        assert store.edit("subagent_999", system_instructions="x") is None
 
     def test_edit_requires_at_least_one_field(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -207,7 +285,7 @@ class TestAllowedToolsValidation:
         entry = store.add(
             name="defaulted",
             description="Uses the default safe tool set.",
-            instructions="Do the task and return.",
+            system_instructions="Do the task and return.",
         )
         assert entry.allowed_tools == list(DEFAULT_SUBAGENT_ALLOWED_TOOLS)
 
@@ -216,17 +294,17 @@ class TestAllowedToolsValidation:
         entry = _add_basic(
             store,
             allowed_tools=[
-                "get_recent_trajectory",
                 "process_memory",
                 "process_skill",
                 "run_skill",
+                "take_actions",
             ],
         )
         assert set(entry.allowed_tools) == {
-            "get_recent_trajectory",
             "process_memory",
             "process_skill",
             "run_skill",
+            "take_actions",
         }
 
     def test_rejects_run_code_now_disabled(self, tmp_path: Path) -> None:
@@ -266,7 +344,7 @@ class TestAllowedToolsValidation:
 
 @pytest.mark.unit
 class TestSubagentStoreSearch:
-    def test_substring_over_name_description_instructions_tags(
+    def test_substring_over_name_description_system_instructions_tags(
         self, tmp_path: Path
     ) -> None:
         store = _store(tmp_path)
@@ -274,14 +352,14 @@ class TestSubagentStoreSearch:
             store,
             name="summarizer",
             description="Compact the trajectory.",
-            instructions="Read trajectory; call subagent_return with a digest.",
+            system_instructions="Read trajectory; call subagent_return with a digest.",
             tags=["history"],
         )
         _add_basic(
             store,
             name="coord_proposer",
             description="Suggest x/y coordinates for ACTION6.",
-            instructions="Inspect frame; propose 3 click points.",
+            system_instructions="Inspect frame; propose 3 click points.",
             tags=["geo"],
         )
 
@@ -294,6 +372,12 @@ class TestSubagentStoreSearch:
         assert [e.name for e in desc_hits] == ["coord_proposer"]
         assert [e.name for e in instr_hits] == ["coord_proposer"]
         assert [e.name for e in tag_hits] == ["summarizer"]
+
+    def test_substring_matches_directive(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        _add_basic(store, name="explorer", directive="systematically probe ACTION space")
+        hits, _ = store.search("probe ACTION space")
+        assert [e.name for e in hits] == ["explorer"]
 
     def test_caps_returned_at_max_matches(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -324,19 +408,22 @@ class TestFormatSubagentOverview:
         assert "## SUBAGENTS (0 saved)" in out
         assert "No subagents saved yet" in out
         assert 'process_subagent(operation="add"' in out
+        assert "cannot commit ARC actions" not in out
+        assert "Include take_actions only for bounded action-capable subagents" in out
 
-    def test_lists_id_name_tools_only(self, tmp_path: Path) -> None:
+    def test_lists_id_name_handler_and_tools_only(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         _add_basic(
             store,
             name="summarizer",
             description="Compact the trajectory and save key insights.",
-            instructions="SECRET_INSTRUCTION_TEXT do not leak in overview",
-            allowed_tools=["get_recent_trajectory", "process_memory"],
+            system_instructions="SECRET_INSTRUCTION_TEXT do not leak in overview",
+            allowed_tools=["process_memory", "run_skill"],
         )
         out = format_subagent_overview(store.all_entries())
         assert "[subagent_001] summarizer" in out
-        assert "[get_recent_trajectory, process_memory]" in out
+        assert "Only subagents whose allowed_tools include take_actions" in out
+        assert "(looping, process_memory, run_skill)" in out
         assert "Compact the trajectory" in out  # description IS shown
         assert "SECRET_INSTRUCTION_TEXT" not in out  # instructions never leak
 
@@ -344,7 +431,7 @@ class TestFormatSubagentOverview:
         store = _store(tmp_path)
         _add_basic(store, allowed_tools=[])
         out = format_subagent_overview(store.all_entries())
-        assert "[no tools]" in out
+        assert "no tools" in out
 
 
 @pytest.mark.unit
@@ -356,6 +443,32 @@ class TestStoreRobustness:
         assert store.all_entries() == []
         entry = _add_basic(store)
         assert entry.id == "subagent_001"
+
+    def test_tolerates_legacy_instructions_key(self, tmp_path: Path) -> None:
+        # A registry written by the pre-rename schema used `instructions`.
+        path = tmp_path / "subagents.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "g",
+                            "name": "legacy",
+                            "description": "old entry",
+                            "instructions": "legacy system prompt",
+                            "allowed_tools": ["process_memory"],
+                        }
+                    ],
+                }
+            )
+        )
+        store = SubagentStore(path, game_id="g")
+        entries = store.all_entries()
+        assert len(entries) == 1
+        assert entries[0].system_instructions == "legacy system prompt"
+        assert entries[0].handler_type == "looping"  # default supplied
 
     def test_load_advances_next_id_past_hand_edited_entries(
         self, tmp_path: Path
@@ -371,8 +484,8 @@ class TestStoreRobustness:
                             "game_id": "g",
                             "name": "seed",
                             "description": "seeded sub",
-                            "instructions": "do thing",
-                            "allowed_tools": ["get_recent_trajectory"],
+                            "system_instructions": "do thing",
+                            "allowed_tools": ["process_memory"],
                             "tags": [],
                             "version": 3,
                             "created_at": "",

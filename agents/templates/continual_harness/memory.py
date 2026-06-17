@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -27,8 +28,40 @@ class MemoryEntry:
     title: str
     body: str
     tags: list[str] = field(default_factory=list)
+    # 1 = untested guess / should explore ... 5 = repeatedly confirmed.
+    # Default keeps legacy memory files (no confidence key) loadable.
+    confidence: int = 3
     created_at: str = ""
     updated_at: str = ""
+
+
+def _validate_confidence(value: Any, *, required: bool) -> int | None:
+    """Coerce + validate a confidence value. None is allowed only when optional."""
+    if value is None:
+        if required:
+            raise ValueError(
+                "add requires confidence (integer 1-5; 1=untested guess, "
+                "5=repeatedly confirmed)"
+            )
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"confidence must be an integer 1-5, got {value!r}")
+    if isinstance(value, int):
+        confidence = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"confidence must be an integer 1-5, got {value!r}")
+        confidence = math.floor(value + 0.5)
+    else:
+        try:
+            confidence = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"confidence must be an integer 1-5, got {value!r}"
+            ) from None
+    if not 1 <= confidence <= 5:
+        raise ValueError(f"confidence must be between 1 and 5, got {confidence}")
+    return confidence
 
 
 RUN_DIR_ENV = "RUN_DIR"
@@ -127,11 +160,19 @@ class MemoryStore:
             state = self._load()
         return [MemoryEntry(**e) for e in state["entries"]]
 
-    def add(self, title: str, body: str, tags: list[str] | None = None) -> MemoryEntry:
+    def add(
+        self,
+        title: str,
+        body: str,
+        tags: list[str] | None = None,
+        confidence: Any = None,
+    ) -> MemoryEntry:
         title = self._truncate(title, TITLE_MAX_CHARS)
         body = self._truncate(body, BODY_MAX_CHARS)
         if not title or not body:
             raise ValueError("add requires non-empty title and body")
+        validated_confidence = _validate_confidence(confidence, required=True)
+        assert validated_confidence is not None
         with self._lock:
             state = self._load()
             if len(state["entries"]) >= MAX_ENTRIES:
@@ -146,6 +187,7 @@ class MemoryStore:
                 title=title,
                 body=body,
                 tags=list(tags or []),
+                confidence=validated_confidence,
                 created_at=now,
                 updated_at=now,
             )
@@ -171,9 +213,13 @@ class MemoryStore:
         title: str | None = None,
         body: str | None = None,
         tags: list[str] | None = None,
+        confidence: Any = None,
     ) -> MemoryEntry | None:
-        if title is None and body is None and tags is None:
-            raise ValueError("edit requires at least one of title/body/tags")
+        if title is None and body is None and tags is None and confidence is None:
+            raise ValueError(
+                "edit requires at least one of title/body/tags/confidence"
+            )
+        validated_confidence = _validate_confidence(confidence, required=False)
         with self._lock:
             state = self._load()
             for entry in state["entries"]:
@@ -184,6 +230,8 @@ class MemoryStore:
                         entry["body"] = self._truncate(body, BODY_MAX_CHARS)
                     if tags is not None:
                         entry["tags"] = list(tags)
+                    if validated_confidence is not None:
+                        entry["confidence"] = validated_confidence
                     entry["updated_at"] = self._now()
                     self._save(state)
                     return MemoryEntry(**entry)
@@ -213,29 +261,40 @@ class MemoryStore:
 
 
 def format_memory_overview(entries: list[MemoryEntry]) -> str:
-    """Compact index for auto-injection. Body is fetched via process_memory(search)."""
+    """Compact index for auto-injection. Body is fetched via process_memory(search).
+
+    [cN] is the entry's confidence (1=untested guess ... 5=repeatedly confirmed).
+    """
     if not entries:
         return (
             "## LONG-TERM MEMORY (0 entries)\n"
-            'No memories saved yet. Use process_memory(operation="add", '
-            "title=..., body=..., tags=[...]) to record observations "
-            "(player identity, action effects, level mechanics) that will help "
-            "future steps. With --bootstrap-memory, they also persist across runs."
+            'No facts recorded yet. Use process_memory(operation="add", '
+            "title=..., body=..., confidence=1-5, tags=[...]) to record one "
+            "small fact per entry (a confirmed action effect, an object "
+            "identity, or a hypothesis to test). With --bootstrap-memory, "
+            "entries also persist across runs."
         )
-    rows = [f"## LONG-TERM MEMORY ({len(entries)} entries)"]
+    rows = [
+        f"## LONG-TERM MEMORY ({len(entries)} entries)",
+        "[cN] = confidence: 1=untested guess ... 5=repeatedly confirmed",
+    ]
     for e in entries:
         tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
-        rows.append(f"[{e.id}] {e.title}{tag_str}")
+        first_line = f"{e.body.splitlines()[0]}" if e.body else ""
+        rows.append(f"[{e.id}][c{e.confidence}] {e.title}{tag_str}: {first_line}...")
     return "\n".join(rows)
 
 
 def format_memory_full(entries: list[MemoryEntry]) -> str:
     """Full memory dump with bodies, for the evolution meta-call."""
     if not entries:
-        return "## LONG-TERM MEMORY (0 entries)\nNo memories saved yet."
-    rows = [f"## LONG-TERM MEMORY ({len(entries)} entries)"]
+        return "## LONG-TERM MEMORY (0 entries)\nNo facts recorded yet."
+    rows = [
+        f"## LONG-TERM MEMORY ({len(entries)} entries)",
+        "Confidence: 1=untested guess ... 5=repeatedly confirmed",
+    ]
     for e in entries:
         tag_str = f" ({', '.join(e.tags)})" if e.tags else ""
-        rows.append(f"### [{e.id}] {e.title}{tag_str}")
+        rows.append(f"### [{e.id}] {e.title}{tag_str} — confidence {e.confidence}/5")
         rows.append(e.body)
     return "\n".join(rows)

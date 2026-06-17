@@ -13,6 +13,12 @@ This is the optimizable strategic guidance that gets combined with runtime conte
 ## Recent Agent Trajectories (last {n} steps):
 {trajectory}
 
+## Recent Tool Evidence (same evolution window):
+{tool_evidence}
+
+## Evolution Trigger
+{trigger_context}
+
 ## Current Agent State
 {memory_overview}
 
@@ -24,7 +30,7 @@ This is the optimizable strategic guidance that gets combined with runtime conte
 Analyze the agent's recent performance and create an IMPROVED base prompt that:
 1. **Addresses observed failures** — if the agent made mistakes, add specific guidance to prevent them
 2. **Reinforces successful patterns** — if certain strategies worked well, emphasize them
-3. **Includes ALL discovered game rules** — you MUST preserve every confirmed or hypothesized rule the agent has found. Losing rules forces re-exploration and wastes actions.
+3. **Includes discovered game rules** — preserve every confirmed rule, state important hypotheses or open questions (low-confidence memory); be faithful to the memory.
 4. **Adds learned lessons** — include insights derived from trajectory analysis
 
 ## Analysis Guidelines

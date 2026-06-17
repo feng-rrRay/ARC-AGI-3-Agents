@@ -43,6 +43,11 @@ hermes-eval = [
     "uvicorn>=0.30",
     "starlette>=1.0",
 ]
+blog-viz = [
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "pandas>=2.2",
+]
 
 [tool.setuptools.packages.find]
 # Only the real Python packages; excludes data dirs (logs/, recordings/,

@@ -461,6 +461,7 @@ class TestRunLocalMemory:
                             "operation": "add",
                             "title": "run local",
                             "body": "available without bootstrap",
+                            "confidence": 3,
                         },
                     )
                 ),
@@ -518,6 +519,7 @@ class TestMemoryOn:
                             "body": "After ACTION1 we observed the orange block move up; "
                             "the white cross is just a target.",
                             "tags": ["player_identity"],
+                            "confidence": 4,
                         },
                     )
                 ),
@@ -532,7 +534,10 @@ class TestMemoryOn:
         # Round 2's prompt overview reflects the just-added entry.
         round2_prompt = scripted.calls[1][1]
         assert "## LONG-TERM MEMORY (1 entries)" in round2_prompt
-        assert "[mem_001] Orange block is the player (player_identity)" in round2_prompt
+        assert (
+            "[mem_001][c4] Orange block is the player (player_identity)"
+            in round2_prompt
+        )
         # Body stays out of the auto-injected overview block (it only renders
         # title + tags). The tool-result echo below carries the body since the
         # model just supplied it as an arg — that's expected, not a leak.
@@ -625,8 +630,9 @@ class TestMemoryOn:
         agent.choose_action([_make_frame([1])], _make_frame([1]))
 
         round2_prompt = scripted.calls[1][1]
-        assert "[mem_001] new title" in round2_prompt
-        assert "[mem_001] old title" not in round2_prompt
+        # Seeded entry predates the confidence field → defaults to 3 in the index.
+        assert "[mem_001][c3] new title" in round2_prompt
+        assert "old title" not in round2_prompt
 
     def test_search_returns_full_body(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -725,8 +731,9 @@ class TestMemoryOn:
 
         prompt = scripted.calls[0][1]
         assert "## LONG-TERM MEMORY (2 entries)" in prompt
-        assert "[mem_001] first preloaded" in prompt
-        assert "[mem_002] second preloaded" in prompt
+        # Bootstrap entries written before the confidence field default to c3.
+        assert "[mem_001][c3] first preloaded" in prompt
+        assert "[mem_002][c3] second preloaded" in prompt
 
     def test_bootstrap_file_is_written_back_on_mutation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -742,6 +749,7 @@ class TestMemoryOn:
                             "operation": "add",
                             "title": "persisted",
                             "body": "persisted body",
+                            "confidence": 5,
                         },
                     )
                 ),
@@ -759,6 +767,7 @@ class TestMemoryOn:
         entries = reopened.all_entries()
         assert len(entries) == 1
         assert entries[0].title == "persisted"
+        assert entries[0].confidence == 5
 
 
 # --- skill / sandbox orchestrator tests --------------------------------------
@@ -1010,7 +1019,7 @@ class TestSubagentHandlers:
                             "operation": "add",
                             "name": "summarizer",
                             "description": "Summarize current state.",
-                            "instructions": "Return a concise summary.",
+                            "system_instructions": "Return a concise summary.",
                         },
                     )
                 ),
@@ -1039,7 +1048,7 @@ class TestSubagentHandlers:
                             "game_id": "orch-test",
                             "name": "summarizer",
                             "description": "Summarize.",
-                            "instructions": "Return the answer.",
+                            "system_instructions": "Return the answer.",
                             "allowed_tools": [],
                             "tags": [],
                             "version": 1,
@@ -1104,6 +1113,332 @@ class TestSubagentHandlers:
         assert result["steps"][0]["subagent_return"]["answer"] == "summary"
         assert result["steps"][0]["tool_calls"] == []
 
+    def test_run_subagent_usage_counts_in_scoped_totals_and_trace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return the answer.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _UsageSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                return _response(
+                    _fc_part(
+                        "subagent_return",
+                        {
+                            "reasoning": "done",
+                            "answer": "summary",
+                            "status": "success",
+                        },
+                    )
+                )
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return {
+                    "prompt": 100,
+                    "output": 20,
+                    "thoughts": 5,
+                    "total": 125,
+                    "cached": 0,
+                }
+
+        monkeypatch.setattr(harness_module, "VLM", _UsageSubVLM)
+        frame = _make_frame([1])
+        agent.frames = [frame]
+        agent._current_latest_frame = frame
+        agent._current_images = []
+        agent._current_outer_round = 7
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        assert record.result["success"] is True
+        assert agent.total_calls == 1
+        assert agent.total_tokens == 125
+        assert agent.usage_by_scope["subagent"]["calls"] == 1
+        assert agent.usage_by_scope["subagent"]["total_tokens"] == 125
+        assert agent.usage_by_scope["subagent"]["priced_calls"] == 1
+
+        trace_rows = [
+            json.loads(line)
+            for line in (tmp_path / "run.trace.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        assert trace_rows[-1]["tools_exposed"] == "subagent"
+        assert trace_rows[-1]["usage_scope"] == "subagent"
+        assert trace_rows[-1]["usage_accounted"] is True
+        assert trace_rows[-1]["usage"]["total"] == 125
+        assert trace_rows[-1]["usage_cost"]["current_usd"] > 0
+
+    def test_run_subagent_images_match_prompt_rendered_grids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return text only.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _CapturingSubVLM:
+            instances: list["_CapturingSubVLM"] = []
+
+            def __init__(self, *_: Any, **__: Any) -> None:
+                self.calls: list[tuple[Any, str]] = []
+                self.instances.append(self)
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                self.calls.append((payload, prompt))
+                return _response(
+                    SimpleNamespace(text="concise summary", function_call=None)
+                )
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _CapturingSubVLM)
+        agent._current_latest_frame = FrameData(
+            game_id="orch-test",
+            frame=[
+                [[0, 0], [0, 0]],
+                [[9, 0], [0, 0]],
+                [[9, 9], [0, 0]],
+                [[0, 0], [0, 0]],
+            ],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            win_levels=1,
+            action_input=ActionInput(),
+            available_actions=[1],
+        )
+        agent._current_images = []
+        agent._current_outer_round = 1
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        assert record.result["success"] is True
+        payload, prompt = _CapturingSubVLM.instances[0].calls[0]
+        assert isinstance(payload, list)
+        assert len(payload) == 3
+        assert [img.size for img in payload] == [(2, 2), (2, 2), (2, 2)]
+        assert "current grid (latest_frame.frame[-1]):" in prompt
+        assert "SELECTED TRANSIENT KEYFRAMES: frame indices [1, 2]" in prompt
+
+        trace_rows = [
+            json.loads(line)
+            for line in (tmp_path / "run.trace.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        image_rows = trace_rows[-1]["input"]["images"]
+        assert trace_rows[-1]["input"]["images_attached_count"] == 3
+        assert [row["label"] for row in image_rows] == [
+            "current_state_frame",
+            "current_frame_transient_1",
+            "current_frame_transient_2",
+        ]
+
+    def test_one_step_subagent_auto_returns_text_response(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return text only.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _TextSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                return _response(
+                    SimpleNamespace(text="concise summary", function_call=None)
+                )
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _TextSubVLM)
+        agent._current_latest_frame = _make_frame([1])
+        agent._current_images = []
+        agent._current_outer_round = 1
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        result = record.result
+        assert result["success"] is True
+        assert result["error"] is None
+        assert result["result"]["answer"] == "concise summary"
+        assert result["result"]["reasoning"] == "one_step auto-return"
+
+    def test_one_step_subagent_preserves_vlm_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "subagents.json").write_text(
+            json.dumps(
+                {
+                    "next_id": 2,
+                    "entries": [
+                        {
+                            "id": "subagent_001",
+                            "game_id": "orch-test",
+                            "name": "summarizer",
+                            "description": "Summarize.",
+                            "system_instructions": "Return text only.",
+                            "handler_type": "one_step",
+                            "max_turns": 1,
+                            "allowed_tools": [],
+                            "tags": [],
+                            "version": 1,
+                            "created_at": "",
+                            "updated_at": "",
+                        }
+                    ],
+                }
+            )
+        )
+        agent = _make_agent(tmp_path, monkeypatch)
+
+        class _FailingSubVLM:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+            def set_tools(self, tools: list[dict[str, Any]] | None) -> None:
+                return None
+
+            def get_query(
+                self, payload: Any, prompt: str, module_name: str = "x"
+            ) -> Any:
+                raise RuntimeError("quota exhausted")
+
+            def extract_usage(self, response: Any) -> dict[str, int | None] | None:
+                return None
+
+        monkeypatch.setattr(harness_module, "VLM", _FailingSubVLM)
+        agent._current_latest_frame = _make_frame([1])
+        agent._current_images = []
+        agent._current_outer_round = 1
+
+        record = agent.tool_router.execute(
+            FunctionCall(
+                "run_subagent",
+                {
+                    "reasoning": "ask helper",
+                    "id": "subagent_001",
+                    "task": "summarize",
+                },
+            )
+        )
+
+        result = record.result
+        assert result["success"] is False
+        assert result["result"] is None
+        assert "quota exhausted" in result["error"]
+        assert result["steps"][0]["error"] == result["error"]
+
     def test_run_subagent_forces_failure_return_on_max_rounds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1117,7 +1452,9 @@ class TestSubagentHandlers:
                             "game_id": "orch-test",
                             "name": "looper",
                             "description": "Loops.",
-                            "instructions": "Keep using tools.",
+                            "system_instructions": "Keep using tools.",
+                            "handler_type": "looping",
+                            "max_turns": 2,
                             "allowed_tools": ["get_recent_trajectory"],
                             "tags": [],
                             "version": 1,
@@ -1129,7 +1466,6 @@ class TestSubagentHandlers:
             )
         )
         agent = _make_agent(tmp_path, monkeypatch)
-        monkeypatch.setattr(agent, "MAX_SUBAGENT_ROUNDS_PER_CALL", 2)
 
         class _LoopingSubVLM:
             def __init__(self, *_: Any, **__: Any) -> None:

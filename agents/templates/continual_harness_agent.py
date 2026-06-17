@@ -4,7 +4,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
@@ -18,9 +18,13 @@ from .continual_harness.context import (
     build_subagent_prompt,
     build_working_prompt,
     current_state_rendered_grid,
+    format_tool_record_md,
+    subagent_current_frame_rendered_grids,
 )
+from .continual_harness.harness_evolver import HarnessEvolver
 from .continual_harness.helpers import (
     available_game_actions,
+    frame_to_hex,
     frame_to_images,
     grid_to_image,
     validate_action_sequence,
@@ -28,7 +32,6 @@ from .continual_harness.helpers import (
 from .continual_harness.memory import (
     MemoryStore,
     active_memory_path,
-    format_memory_full,
     format_memory_overview,
 )
 from .continual_harness.models import (
@@ -36,20 +39,10 @@ from .continual_harness.models import (
     RenderedGrid,
     StepRecord,
     ToolCallRecord,
-)
-from .continual_harness.prompt_evolution import (
-    PromptEvolutionRecord,
-    PromptEvolutionStore,
-    PromptFile,
-    active_prompt_evolution_path,
-    active_prompt_path,
-    build_evolution_prompt,
-    now_iso,
-    validate_evolved_prompt,
+    ToolEvidenceRecord,
 )
 from .continual_harness.prompts import (
     BASE_ORCHESTRATOR_POLICY,
-    EVOLUTION_SYSTEM_INSTRUCTION,
     HARNESS_SYSTEM_INSTRUCTION,
 )
 from .continual_harness.sandbox import SandboxState, run_python_snippet
@@ -88,12 +81,25 @@ from .continual_harness.trace import (
 from .continual_harness.trajectory import (
     TrajectoryStore,
     default_trajectory_path,
-    format_compact_history,
-    format_full_history,
+    # format_full_history,  # removed with get_recent_trajectory (still used by prompt_evolution)
+    hexify_record_colors,
+    render_recent_history,
+    summarize_grid_transitions,
 )
-from .utils.vlm_backend import VLM
+from .utils.vlm_backend import VLM, estimate_vlm_usage_cost, usage_token_count
 
 logger = logging.getLogger(__name__)
+
+
+def _float_env(name: str, default: float) -> float:
+    """Read a float env var, falling back to ``default`` on unset/blank/invalid."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def _compute_grid_delta(
@@ -152,21 +158,90 @@ def _format_action_list(specs: Any) -> str:
     return "[" + ",".join(parts) + "]"
 
 
+def _cost_log_suffix(cost: dict[str, Any] | None) -> str:
+    if not cost:
+        return ""
+    return (
+        f" cost=${float(cost['current_usd']):.6f}"
+        f" cum_cost=${float(cost['cumulative_usd']):.6f}"
+    )
+
+
+def _tool_result_pairs(
+    records: list[ToolCallRecord],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Map tool-call records to (name, response) pairs for a function-response turn.
+
+    Each non-action tool record becomes one Gemini function_response part whose
+    ``output`` is the markdown rendering (JSON fields + fenced code/text), so the
+    model reads code print-style rather than as a ``\\n``-escaped JSON string.
+    """
+    return [(r.name, {"output": format_tool_record_md(r)}) for r in records]
+
+
 def _safe_frame_dump(frame: FrameData) -> dict[str, Any]:
     """JSON-safe dump of a FrameData for return to a sandboxed skill.
+
+    The `frame` field is hex-rendered (list[list[str]]) so a skill reading
+    `tools.take_actions(...).last_frame.frame` sees the same representation as
+    `state.latest_frame.frame` and the working prompt. int→hex boundary.
 
     Falls back to a hand-built dict if model_dump fails (defensive — same
     pattern used when building the sandbox state at the top of an iter).
     """
     try:
-        return frame.model_dump(mode="json")
+        dump = frame.model_dump(mode="json")
     except (AttributeError, TypeError):
-        return {
+        dump = {
             "state": frame.state.name,
             "score": frame.levels_completed,
             "frame": frame.frame,
             "available_actions": list(frame.available_actions),
         }
+    dump["frame"] = frame_to_hex(dump.get("frame"))
+    return dump
+
+
+def _build_sandbox_observations(
+    pending: list[PendingActionObservation],
+    frames: list[FrameData],
+) -> list[dict[str, Any]]:
+    """One hex entry per action since the last VLM query (mirrors OBSERVATIONS).
+
+    Each entry is ``{step, action, source, state, score, frame}`` where ``frame``
+    is the FULL hex animation stack (``list[list[str]]``) for that action —
+    richer than the prompt's subsampled keyframes. int→hex boundary.
+    """
+    out: list[dict[str, Any]] = []
+    n = len(frames)
+    for obs in pending:
+        idx = obs.post_frame_index
+        if not (0 <= idx < n):
+            continue
+        post = frames[idx]
+        data = obs.action_data or {}
+        if "x" in data and "y" in data:
+            label = f"{obs.action_name}(x={data['x']}, y={data['y']})"
+        elif data:
+            label = (
+                obs.action_name
+                + "("
+                + ", ".join(f"{k}={v}" for k, v in data.items())
+                + ")"
+            )
+        else:
+            label = obs.action_name
+        out.append(
+            {
+                "step": obs.action_counter,
+                "action": label,
+                "source": obs.source,
+                "state": post.state.name,
+                "score": post.levels_completed,
+                "frame": frame_to_hex(post.frame),
+            }
+        )
+    return out
 
 
 def _optional_str_list_arg(args: dict[str, Any], key: str) -> list[str] | None:
@@ -187,11 +262,12 @@ class ContinualHarness(Agent):
       1. If state is NOT_PLAYED, emit RESET and continue. If state is
          GAME_OVER, evolve the base prompt once for that terminal state, then
          emit RESET and continue.
-      2. Maybe evolve the system prompt (boundary-gated by action_counter).
-      3. Make ONE VLM call via `_vlm_loop_inner`. The response may contain
+      2. Make ONE VLM call via `_vlm_loop_inner`. The response may contain
          analysis tool calls (process_memory, run_skill, etc.) and/or one
          `take_actions(actions=[...])` call. All are dispatched in emission
          order. take_actions executes its action list synchronously.
+      3. If the action result advances a level, evolve immediately. Otherwise,
+         evolve after the configured frequency with no score/level progress.
       4. If any actions were executed (orchestrator OR via a skill's inline
          tools.take_actions RPC), clear the carried tool-result block.
          Otherwise carry results forward to the next iteration's prompt
@@ -202,21 +278,26 @@ class ContinualHarness(Agent):
     """
 
     MAX_ACTIONS = 5000
+    MAX_COST_USD = 100.0  # cumulative VLM-cost ceiling (USD); 0 disables
+    MIN_LEVEL_SCORE = 4.0  # abandon current level when best-case score < this; 0 disables
+    MIN_LEVEL_ACTIONS = 100  # don't apply the efficiency stop before this many actions on a level
     MODEL = "gemini-3.1-pro-preview"  # default; override via GEMINI_MODEL
     HISTORY_MAX_CHARS = 12000  # budget for the RECENT HISTORY block
     HISTORY_BATCH_WINDOW = 5  # last N batches shown in compact history
     FULL_HISTORY_DEFAULT_LIMIT = 40
     FULL_HISTORY_MAX_LIMIT = 80
     MAX_SUBAGENT_CALLS_PER_STEP = 1  # distinct run_subagent invocations per outer step
-    MAX_SUBAGENT_ROUNDS_PER_CALL = 20  # inner VLM rounds per invocation
+    MAX_SUBAGENT_ROUNDS_CEILING = 50  # hard cap on inner VLM rounds (runaway protection)
     SUBAGENT_HISTORY_WINDOW = 20  # rows of compact history fed into a subagent's prompt
     RECENT_RESULTS_CAP = 16  # how many tool-result records to carry forward
+    TOOL_EVIDENCE_CAP = 512  # non-action tool records retained for evolution windows
+    MAX_CONVERSATION_TURNS = 24  # max tool-only VLM turns per decision before forcing a break
+    CONVERSATION_CONTEXT_GUARD_RATIO = 0.80
     SKILL_TIMEOUT_S = 30.0  # wall-clock cap per run_skill (engine RPCs add latency)
-    # Prompt-evolution defaults; the actual frequency is read from
-    # CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
-    # --prompt-evolve-frequency). 0 disables; positive N means every N actions.
-    DEFAULT_PROMPT_EVOLVE_FREQUENCY = 75
-    PROMPT_EVOLVE_FREQUENCY_ENV = "CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY"
+    # Prompt/skill/subagent/memory evolution is owned by HarnessEvolver, which
+    # reads CONTINUAL_HARNESS_PROMPT_EVOLVE_FREQUENCY (set by main.py from
+    # --prompt-evolve-frequency; 0 disables all evolution) and holds the
+    # stagnation thresholds.
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Must resolve model_name BEFORE super().__init__(): Agent.__init__
@@ -226,34 +307,19 @@ class ContinualHarness(Agent):
 
         # Three-layer prompt architecture:
         # 1. _system_instruction: fixed, never evolved (tool schemas, game context)
-        # 2. _current_base_prompt: evolved strategic guidance (rules, strategy)
+        # 2. base orchestrator policy: evolved strategic guidance — owned by the
+        #    HarnessEvolver (read via get_current_prompt()), constructed below
+        #    once the memory/skill/subagent/trajectory stores exist.
         # 3. Per-step user prompt: game state, history, tool results
-        freq_raw = os.getenv(
-            self.PROMPT_EVOLVE_FREQUENCY_ENV,
-            str(self.DEFAULT_PROMPT_EVOLVE_FREQUENCY),
-        )
-        try:
-            self._prompt_evolve_frequency = max(0, int(freq_raw))
-        except ValueError:
-            self._prompt_evolve_frequency = self.DEFAULT_PROMPT_EVOLVE_FREQUENCY
 
         # Fixed system instruction — NEVER evolved. {game_name} substituted here.
         self._system_instruction: str = HARNESS_SYSTEM_INSTRUCTION.replace(
             "{game_name}", self.game_id
         )
 
-        # Evolvable base prompt — strategic guidance, rule discoveries. Stored
-        # per-game so parallel games evolve independent prompts.
-        self._base_prompt_file = PromptFile(
-            active_prompt_path(self.game_id), baseline=BASE_ORCHESTRATOR_POLICY
-        )
-        self._current_base_prompt: str = self._base_prompt_file.read()
-        self._prompt_generation: int = 0
-        self._last_evolution_step: int = -1
-        self._last_game_over_evolution_step: int = -1
-        self.prompt_evolution = PromptEvolutionStore(
-            active_prompt_evolution_path(self.game_id)
-        )
+        # Action at which score/level last advanced; updated inline on progress
+        # and read by the evolver's stagnation trigger.
+        self._last_progress_step: int = 0
 
         self.vlm = VLM(
             self.model_name,
@@ -265,19 +331,22 @@ class ContinualHarness(Agent):
         self.trace = TraceWriter(default_trace_path(self.game_id))
         self.trajectory = TrajectoryStore(default_trajectory_path(self.game_id))
 
-        def _handle_get_recent_trajectory(args: dict[str, Any]) -> dict[str, Any]:
-            try:
-                limit = int(args.get("limit", self.FULL_HISTORY_DEFAULT_LIMIT))
-            except (TypeError, ValueError):
-                limit = self.FULL_HISTORY_DEFAULT_LIMIT
-            limit = max(1, min(self.FULL_HISTORY_MAX_LIMIT, limit))
-            records = self.trajectory.tail(limit)
-            return {
-                "success": True,
-                "limit": limit,
-                "count": len(records),
-                "history": format_full_history(records),
-            }
+        # --- COMMENTED OUT: get_recent_trajectory removed (superseded by the
+        # always-in-prompt RECENT HISTORY block). format_full_history stays in
+        # trajectory.py for prompt_evolution. ---
+        # def _handle_get_recent_trajectory(args: dict[str, Any]) -> dict[str, Any]:
+        #     try:
+        #         limit = int(args.get("limit", self.FULL_HISTORY_DEFAULT_LIMIT))
+        #     except (TypeError, ValueError):
+        #         limit = self.FULL_HISTORY_DEFAULT_LIMIT
+        #     limit = max(1, min(self.FULL_HISTORY_MAX_LIMIT, limit))
+        #     records = self.trajectory.tail(limit)
+        #     return {
+        #         "success": True,
+        #         "limit": limit,
+        #         "count": len(records),
+        #         "history": format_full_history(records),
+        #     }
 
         # Memory is always available, backed per-game at
         # logs/<run_id>/<game_id>/memory.json (seeded from --bootstrap when a
@@ -293,13 +362,19 @@ class ContinualHarness(Agent):
                     title = args.get("title") or ""
                     body = args.get("body") or ""
                     tags = list(args.get("tags") or [])
-                    entry = self.memory.add(title=title, body=body, tags=tags)
+                    entry = self.memory.add(
+                        title=title,
+                        body=body,
+                        tags=tags,
+                        confidence=args.get("confidence"),
+                    )
                     return {
                         "success": True,
                         "operation": "add",
                         "id": entry.id,
                         "title": entry.title,
                         "tags": entry.tags,
+                        "confidence": entry.confidence,
                     }
                 if op == "delete":
                     entry_id = args.get("id") or ""
@@ -332,6 +407,7 @@ class ContinualHarness(Agent):
                         title=args.get("title"),
                         body=args.get("body"),
                         tags=list(args["tags"]) if "tags" in args else None,
+                        confidence=args.get("confidence"),
                     )
                     if edited is None:
                         return {
@@ -344,6 +420,7 @@ class ContinualHarness(Agent):
                         "success": True,
                         "operation": "edit",
                         "id": entry_id,
+                        "confidence": edited.confidence,
                         "updated_at": edited.updated_at,
                     }
                 if op == "search":
@@ -492,6 +569,7 @@ class ContinualHarness(Agent):
                     "id": skill_id,
                     "error": f"no skill with id-or-name={skill_id}",
                 }
+            self._refresh_current_sandbox_stores()
             state = self._current_sandbox_state or SandboxState()
 
             # Per-skill sandbox bookkeeping. The on_rpc callback (self._sandbox_rpc)
@@ -517,6 +595,9 @@ class ContinualHarness(Agent):
             out["id"] = skill_id
             out["name"] = skill.name
             out["version"] = skill.version
+            # Echo the executed source so the result renders a ```python section
+            # (helps the model edit-then-rerun a failing skill without a search).
+            out["code"] = skill.code
             out["actions_taken_inline"] = self.action_counter - actions_before
             return out
 
@@ -535,18 +616,19 @@ class ContinualHarness(Agent):
             active_subagent_path(self.game_id), game_id=self.game_id
         )
 
-        # Per-iteration state used by _handle_run_subagent. Set at the top of
-        # every _vlm_loop_inner call so any subagent invocation in that
-        # iteration sees the live frame, images, and VLM-call counter, and
-        # shares a single per-iteration call counter.
+        # Per-iteration state used by _handle_run_subagent and skills. Set at
+        # the top of every _vlm_loop_inner call so tool handlers see the live
+        # frame, full frame images for sandbox state, and VLM-call counter.
         self._current_latest_frame: FrameData | None = None
         self._current_images: list[Any] = []
         self._current_outer_round: int = 0
         self._subagent_call_count: int = 0
 
         # Cross-iteration state for the new VLM-call-driven loop.
-        # `_recent_tool_results` carries forward analysis-tool outputs from one
-        # outer iteration to the next (PokeAgent-style — cleared on action).
+        # `_recent_tool_results` carries the previous conversation's analysis-tool
+        # outputs into the next decision's prompt (older ones as a recap line,
+        # the newest in full — see format_tool_results_markdown).
+        # `_tool_evidence` keeps a longer window for harness evolution prompts.
         # `_pending_observations` carries action transition/result frames from
         # executed actions into the next successful orchestrator VLM prompt.
         # `_consecutive_vlm_errors` is bookkeeping for hard failure detection.
@@ -555,12 +637,17 @@ class ContinualHarness(Agent):
         # `_batch_counter` mints unique batch IDs for tagging trajectory rows.
         # `_vlm_call_count` is a monotonic counter set on `_current_outer_round`.
         self._recent_tool_results: list[ToolCallRecord] = []
+        self._tool_evidence: list[ToolEvidenceRecord] = []
         self._pending_observations: list[PendingActionObservation] = []
         self._consecutive_vlm_errors: int = 0
         self._sandbox_terminal_seen: bool = False
         self._sandbox_skill_id: str | None = None
         self._batch_counter: int = 0
         self._vlm_call_count: int = 0
+        # `_conversation_count` increments once per decision (one `_vlm_loop_inner`
+        # call), grouping the multi-turn conversation's per-VLM-call trace records.
+        self._conversation_count: int = 0
+        self._previous_no_action_reason: str | None = None
 
         def _handle_process_subagent(args: dict[str, Any]) -> dict[str, Any]:
             op = (args.get("operation") or "").strip().lower()
@@ -568,21 +655,32 @@ class ContinualHarness(Agent):
                 if op == "add":
                     name = args.get("name") or ""
                     description = args.get("description") or ""
-                    instructions = args.get("instructions") or ""
+                    system_instructions = args.get("system_instructions") or ""
                     allowed_tools = _optional_str_list_arg(args, "allowed_tools")
                     tags = _optional_str_list_arg(args, "tags") or []
+                    add_kwargs: dict[str, Any] = {
+                        "directive": args.get("directive") or "",
+                        "return_condition": args.get("return_condition") or "",
+                    }
+                    if args.get("handler_type"):
+                        add_kwargs["handler_type"] = args["handler_type"]
+                    if args.get("max_turns") is not None:
+                        add_kwargs["max_turns"] = args["max_turns"]
                     entry = self.subagents.add(
                         name=name,
                         description=description,
-                        instructions=instructions,
+                        system_instructions=system_instructions,
                         allowed_tools=allowed_tools,
                         tags=tags,
+                        **add_kwargs,
                     )
                     return {
                         "success": True,
                         "operation": "add",
                         "id": entry.id,
                         "name": entry.name,
+                        "handler_type": entry.handler_type,
+                        "max_turns": entry.max_turns,
                         "allowed_tools": entry.allowed_tools,
                         "tags": entry.tags,
                     }
@@ -616,7 +714,11 @@ class ContinualHarness(Agent):
                         sub_id,
                         name=args.get("name"),
                         description=args.get("description"),
-                        instructions=args.get("instructions"),
+                        system_instructions=args.get("system_instructions"),
+                        directive=args.get("directive"),
+                        return_condition=args.get("return_condition"),
+                        handler_type=args.get("handler_type"),
+                        max_turns=args.get("max_turns"),
                         allowed_tools=_optional_str_list_arg(args, "allowed_tools"),
                         tags=_optional_str_list_arg(args, "tags"),
                     )
@@ -677,24 +779,42 @@ class ContinualHarness(Agent):
                     "error": "run_subagent invoked before choose_action stash; refusing",
                 }
 
-            task = str(args.get("task") or "")
+            directive = (str(args.get("task") or "").strip()) or entry.directive
+            if not directive.strip():
+                return {
+                    "success": False,
+                    "id": sub_id,
+                    "error": (
+                        "run_subagent requires a task, or the subagent must have a "
+                        "stored directive"
+                    ),
+                }
             raw_context = args.get("context") or {}
             context = dict(raw_context) if isinstance(raw_context, dict) else {}
+
+            # one_step runs a single analysis turn; looping runs a bounded action
+            # loop, clamped to the runaway ceiling.
+            inner_rounds = (
+                1
+                if entry.handler_type == "one_step"
+                else max(1, min(entry.max_turns, self.MAX_SUBAGENT_ROUNDS_CEILING))
+            )
 
             tools = build_subagent_tools(entry.allowed_tools)
             sub_vlm = VLM(
                 self.model_name,
                 backend="gemini",
-                system_instruction=entry.instructions,
+                system_instruction=entry.system_instructions,
             )
             sub_vlm.set_tools(tools)
 
-            history = format_compact_history(
-                self.trajectory.tail(self.SUBAGENT_HISTORY_WINDOW),
+            history = render_recent_history(
+                self.trajectory.tail(self.MAX_ACTIONS + 1),
                 max_chars=self.HISTORY_MAX_CHARS,
             )
             base_prompt = build_subagent_prompt(
-                task=task,
+                directive=directive,
+                return_condition=entry.return_condition,
                 context=context,
                 latest_frame=self._current_latest_frame,
                 memory_overview=format_memory_overview(self.memory.all_entries()),
@@ -702,7 +822,10 @@ class ContinualHarness(Agent):
                 compact_history=history,
             )
             working_prompt = base_prompt
-            images = self._current_images
+            rendered_grids = subagent_current_frame_rendered_grids(
+                self._current_latest_frame
+            )
+            images = [grid_to_image(item.grid) for item in rendered_grids]
             payload: Any = (
                 images if len(images) > 1 else (images[0] if images else None)
             )
@@ -715,8 +838,10 @@ class ContinualHarness(Agent):
             forced_return = False
             inner_round = 0
             total_subagent_actions = 0
+            last_output: dict[str, Any] = {}
+            completed_response = False
 
-            for inner_round in range(1, self.MAX_SUBAGENT_ROUNDS_PER_CALL + 1):
+            for inner_round in range(1, inner_rounds + 1):
                 round_records: list[ToolCallRecord] = []
                 output: dict[str, Any] = {}
                 usage: dict[str, int | None] | None = None
@@ -731,6 +856,8 @@ class ContinualHarness(Agent):
                         module_name=f"{self.name}.subagent.{entry.name}",
                     )
                     output = serialize_response(response)
+                    last_output = output
+                    completed_response = True
                     usage = sub_vlm.extract_usage(response)
                     fcs = extract_function_calls(response)
 
@@ -793,10 +920,11 @@ class ContinualHarness(Agent):
                         "Subagent %s inner round %d/%d failed: %s",
                         entry.name,
                         inner_round,
-                        self.MAX_SUBAGENT_ROUNDS_PER_CALL,
+                        inner_rounds,
                         exc,
                     )
                 finally:
+                    usage_cost = self._record_vlm_usage(usage, scope="subagent")
                     self.trace.write(
                         {
                             "agent": self.name,
@@ -809,24 +937,31 @@ class ContinualHarness(Agent):
                                 "id": entry.id,
                                 "name": entry.name,
                                 "version": entry.version,
+                                "handler_type": entry.handler_type,
                                 "inner_round": inner_round,
-                                "max_inner_rounds": self.MAX_SUBAGENT_ROUNDS_PER_CALL,
+                                "max_inner_rounds": inner_rounds,
                             },
                             "input": {
-                                "system_instruction": entry.instructions,
+                                "system_instruction": entry.system_instructions,
                                 "user_prompt": working_prompt,
                                 "tools": tools,
                                 "images": [
                                     {
-                                        "width": img.width,
-                                        "height": img.height,
-                                        "mode": img.mode,
+                                        "label": item.label,
+                                        "width": len(item.grid[0])
+                                        if item.grid
+                                        else 0,
+                                        "height": len(item.grid),
                                     }
-                                    for img in images
+                                    for item in rendered_grids
                                 ],
+                                "images_attached_count": len(rendered_grids),
                             },
                             "output": output,
                             "usage": usage,
+                            "usage_scope": "subagent",
+                            "usage_accounted": usage is not None,
+                            "usage_cost": usage_cost,
                             "chosen_action": None,
                             "reasoning": None,
                             "tool_calls": [asdict(r) for r in round_records],
@@ -835,10 +970,20 @@ class ContinualHarness(Agent):
                         }
                     )
                     if usage is not None:
-                        self.total_calls += 1
-                        self.total_prompt_tokens += int(usage.get("prompt") or 0)
-                        self.total_output_tokens += int(usage.get("output") or 0)
-                        self.total_tokens += int(usage.get("total") or 0)
+                        logger.info(
+                            "[%s] subagent=%s inner=%d/%d tokens=%d actions=%d "
+                            "tools=%d return=%s error=%s%s",
+                            self.game_id,
+                            entry.name,
+                            inner_round,
+                            inner_rounds,
+                            usage_token_count(usage, "total"),
+                            round_actions,
+                            len(round_records),
+                            ret_call_args is not None,
+                            round_error,
+                            _cost_log_suffix(usage_cost),
+                        )
 
                 total_subagent_actions += round_actions
                 round_step = {
@@ -860,6 +1005,8 @@ class ContinualHarness(Agent):
                 if round_error is not None:
                     break
                 if not round_records:
+                    if entry.handler_type == "one_step":
+                        break
                     last_error = "subagent produced no tool calls and did not return"
                     break
 
@@ -867,18 +1014,20 @@ class ContinualHarness(Agent):
                     latest = self.frames[-1]
                     self._current_latest_frame = latest
                     self._current_images = list(frame_to_images(latest))
-                    images = self._current_images
+                    rendered_grids = subagent_current_frame_rendered_grids(latest)
+                    images = [grid_to_image(item.grid) for item in rendered_grids]
                     payload = (
                         images
                         if len(images) > 1
                         else (images[0] if images else None)
                     )
-                    history = format_compact_history(
-                        self.trajectory.tail(self.SUBAGENT_HISTORY_WINDOW),
+                    history = render_recent_history(
+                        self.trajectory.tail(self.MAX_ACTIONS + 1),
                         max_chars=self.HISTORY_MAX_CHARS,
                     )
                     base_prompt = build_subagent_prompt(
-                        task=task,
+                        directive=directive,
+                        return_condition=entry.return_condition,
                         context=context,
                         latest_frame=latest,
                         memory_overview=format_memory_overview(
@@ -896,19 +1045,38 @@ class ContinualHarness(Agent):
 
             if (
                 final_answer is None
+                and entry.handler_type == "one_step"
                 and last_error is None
-                and inner_round >= self.MAX_SUBAGENT_ROUNDS_PER_CALL
+                and completed_response
+            ):
+                # one_step subagents are read-only analysers: they either call
+                # subagent_return or simply produce a text analysis. Either way,
+                # surface their output as a successful return rather than treating
+                # the absence of subagent_return as a failure.
+                answer_text = (
+                    str(last_output.get("text") or "").strip()
+                    or "(one_step subagent produced no analysis)"
+                )
+                final_answer = {
+                    "answer": answer_text,
+                    "status": "success",
+                    "reasoning": "one_step auto-return",
+                }
+            elif (
+                final_answer is None
+                and last_error is None
+                and inner_round >= inner_rounds
             ):
                 warning = (
                     f"subagent exhausted max inner rounds "
-                    f"({self.MAX_SUBAGENT_ROUNDS_PER_CALL}) without "
+                    f"({inner_rounds}) without "
                     f"subagent_return; forcing return to orchestrator"
                 )
                 logger.warning(
                     "Subagent %s exhausted max inner rounds (%d) without "
                     "subagent_return; forcing return to orchestrator",
                     entry.name,
-                    self.MAX_SUBAGENT_ROUNDS_PER_CALL,
+                    inner_rounds,
                 )
                 last_error = warning
                 forced_return = True
@@ -937,7 +1105,7 @@ class ContinualHarness(Agent):
             }
 
         handlers: dict[str, Any] = {
-            "get_recent_trajectory": _handle_get_recent_trajectory,
+            # "get_recent_trajectory": _handle_get_recent_trajectory,  # removed
             "process_memory": _handle_process_memory,
             "process_skill": _handle_process_skill,
             "run_skill": _handle_run_skill,
@@ -964,19 +1132,72 @@ class ContinualHarness(Agent):
             self.subagents.path,
             len(self.subagents.all_entries()),
         )
-        logger.info(
-            "[%s] Prompt evolution: frequency=%d, baseline at %s, log at %s",
-            self.name,
-            self._prompt_evolve_frequency,
-            self._base_prompt_file.path,
-            self.prompt_evolution.path,
-        )
-
         # Cumulative token usage; logged once on cleanup().
         self.total_calls = 0
         self.total_prompt_tokens = 0
         self.total_output_tokens = 0
         self.total_tokens = 0
+        self.total_vlm_cost_usd = 0.0
+        self.total_priced_calls = 0
+        self.usage_by_scope: dict[str, dict[str, Any]] = {}
+
+        # Stop conditions beyond MAX_ACTIONS (env-overridable).
+        self.max_cost_usd = _float_env(
+            "CONTINUAL_HARNESS_MAX_COST_USD", self.MAX_COST_USD
+        )
+        self.min_level_score = _float_env(
+            "CONTINUAL_HARNESS_MIN_LEVEL_SCORE", self.MIN_LEVEL_SCORE
+        )
+        self.min_level_actions = int(
+            _float_env("CONTINUAL_HARNESS_MIN_LEVEL_ACTIONS", self.MIN_LEVEL_ACTIONS)
+        )
+        # action_counter at which the CURRENT level began; updated on any level
+        # change (progress, or post-GAME_OVER reset). Drives the per-level
+        # efficiency stop via actions_this_level = action_counter - this.
+        self._level_start_action: int = 0
+        # Per-level human baseline action counts (one per level), used to judge
+        # whether the current level can still meaningfully score. Reachable live
+        # off the env wrapper; falls back to None (efficiency stop then no-ops).
+        try:
+            self._baseline_actions: list[int] | None = self.arc_env.info.baseline_actions
+        except Exception:
+            self._baseline_actions = None
+        logger.info(
+            "[%s] Stop conditions: MAX_ACTIONS=%d max_cost=$%.2f min_level_score=%.2f "
+            "min_level_actions=%d baseline_actions=%s",
+            self.name,
+            self.MAX_ACTIONS,
+            self.max_cost_usd,
+            self.min_level_score,
+            self.min_level_actions,
+            self._baseline_actions,
+        )
+
+        # All evolution state (base prompt file, evolution log, generation
+        # counters) lives in the evolver; it shares the stores built above so
+        # inline orchestrator edits and meta-level edits hit the same files.
+        self.harness_evolver = HarnessEvolver(
+            model_name=self.model_name,
+            system_instruction=self._system_instruction,
+            game_id=self.game_id,
+            agent_name=self.name,
+            memory=self.memory,
+            skills=self.skills,
+            subagents=self.subagents,
+            trajectory=self.trajectory,
+            trace=self.trace,
+            record_usage=lambda usage: self._record_vlm_usage(
+                usage, scope="harness_evolution"
+            ),
+            baseline_prompt=BASE_ORCHESTRATOR_POLICY,
+        )
+        logger.info(
+            "[%s] Harness evolution: stagnation_after=%d, base prompt at %s, log at %s",
+            self.name,
+            self.harness_evolver.stagnation_after,
+            self.harness_evolver.base_prompt_path,
+            self.harness_evolver.evolution_log_path,
+        )
 
     @property
     def name(self) -> str:
@@ -1004,153 +1225,6 @@ class ContinualHarness(Agent):
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return latest_frame.state is GameState.WIN
 
-    @staticmethod
-    def _extract_text(response: Any) -> str:
-        """Extract plain text from a Gemini response or string.
-
-        When no tools are set, the VLM backend returns a plain string. When
-        tools are set, it returns a response object with candidates/parts.
-        Handles preamble text before markdown fences.
-        """
-        import re
-        if isinstance(response, str):
-            text = response.strip()
-        else:
-            text = ""
-            for cand in getattr(response, "candidates", None) or []:
-                for part in getattr(getattr(cand, "content", None), "parts", []) or []:
-                    t = getattr(part, "text", None)
-                    if t:
-                        text += t
-            text = text.strip()
-        m = re.search(r"```(?:markdown)?\s*\n(.*?)```", text, re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        return text
-
-    def _evolve_system_prompt(self, latest_frame: FrameData) -> None:
-        """One meta-VLM call that may rewrite the agent's base prompt.
-
-        Spawns a fresh VLM with EVOLUTION_SYSTEM_INSTRUCTION. The model returns
-        the improved prompt as plain text. Accepted only if
-        `validate_evolved_prompt` returns ok=True; on accept, the new text is
-        written through `self._base_prompt_file`. Every attempt is logged.
-        """
-        self._prompt_generation += 1
-        gen = self._prompt_generation
-        previous = self._current_base_prompt
-
-        steps_since = max(1, self.action_counter - max(self._last_evolution_step, 0))
-        trajectory_rows = self.trajectory.tail(steps_since)
-        user_prompt = build_evolution_prompt(
-            system_prompt=self._system_instruction,
-            current_base_prompt=previous,
-            trajectory_rows=trajectory_rows,
-            memory_overview=format_memory_full(self.memory.all_entries()),
-            skill_overview=format_skill_overview(self.skills.all_entries()),
-            subagent_overview=format_subagent_overview(self.subagents.all_entries()),
-        )
-
-        evolution_system = EVOLUTION_SYSTEM_INSTRUCTION.replace(
-            "{game_name}", self.game_id
-        )
-        meta_vlm = VLM(
-            self.model_name,
-            backend="gemini",
-            system_instruction=evolution_system,
-        )
-
-        images = list(frame_to_images(latest_frame))
-        payload: Any = images if len(images) > 1 else (images[0] if images else None)
-
-        proposed = ""
-        accepted = False
-        validation_error: str | None = None
-        usage: dict[str, int | None] | None = None
-        output: dict[str, Any] = {}
-        error: str | None = None
-
-        try:
-            response = meta_vlm.get_query(
-                payload,
-                user_prompt,
-                module_name=f"{self.name}.evolve.{gen}",
-            )
-            output = serialize_response(response)
-            usage = meta_vlm.extract_usage(response)
-            proposed = self._extract_text(response)
-            if not proposed:
-                validation_error = "model returned empty text"
-            else:
-                ok, err = validate_evolved_prompt(proposed)
-                accepted = ok
-                validation_error = err
-                if accepted:
-                    self._current_base_prompt = proposed
-                    self._base_prompt_file.write(proposed)
-        except Exception as exc:
-            error = repr(exc)
-            logger.warning("Prompt evolution gen=%d failed: %s", gen, exc)
-        finally:
-            if usage is not None:
-                self.total_calls += 1
-                self.total_prompt_tokens += int(usage.get("prompt") or 0)
-                self.total_output_tokens += int(usage.get("output") or 0)
-                self.total_tokens += int(usage.get("total") or 0)
-
-            record = PromptEvolutionRecord(
-                generation=gen,
-                action_counter=self.action_counter,
-                accepted=accepted,
-                reasoning="",
-                proposed_prompt=proposed,
-                previous_prompt=previous,
-                new_prompt=self._current_base_prompt,
-                validation_error=validation_error or error,
-                usage=usage,
-                timestamp=now_iso(),
-            )
-            self.prompt_evolution.append(record)
-
-            self.trace.write(
-                {
-                    "agent": self.name,
-                    "model": self.model_name,
-                    "game_id": self.game_id,
-                    "action_counter": self.action_counter,
-                    "round": 0,
-                    "tools_exposed": "evolution",
-                    "evolution": {
-                        "generation": gen,
-                        "accepted": accepted,
-                        "validation_error": validation_error,
-                        "previous_len": len(previous),
-                        "new_len": len(self._current_base_prompt),
-                    },
-                    "input": {
-                        "system_instruction": evolution_system,
-                        "user_prompt": user_prompt,
-                        "images": [
-                            {"width": img.width, "height": img.height, "mode": img.mode}
-                            for img in images
-                        ],
-                    },
-                    "output": output,
-                    "usage": usage,
-                    "error": error,
-                }
-            )
-
-            logger.info(
-                "[%s] Prompt evolution gen=%d accepted=%s len=%d (prev=%d) error=%s",
-                self.name,
-                gen,
-                accepted,
-                len(self._current_base_prompt),
-                len(previous),
-                validation_error or error,
-            )
-
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
@@ -1163,6 +1237,141 @@ class ContinualHarness(Agent):
             "choose_action is unused."
         )
 
+    def _refresh_current_sandbox_stores(self) -> None:
+        """Refresh mutable stores while preserving the per-decision frame snapshot."""
+        if self._current_sandbox_state is None:
+            return
+        self._current_sandbox_state = replace(
+            self._current_sandbox_state,
+            memory_entries=[asdict(e) for e in self.memory.all_entries()],
+            skill_entries=[asdict(e) for e in self.skills.all_entries()],
+        )
+
+    def _conversation_context_guard_reason(
+        self, contents: list[Any]
+    ) -> tuple[str | None, dict[str, int] | None]:
+        context_window = self.vlm.context_window_tokens()
+        if context_window is None or context_window <= 0:
+            return None, None
+        guard_tokens = int(context_window * self.CONVERSATION_CONTEXT_GUARD_RATIO)
+        input_tokens = self.vlm.count_input_tokens(contents, module_name=self.name)
+        usage = {
+            "prompt": input_tokens,
+            "total": input_tokens,
+            "context_window": context_window,
+            "context_guard": guard_tokens,
+        }
+        if input_tokens < guard_tokens:
+            return None, usage
+        reason = (
+            "context_window_guard: conversation input estimated at "
+            f"{input_tokens} tokens, exceeding {self.CONVERSATION_CONTEXT_GUARD_RATIO:.0%} "
+            f"of the model context window ({guard_tokens}/{context_window})"
+        )
+        return reason, usage
+
+    def _record_vlm_usage(
+        self,
+        usage: dict[str, Any] | None,
+        *,
+        scope: str = "orchestrator",
+    ) -> dict[str, Any] | None:
+        if usage is None:
+            return None
+
+        prompt_tokens = usage_token_count(usage, "prompt")
+        output_tokens = usage_token_count(usage, "output")
+        total_tokens = usage_token_count(usage, "total")
+
+        self.total_calls += 1
+        self.total_prompt_tokens += prompt_tokens
+        self.total_output_tokens += output_tokens
+        self.total_tokens += total_tokens
+
+        bucket = self.usage_by_scope.setdefault(
+            scope,
+            {
+                "calls": 0,
+                "prompt_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "priced_calls": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        bucket["calls"] += 1
+        bucket["prompt_tokens"] += prompt_tokens
+        bucket["output_tokens"] += output_tokens
+        bucket["total_tokens"] += total_tokens
+
+        cost = estimate_vlm_usage_cost(
+            self.model_name,
+            usage,
+            cumulative_usd_before=self.total_vlm_cost_usd,
+        )
+        if cost is None:
+            return None
+
+        self.total_vlm_cost_usd = float(cost["cumulative_usd"])
+        self.total_priced_calls += 1
+        bucket["priced_calls"] += 1
+        bucket["cost_usd"] += float(cost["current_usd"])
+        return cost
+
+    # ------------------------------------------------------------------
+    # Stop conditions — checked once per decision at the top of main().
+    # ------------------------------------------------------------------
+
+    def _level_score_ceiling(self) -> float | None:
+        """Best-case score for the CURRENT level given actions already spent.
+
+        Mirrors the scorecard formula ((baseline/actions)^2 * 100, capped 115).
+        Assumes the level is completed right now — more actions only lower it,
+        so this is an upper bound on what the level can still contribute.
+        Returns None when no baseline is known for the current level.
+        """
+        baselines = self._baseline_actions
+        if not baselines:
+            return None
+        level = self.frames[-1].levels_completed  # 0-based index of level in play
+        if level < 0 or level >= len(baselines):
+            return None
+        baseline = baselines[level]
+        actions_this_level = self.action_counter - self._level_start_action
+        if baseline <= 0 or actions_this_level <= 0:
+            return None
+        return min((baseline / actions_this_level) ** 2 * 100.0, 115.0)
+
+    def _stop_reason(self) -> str | None:
+        """Return a human-readable reason to abandon the game, or None to go on.
+
+        WIN is handled separately via is_done(); this owns the budget/give-up
+        stops: action cap, cumulative-cost cap, and per-level efficiency.
+        """
+        if self.action_counter > self.MAX_ACTIONS:
+            return (
+                f"action budget exhausted (action_counter={self.action_counter} "
+                f"> MAX_ACTIONS={self.MAX_ACTIONS})"
+            )
+        if self.max_cost_usd > 0 and self.total_vlm_cost_usd >= self.max_cost_usd:
+            return (
+                f"cost cap reached (cum_cost=${self.total_vlm_cost_usd:.2f} "
+                f">= ${self.max_cost_usd:.2f})"
+            )
+        if self.min_level_score > 0:
+            actions_this_level = self.action_counter - self._level_start_action
+            if actions_this_level >= self.min_level_actions:
+                ceiling = self._level_score_ceiling()
+                if ceiling is not None and ceiling < self.min_level_score:
+                    level = self.frames[-1].levels_completed
+                    return (
+                        f"level {level} unlikely to contribute (best-case score "
+                        f"{ceiling:.1f} < {self.min_level_score:.1f}; "
+                        f"actions_this_level={actions_this_level}, "
+                        f"baseline={self._baseline_actions[level]})"
+                    )
+        return None
+
     # ------------------------------------------------------------------
     # Main loop — overrides Agent.main() with @trace_agent_session re-applied.
     # ------------------------------------------------------------------
@@ -1170,15 +1379,20 @@ class ContinualHarness(Agent):
     @trace_agent_session
     def main(self) -> None:
         self.timer = time.time()
-        while (
-            not self.is_done(self.frames, self.frames[-1])
-            and self.action_counter <= self.MAX_ACTIONS
-        ):
+        while not self.is_done(self.frames, self.frames[-1]):
+            stop_reason = self._stop_reason()
+            if stop_reason is not None:
+                logger.info("[%s] Stopping early: %s", self.game_id, stop_reason)
+                break
             latest_frame = self.frames[-1]
 
             # Terminal failure: consolidate the failed trajectory before reset.
             if latest_frame.state is GameState.GAME_OVER:
-                self._evolve_on_game_over(latest_frame)
+                self.harness_evolver.evolve_on_game_over(
+                    latest_frame,
+                    self.action_counter,
+                    tool_evidence_records=list(self._tool_evidence),
+                )
                 self._execute_one(GameAction.RESET, source="auto_reset")
                 self._recent_tool_results = []
                 continue
@@ -1191,46 +1405,69 @@ class ContinualHarness(Agent):
 
             pre_step_level = latest_frame.levels_completed
 
-            # Prompt-evolution hook — boundary-gated by action_counter rather
-            # than modulo so multi-action batches that straddle a boundary
-            # still fire exactly once.
-            self._maybe_evolve_prompt(latest_frame)
-
-            actions_executed = self._vlm_loop_inner(latest_frame)
-
-            if actions_executed > 0:
-                self._recent_tool_results = []
+            # `_vlm_loop_inner` runs a full conversation until an action fires and
+            # owns `_recent_tool_results` (carrying all of the conversation's tool
+            # results into the next decision's prompt as recap + full tail), so
+            # main() no longer clears it here.
+            self._vlm_loop_inner(latest_frame)
 
             # Level-up evolution: consolidate discovered rules immediately
-            # after advancing to a new level.
+            # after advancing to a new level. Otherwise, evolve after the
+            # configured frequency with no score/level progress. Progress
+            # tracking stays on the agent (also set inline in dispatch on
+            # score gains).
             post_frame = self.frames[-1]
             if post_frame.levels_completed > pre_step_level:
-                self._evolve_on_level_up(post_frame)
+                self._last_progress_step = self.action_counter
+                self.harness_evolver.evolve_on_level_up(
+                    post_frame,
+                    self.action_counter,
+                    tool_evidence_records=list(self._tool_evidence),
+                )
+            else:
+                self.harness_evolver.maybe_evolve_on_stagnation(
+                    post_frame,
+                    self.action_counter,
+                    self._last_progress_step,
+                    tool_evidence_records=list(self._tool_evidence),
+                )
 
         self.cleanup()
 
     # ------------------------------------------------------------------
-    # Inner VLM dispatch — one VLM call per outer iteration.
+    # Inner VLM dispatch — a conversation per decision, one trace record per turn.
     # ------------------------------------------------------------------
 
     def _vlm_loop_inner(self, latest_frame: FrameData) -> int:
-        """Make one VLM call, dispatch every function call, return # actions executed.
+        """Run one decision as a multi-turn conversation until an action fires.
 
-        - `take_actions` calls execute their action list synchronously via
-          `_dispatch_take_actions`.
+        Turn 0 sends the freshly rendered working prompt (observations + current
+        state + grid images). If the model emits only non-action tool calls, the
+        model turn and the tool-result function-responses are appended to the SAME
+        conversation and re-queried — the game state cannot change without an
+        action, so the observation/images are never re-rendered mid-decision. The
+        loop ends on the first executed action (state changed → must re-observe),
+        a terminal state, an empty/dead response, or `MAX_CONVERSATION_TURNS`.
+
+        Each VLM turn writes one orchestrator trace record sharing a
+        `conversation_id`. Returns the total actions executed this decision.
+
+        - `take_actions` calls execute synchronously via `_dispatch_take_actions`.
         - Analysis tool calls (process_*, run_skill, run_subagent, etc.) go
-          through `self.tool_router`. A skill that called tools.take_actions()
-          inside the sandbox contributes its inline action count via the
-          `actions_taken_inline` field on the returned ToolCallRecord.
+          through `self.tool_router`; a skill's inline take_actions count is
+          carried via the `actions_taken_inline` field on the ToolCallRecord.
         - Stray legacy ACTION1..ACTION6 calls are rejected with an explicit
-          error record so the model can self-correct next round.
+          error record so the model can self-correct next turn.
         """
-        # Stash per-iteration state used by sub-handlers (run_subagent, etc.).
+        self._conversation_count += 1
+        conversation_id = self._conversation_count
+
+        # Stash per-decision state used by sub-handlers (run_subagent, skills).
+        # Built once from `latest_frame`: no action runs mid-conversation, so the
+        # frame — and this snapshot — stay valid for every turn of the decision.
         self._current_latest_frame = latest_frame
         self._current_images = list(frame_to_images(latest_frame))
         self._subagent_call_count = 0
-        self._vlm_call_count += 1
-        self._current_outer_round = self._vlm_call_count
 
         # Build a JSON-only sandbox snapshot. The sandbox sees this view at
         # the *start* of the skill call; subsequent take_actions RPCs update
@@ -1244,66 +1481,250 @@ class ContinualHarness(Agent):
                 "score": latest_frame.levels_completed,
                 "frame": latest_frame.frame,
             }
+        # int→hex boundary: the sandbox `state` mirrors the working prompt's hex
+        # view. `latest_frame.frame` becomes a hex stack; `observations` carries
+        # the per-action hex frames; recent_trajectory colors are hex-mapped
+        # (counts/coords stay int). Engine storage / trajectory.jsonl stay int.
+        frame_dump["frame"] = frame_to_hex(frame_dump.get("frame"))
         self._current_sandbox_state = SandboxState(
             latest_frame=frame_dump,
-            recent_trajectory=self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT),
+            observations=_build_sandbox_observations(
+                self._pending_observations, self.frames
+            ),
+            recent_trajectory=[
+                hexify_record_colors(r)
+                for r in self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT)
+            ],
             memory_entries=[asdict(e) for e in self.memory.all_entries()],
             skill_entries=[asdict(e) for e in self.skills.all_entries()],
         )
 
+        # Turn 0: render the working prompt + grid images once for this decision.
+        # Skills still see every grid from the current latest_frame via
+        # `self._current_images` -> `state.images`.
         prompt, rendered_grids = self._build_working_prompt(latest_frame)
         tools = self._full_tool_list()
-
-        # The orchestrator image payload mirrors the grids rendered in the
-        # prompt text, in order. Skills still see every grid from the current
-        # latest_frame via `self._current_images` -> `state.images`.
         vlm_images = [grid_to_image(item.grid) for item in rendered_grids]
-        payload: Any = (
-            vlm_images
-            if len(vlm_images) > 1
-            else (vlm_images[0] if vlm_images else [])
-        )
+        contents: list[Any] = [self.vlm.build_user_turn(prompt, vlm_images)]
 
-        output: dict[str, Any] = {}
-        usage: dict[str, int | None] | None = None
-        error: str | None = None
-        try:
-            response = self.vlm.get_query(payload, prompt, module_name=self.name)
-            output = serialize_response(response)
-            usage = self.vlm.extract_usage(response)
-        except Exception as exc:
-            self._consecutive_vlm_errors += 1
-            self._write_orchestrator_trace(
-                prompt=prompt, output={}, usage=None, tools=tools,
-                tool_calls=[], actions_executed=0, rendered_grids=rendered_grids,
-                error=repr(exc),
+        actions_executed = 0
+        all_new_results: list[ToolCallRecord] = []
+        prev_results: list[ToolCallRecord] = []
+        no_action_reason: str | None = None
+        turn = 0
+        while True:
+            self._vlm_call_count += 1
+            self._current_outer_round = self._vlm_call_count
+
+            # Trace input fidelity: turn 0 carries the working prompt + its grids;
+            # follow-up turns carry only the tool-result function-responses the
+            # model is now answering (no new images attached).
+            turn_prompt = prompt if turn == 0 else render_tool_results(prev_results)
+            turn_grids = rendered_grids if turn == 0 else []
+
+            guard_reason, guard_usage = self._conversation_context_guard_reason(contents)
+            if guard_reason is not None:
+                no_action_reason = guard_reason
+                self._write_orchestrator_trace(
+                    prompt=turn_prompt, output={}, usage=guard_usage, tools=tools,
+                    tool_calls=[], actions_executed=0, rendered_grids=turn_grids,
+                    error=guard_reason,
+                    conversation_id=conversation_id, conversation_turn=turn,
+                )
+                logger.warning("[%s] %s", self.game_id, guard_reason)
+                break
+
+            try:
+                response = self.vlm.get_query_contents(contents, module_name=self.name)
+                output = serialize_response(response)
+                usage = self.vlm.extract_usage(response)
+                usage_cost = self._record_vlm_usage(usage, scope="orchestrator")
+            except Exception as exc:
+                self._consecutive_vlm_errors += 1
+                no_action_reason = f"vlm_error: {exc!r}"
+                self._write_orchestrator_trace(
+                    prompt=turn_prompt, output={}, usage=None, tools=tools,
+                    tool_calls=[], actions_executed=0, rendered_grids=turn_grids,
+                    error=repr(exc),
+                    conversation_id=conversation_id, conversation_turn=turn,
+                )
+                logger.warning("VLM call failed: %s", exc)
+                break
+            self._consecutive_vlm_errors = 0
+
+            # Observations shown in turn 0 have now been delivered. Clear before
+            # dispatch so any actions emitted become the NEXT decision's prompt.
+            if turn == 0:
+                self._pending_observations = []
+
+            action_counter_before = self.action_counter
+            (
+                turn_actions,
+                new_results,
+                round_tool_log,
+                terminal,
+                had_fcs,
+            ) = self._dispatch_response(response)
+            self._append_tool_evidence(
+                new_results,
+                conversation_id=conversation_id,
+                conversation_turn=turn,
+                action_counter_before=action_counter_before,
+                action_counter_after=self.action_counter,
             )
-            logger.warning("VLM call failed: %s", exc)
-            return 0
-        self._consecutive_vlm_errors = 0
-        # Observations shown in this prompt have now been delivered. Clear
-        # before dispatching the response so any actions emitted by this query
-        # become the next prompt's observations.
-        self._pending_observations = []
+            actions_executed += turn_actions
+            all_new_results.extend(new_results)
 
+            self._write_orchestrator_trace(
+                prompt=turn_prompt, output=output, usage=usage, tools=tools,
+                tool_calls=new_results, actions_executed=turn_actions,
+                rendered_grids=turn_grids, error=None,
+                conversation_id=conversation_id, conversation_turn=turn,
+                usage_cost=usage_cost, usage_accounted=usage is not None,
+            )
+
+            # Per-VLM-call run.log summary. One line per conversation turn.
+            latest = self.frames[-1]
+            tokens_total = usage_token_count(usage, "total")
+            tools_label = ", ".join(round_tool_log) if round_tool_log else "(no fcs)"
+            logger.info(
+                "[%s] vlm#%d conv=%d.t%d step=%d lvl=%d state=%s tokens=%d "
+                "actions=%d tools=[%s]%s",
+                self.game_id,
+                self._vlm_call_count,
+                conversation_id,
+                turn,
+                self.action_counter,
+                latest.levels_completed,
+                latest.state.name,
+                tokens_total,
+                turn_actions,
+                tools_label,
+                _cost_log_suffix(usage_cost),
+            )
+
+            # End the conversation when the game state changed (action fired) or a
+            # terminal state was reached — both require a fresh observation.
+            if turn_actions > 0 or terminal:
+                break
+            # No function calls at all (e.g. safety-filtered/empty response): we
+            # can't extend the conversation with a model turn, so end here.
+            if not had_fcs:
+                no_action_reason = "model response contained no function calls"
+                break
+            # Tool-only turn: extend the SAME conversation (cached prefix) and
+            # re-query without re-rendering the unchanged observation/state.
+            contents.append(self.vlm.model_turn(response))
+            contents.append(
+                self.vlm.build_tool_results_turn(_tool_result_pairs(new_results))
+            )
+            prev_results = new_results
+            turn += 1
+            if turn >= self.MAX_CONVERSATION_TURNS:
+                no_action_reason = (
+                    f"max_conversation_turns: hit MAX_CONVERSATION_TURNS="
+                    f"{self.MAX_CONVERSATION_TURNS} without an action"
+                )
+                logger.warning("[%s] conv=%d %s", self.game_id, conversation_id, no_action_reason)
+                break
+
+        # Carry every non-action tool result from this conversation into the next
+        # working prompt's TOOL RESULTS block: the newest render in full, older
+        # ones as a one-line recap (see format_tool_results_markdown), so the
+        # next decision does not re-run tools to re-derive outputs it already saw.
+        self._recent_tool_results = all_new_results[-self.RECENT_RESULTS_CAP:]
+        if actions_executed > 0 or self.frames[-1].state in (
+            GameState.WIN,
+            GameState.GAME_OVER,
+        ):
+            self._previous_no_action_reason = None
+        else:
+            self._previous_no_action_reason = (
+                no_action_reason or "conversation ended without an action"
+            )
+        return actions_executed
+
+    def _append_tool_evidence(
+        self,
+        records: list[ToolCallRecord],
+        *,
+        conversation_id: int,
+        conversation_turn: int,
+        action_counter_before: int,
+        action_counter_after: int,
+    ) -> None:
+        for record in records:
+            self._tool_evidence.append(
+                ToolEvidenceRecord(
+                    conversation_id=conversation_id,
+                    conversation_turn=conversation_turn,
+                    round=self._current_outer_round,
+                    action_counter_before=action_counter_before,
+                    action_counter_after=action_counter_after,
+                    tool_call=record,
+                )
+            )
+        overflow = len(self._tool_evidence) - self.TOOL_EVIDENCE_CAP
+        if overflow > 0:
+            del self._tool_evidence[:overflow]
+
+    def _dispatch_response(
+        self, response: Any
+    ) -> tuple[int, list[ToolCallRecord], list[str], bool, bool]:
+        """Dispatch every function call in one VLM response.
+
+        Returns ``(actions_executed, new_results, round_tool_log, terminal,
+        had_fcs)``. ``new_results`` holds the non-action / rejected tool records
+        for this turn. Successful take_actions calls are not recorded — the next
+        prompt's observation shows what ran — but zero-action take_actions calls
+        are returned so Gemini receives a response for the pending function call.
+        ``terminal`` is True if a WIN/GAME_OVER was reached mid-response.
+        ``had_fcs`` is False only when the response carried no function calls at
+        all.
+        """
         fcs = extract_function_calls(response)
         actions_executed = 0
         new_results: list[ToolCallRecord] = []
-        # Track the human-readable name of every tool call this round, in
-        # emission order, for the run.log summary at the end. take_actions
-        # entries include the emitted action list inline so a `grep
-        # take_actions` against run.log shows exactly what was committed.
+        # Track the human-readable name of every tool call this turn, in emission
+        # order, for the run.log summary. take_actions entries include the emitted
+        # action list inline so a `grep take_actions` against run.log shows what
+        # was committed.
         round_tool_log: list[str] = []
+        terminal = False
 
         for fc in fcs:
             if is_take_actions_call(fc.name):
-                action_specs = fc.args.get("actions") if isinstance(fc.args, dict) else None
+                action_specs = (
+                    fc.args.get("actions") if isinstance(fc.args, dict) else None
+                )
                 spec_label = _format_action_list(action_specs)
                 executed = self._dispatch_take_actions(fc.args, source="vlm")
                 actions_executed += executed
                 round_tool_log.append(f"take_actions{spec_label}={executed}")
-                # We don't add a TOOL RESULTS entry for take_actions — the
-                # next prompt's RECENT HISTORY block already shows what ran.
+                if executed == 0:
+                    new_results.append(
+                        ToolCallRecord(
+                            name=fc.name,
+                            args=fc.args,
+                            result={
+                                "success": False,
+                                "executed": 0,
+                                "available_actions": [
+                                    a.name
+                                    for a in available_game_actions(
+                                        self.frames[-1].available_actions
+                                    )
+                                ],
+                                "message": (
+                                    "take_actions executed no actions; send a "
+                                    "non-empty valid actions list using the "
+                                    "currently available actions"
+                                ),
+                            },
+                        )
+                    )
+                # Successful take_actions calls do not need a TOOL RESULTS entry:
+                # the conversation stops and the next prompt shows what ran.
             elif is_action_tool(fc.name):
                 # Legacy per-action tool emitted directly — reject and
                 # surface so the model corrects.
@@ -1331,45 +1752,10 @@ class ContinualHarness(Agent):
 
             if self.frames[-1].state in (GameState.WIN, GameState.GAME_OVER):
                 # Terminal mid-response — stop processing further fcs.
+                terminal = True
                 break
 
-        if usage is not None:
-            self.total_calls += 1
-            self.total_prompt_tokens += int(usage.get("prompt") or 0)
-            self.total_output_tokens += int(usage.get("output") or 0)
-            self.total_tokens += int(usage.get("total") or 0)
-
-        self._write_orchestrator_trace(
-            prompt=prompt, output=output, usage=usage, tools=tools,
-            tool_calls=new_results, actions_executed=actions_executed,
-            rendered_grids=rendered_grids, error=error,
-        )
-
-        # Carry analysis results to the next iteration's prompt. Cap to avoid
-        # unbounded growth across consecutive no-action iters. If actions
-        # executed, main() will clear this list anyway.
-        if new_results:
-            self._recent_tool_results = (
-                self._recent_tool_results + new_results
-            )[-self.RECENT_RESULTS_CAP:]
-
-        # Per-VLM-call run.log summary. One line per outer iteration.
-        latest = self.frames[-1]
-        tokens_total = int((usage or {}).get("total") or 0) if usage else 0
-        tools_label = ", ".join(round_tool_log) if round_tool_log else "(no fcs)"
-        logger.info(
-            "[%s] vlm#%d step=%d lvl=%d state=%s tokens=%d actions=%d tools=[%s]",
-            self.game_id,
-            self._vlm_call_count,
-            self.action_counter,
-            latest.levels_completed,
-            latest.state.name,
-            tokens_total,
-            actions_executed,
-            tools_label,
-        )
-
-        return actions_executed
+        return actions_executed, new_results, round_tool_log, terminal, bool(fcs)
 
     # ------------------------------------------------------------------
     # take_actions dispatch — used by both the VLM path and the sandbox RPC.
@@ -1467,8 +1853,18 @@ class ContinualHarness(Agent):
         post = frame if frame is not None else pre
         score_after = post.levels_completed
         state_after = post.state.name if frame is not None else "INVALID"
+        if frame is not None and (
+            score_after > pre_score or post.state is GameState.WIN
+        ):
+            self._last_progress_step = self.action_counter
+        if frame is not None and score_after != pre_score:
+            # Level changed — up on progress, or down to 0 on a post-GAME_OVER
+            # reset. Reset the per-level action counter either way.
+            self._level_start_action = self.action_counter
 
-        grid_delta = _compute_grid_delta(pre_grid, post.frame[-1] if post.frame else None)
+        post_grid = post.frame[-1] if post.frame else None
+        grid_delta = _compute_grid_delta(pre_grid, post_grid)
+        grid_change = summarize_grid_transitions(pre_grid, post_grid)
 
         self.trajectory.append(
             StepRecord(
@@ -1490,6 +1886,7 @@ class ContinualHarness(Agent):
                 skill_id=skill_id,
                 tool_calls=[],
                 grid_delta=grid_delta,
+                grid_change=grid_change,
             )
         )
         self._pending_observations.append(
@@ -1585,11 +1982,9 @@ class ContinualHarness(Agent):
     def _build_working_prompt(
         self, latest_frame: FrameData
     ) -> tuple[str, list[RenderedGrid]]:
-        history_block = format_compact_history(
-            self.trajectory.tail(self.FULL_HISTORY_MAX_LIMIT),
-            frames=self.frames,
+        history_block = render_recent_history(
+            self.trajectory.tail(self.MAX_ACTIONS + 1),
             max_chars=self.HISTORY_MAX_CHARS,
-            max_batches=self.HISTORY_BATCH_WINDOW,
         )
         observation_block, observation_grids = build_observation_section(
             self._pending_observations,
@@ -1611,7 +2006,9 @@ class ContinualHarness(Agent):
             skill_overview=skill_overview,
             subagent_overview=subagent_overview,
             observation_block=observation_block,
-            base_prompt=self._current_base_prompt,
+            base_prompt=self.harness_evolver.get_current_prompt(),
+            previous_no_action_reason=self._previous_no_action_reason,
+            max_deliberation_turns=self.MAX_CONVERSATION_TURNS,
         )
         return prompt, rendered_grids
 
@@ -1622,39 +2019,11 @@ class ContinualHarness(Agent):
     def _full_tool_list(self) -> list[dict[str, Any]]:
         """Unified action tool + analysis tools — exposed every iteration."""
         tools: list[dict[str, Any]] = [TAKE_ACTIONS_TOOL]
-        tools.extend(build_analysis_tools())  # get_recent_trajectory
+        tools.extend(build_analysis_tools())  # currently empty (get_recent_trajectory removed)
         tools.append(PROCESS_MEMORY_TOOL)
         tools.extend([PROCESS_SKILL_TOOL, RUN_SKILL_TOOL])
         tools.extend([PROCESS_SUBAGENT_TOOL, RUN_SUBAGENT_TOOL])
         return tools
-
-    def _maybe_evolve_prompt(self, latest_frame: FrameData) -> None:
-        if self._prompt_evolve_frequency <= 0:
-            return
-        if self.action_counter == 0:
-            return
-        gap = self.action_counter - self._last_evolution_step
-        if gap < self._prompt_evolve_frequency:
-            return
-        self._last_evolution_step = self.action_counter
-        self._evolve_system_prompt(latest_frame)
-
-    def _evolve_on_level_up(self, latest_frame: FrameData) -> None:
-        """Trigger evolution unconditionally on level transition."""
-        if self._prompt_evolve_frequency <= 0:
-            return
-        self._last_evolution_step = self.action_counter
-        self._evolve_system_prompt(latest_frame)
-
-    def _evolve_on_game_over(self, latest_frame: FrameData) -> None:
-        """Trigger evolution once for a GAME_OVER state before auto-reset."""
-        if self._prompt_evolve_frequency <= 0:
-            return
-        if self._last_game_over_evolution_step == self.action_counter:
-            return
-        self._last_game_over_evolution_step = self.action_counter
-        self._last_evolution_step = self.action_counter
-        self._evolve_system_prompt(latest_frame)
 
     def _mint_batch_id(self) -> str:
         self._batch_counter += 1
@@ -1673,6 +2042,10 @@ class ContinualHarness(Agent):
         actions_executed: int,
         rendered_grids: list[RenderedGrid],
         error: str | None = None,
+        conversation_id: int | None = None,
+        conversation_turn: int | None = None,
+        usage_cost: dict[str, Any] | None = None,
+        usage_accounted: bool = False,
     ) -> None:
         self.trace.write(
             {
@@ -1682,10 +2055,14 @@ class ContinualHarness(Agent):
                 "action_counter": self.action_counter,
                 "vlm_call": self._vlm_call_count,
                 "round": self._current_outer_round,
+                # Group a decision's multi-turn conversation: all turns share
+                # `conversation_id`; `conversation_turn` is the 0-based turn index.
+                "conversation_id": conversation_id,
+                "conversation_turn": conversation_turn,
                 "tools_exposed": "full",
                 "input": {
                     "system_instruction": self._system_instruction,
-                    "base_prompt": self._current_base_prompt,
+                    "base_prompt": self.harness_evolver.get_current_prompt(),
                     "user_prompt": prompt,
                     "tools": tools,
                     # `images` mirrors the grids rendered in this prompt, in
@@ -1703,6 +2080,9 @@ class ContinualHarness(Agent):
                 },
                 "output": output,
                 "usage": usage,
+                "usage_scope": "orchestrator",
+                "usage_accounted": usage_accounted,
+                "usage_cost": usage_cost,
                 "actions_executed": actions_executed,
                 "tool_calls": [asdict(r) for r in tool_calls],
                 "error": error,
@@ -1718,6 +2098,27 @@ class ContinualHarness(Agent):
             self.total_output_tokens,
             self.total_tokens,
         )
+        if self.total_priced_calls:
+            logger.info(
+                "[%s] Final priced VLM usage: priced_calls=%d cost=$%.6f",
+                self.name,
+                self.total_priced_calls,
+                self.total_vlm_cost_usd,
+            )
+        for scope in sorted(self.usage_by_scope):
+            bucket = self.usage_by_scope[scope]
+            logger.info(
+                "[%s] Token usage scope=%s: calls=%d prompt=%d output=%d "
+                "total=%d priced_calls=%d cost=$%.6f",
+                self.name,
+                scope,
+                bucket["calls"],
+                bucket["prompt_tokens"],
+                bucket["output_tokens"],
+                bucket["total_tokens"],
+                bucket["priced_calls"],
+                bucket["cost_usd"],
+            )
         logger.info(
             "[%s] Trajectory: %d steps recorded at %s",
             self.name,
