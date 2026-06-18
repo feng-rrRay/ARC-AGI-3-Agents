@@ -282,6 +282,7 @@ class ContinualHarness(Agent):
     MIN_LEVEL_SCORE = 4.0  # abandon current level when best-case score < this; 0 disables
     MIN_LEVEL_ACTIONS = 100  # don't apply the efficiency stop before this many actions on a level
     MODEL = "gemini-3.1-pro-preview"  # default; override via GEMINI_MODEL
+    VLM_BACKEND = "gemini"  # "gemini" | "vllm"; override via CONTINUAL_HARNESS_VLM_BACKEND
     HISTORY_MAX_CHARS = 12000  # budget for the RECENT HISTORY block
     HISTORY_BATCH_WINDOW = 5  # last N batches shown in compact history
     FULL_HISTORY_DEFAULT_LIMIT = 40
@@ -300,9 +301,15 @@ class ContinualHarness(Agent):
     # stagnation thresholds.
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # Must resolve model_name BEFORE super().__init__(): Agent.__init__
+        # Must resolve backend/model BEFORE super().__init__(): Agent.__init__
         # calls start_recording() which reads self.name → self.model_name.
-        self.model_name = os.getenv("GEMINI_MODEL", self.MODEL)
+        self.vlm_backend = os.getenv(
+            "CONTINUAL_HARNESS_VLM_BACKEND", self.VLM_BACKEND
+        ).lower()
+        if self.vlm_backend == "vllm":
+            self.model_name = os.getenv("VLLM_MODEL", "gpt-oss-120b")
+        else:
+            self.model_name = os.getenv("GEMINI_MODEL", self.MODEL)
         super().__init__(*args, **kwargs)
 
         # Three-layer prompt architecture:
@@ -323,7 +330,7 @@ class ContinualHarness(Agent):
 
         self.vlm = VLM(
             self.model_name,
-            backend="gemini",
+            backend=self.vlm_backend,
             system_instruction=self._system_instruction,
         )
         self.vlm.set_tools(self._full_tool_list())
@@ -803,7 +810,7 @@ class ContinualHarness(Agent):
             tools = build_subagent_tools(entry.allowed_tools)
             sub_vlm = VLM(
                 self.model_name,
-                backend="gemini",
+                backend=self.vlm_backend,
                 system_instruction=entry.system_instructions,
             )
             sub_vlm.set_tools(tools)
@@ -1190,6 +1197,7 @@ class ContinualHarness(Agent):
                 usage, scope="harness_evolution"
             ),
             baseline_prompt=BASE_ORCHESTRATOR_POLICY,
+            backend=self.vlm_backend,
         )
         logger.info(
             "[%s] Harness evolution: stagnation_after=%d, base prompt at %s, log at %s",
@@ -1304,10 +1312,16 @@ class ContinualHarness(Agent):
         bucket["output_tokens"] += output_tokens
         bucket["total_tokens"] += total_tokens
 
-        cost = estimate_vlm_usage_cost(
-            self.model_name,
-            usage,
-            cumulative_usd_before=self.total_vlm_cost_usd,
+        # USD cost is only computed for the Gemini backend; open-weight models
+        # served via vLLM record token usage but no cost (no pricing table).
+        cost = (
+            estimate_vlm_usage_cost(
+                self.model_name,
+                usage,
+                cumulative_usd_before=self.total_vlm_cost_usd,
+            )
+            if self.vlm_backend == "gemini"
+            else None
         )
         if cost is None:
             return None

@@ -487,8 +487,10 @@ class HarnessEvolver:
         trace: Any,
         record_usage: Callable[[dict[str, Any] | None], dict[str, Any] | None],
         baseline_prompt: str,
+        backend: str = "gemini",
     ) -> None:
         self.model_name = model_name
+        self.backend = backend
         self.system_instruction = system_instruction
         self.game_id = game_id
         self.agent_name = agent_name
@@ -742,7 +744,7 @@ class HarnessEvolver:
     def _meta_query(
         self, system: str, user: str, images: list[Any], tag: Any
     ) -> tuple[Any, dict[str, Any] | None, dict[str, Any] | None]:
-        vlm = VLM(self.model_name, backend="gemini", system_instruction=system)
+        vlm = VLM(self.model_name, backend=self.backend, system_instruction=system)
         # Use the multi-turn contents API: it always returns the raw response
         # object, so extract_usage() can read usage_metadata. `vlm.get_query`
         # returns plain text when no tools are set — which the evolver never

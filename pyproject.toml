@@ -15,8 +15,12 @@ dependencies = [
     "langchain[openai]>=0.3.27",
     "langgraph>=0.6.3",
     "langgraph-checkpoint-sqlite>=2.0.11",
-    "numpy>=2.3.2",
-    "openai==1.72.0",
+    # numpy upper bound is dictated by the open-vlm extra (numba<2.3); our code
+    # only uses basic numpy APIs, so the lower floor is all we need here.
+    "numpy>=1.24",
+    # Relaxed from ==1.72.0 so the open-vlm extra (vllm) can pull openai>=2.0.0;
+    # llm_agents.py only uses stable APIs (OpenAI, BadRequestError) present in 2.x.
+    "openai>=1.72.0",
     "pillow>=11.2.1",
     "pydantic>=2.11.7",
     "requests>=2.32.4",
@@ -47,6 +51,14 @@ blog-viz = [
     "matplotlib>=3.8",
     "seaborn>=0.13",
     "pandas>=2.2",
+]
+# Open-weight VLMs served by a local vLLM OpenAI-compatible server. Heavy
+# (pulls torch + CUDA, several GB) — install only on a GPU node:
+#   uv sync --extra open-vlm
+# Forces the whole project onto openai>=2.0 and numpy<2.3 (see the relaxed pins
+# above). The VLLMBackend talks to the server over HTTP via the `openai` client.
+open-vlm = [
+    "vllm==0.19.1",
 ]
 
 [tool.setuptools.packages.find]

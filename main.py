@@ -66,6 +66,32 @@ def _parse_prompt_evolve_frequency(value: str | int) -> int:
     return parsed
 
 
+def _local_games(environments_dir: str) -> list[str]:
+    """Enumerate game_ids from the local environment_files/ tree.
+
+    Mirrors arc_agi's offline scan: each game has a
+    ``<environments_dir>/<code>/<hash>/metadata.json`` carrying the full
+    ``game_id`` (e.g. ``ft09-0d8bbf25``). Used when OPERATION_MODE=offline or as
+    a fallback when the API is unreachable (e.g. an offline compute node).
+    """
+    base = Path(environments_dir)
+    if not base.is_dir():
+        return []
+    game_ids: list[str] = []
+    seen: set[str] = set()
+    for metadata_file in sorted(base.rglob("metadata.json")):
+        try:
+            data = json.loads(metadata_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning(f"Skipping unreadable metadata {metadata_file}: {exc}")
+            continue
+        game_id = data.get("game_id")
+        if game_id and game_id not in seen:
+            seen.add(game_id)
+            game_ids.append(str(game_id))
+    return game_ids
+
+
 def run_agent(
     swarm: Swarm,
     run_artifacts: RunArtifacts,
@@ -269,28 +295,51 @@ def main() -> None:
         user_tags = [tag.strip() for tag in args.tags.split(",")]
         tags.extend(user_tags)
 
-    print(f"{ROOT_URL}/api/games")
+    environments_dir = os.getenv("ENVIRONMENTS_DIR", "environment_files")
+    offline = os.getenv("OPERATION_MODE", "").strip().lower() == "offline"
 
-    # Get the list of games from the API
-    full_games = []
-    try:
-        with requests.Session() as session:
-            session.headers.update(HEADERS)
-            r = session.get(f"{ROOT_URL}/api/games", timeout=10)
+    full_games: list[str] = []
+    if offline:
+        # Offline evaluation must not touch the network: enumerate games from
+        # the local environment_files/ tree only.
+        full_games = _local_games(environments_dir)
+        logger.info(
+            "OPERATION_MODE=offline; found %d local game(s) in %s/",
+            len(full_games),
+            environments_dir,
+        )
+    else:
+        # Get the list of games from the API.
+        print(f"{ROOT_URL}/api/games")
+        try:
+            with requests.Session() as session:
+                session.headers.update(HEADERS)
+                r = session.get(f"{ROOT_URL}/api/games", timeout=10)
 
-        if r.status_code == 200:
-            try:
-                full_games = [g["game_id"] for g in r.json()]
-            except (ValueError, KeyError) as e:
-                logger.error(f"Failed to parse games response: {e}")
-                logger.error(f"Response content: {r.text[:200]}")
-        else:
-            logger.error(
-                f"API request failed with status {r.status_code}: {r.text[:200]}"
-            )
+            if r.status_code == 200:
+                try:
+                    full_games = [g["game_id"] for g in r.json()]
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Failed to parse games response: {e}")
+                    logger.error(f"Response content: {r.text[:200]}")
+            else:
+                logger.error(
+                    f"API request failed with status {r.status_code}: {r.text[:200]}"
+                )
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to connect to API server: {e}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to connect to API server: {e}")
+
+        # Fall back to local environment files when the API yields nothing
+        # (e.g. unreachable on an offline compute node).
+        if not full_games:
+            full_games = _local_games(environments_dir)
+            if full_games:
+                logger.info(
+                    "API unavailable; falling back to %d local game(s) in %s/",
+                    len(full_games),
+                    environments_dir,
+                )
 
     # For playback agents, we can derive the game from the recording filename
     if not full_games and args.agent and args.agent.endswith(".recording.jsonl"):

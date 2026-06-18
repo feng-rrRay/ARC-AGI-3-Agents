@@ -8,6 +8,7 @@ arc_api_key.sh
 .venv/
 *.egg-info/
 blog_data/
+slurm/
 
 # Cache
 .ruff_cache/
@@ -38,3 +39,4 @@ agents/templates/PokeAgent_ref.py
 
 run.sh
 */*.zip
+*.zip
