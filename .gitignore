@@ -48,6 +48,7 @@ agents/templates/smolagents.py
 agents/templates/langgraph_random_agent.py
 agents/templates/langgraph_functional_agent.py
 agents/templates/langgraph_thinking/
+agents/templates/openclaw_agent/
 
 run.sh
 */*.zip
