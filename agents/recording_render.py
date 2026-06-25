@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
+from collections import Counter
 from dataclasses import dataclass, replace
+from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, Sequence, cast
 
@@ -14,7 +18,6 @@ from PIL import Image, ImageDraw, ImageFont
 RECORDING_SUFFIX = ".recording.jsonl"
 TRACE_SUFFIX = ".trace.jsonl"
 TRAJECTORY_SUFFIX = ".trajectory.jsonl"
-PROMPT_EVOLUTION_NAME = "prompt_evolution.jsonl"
 VIDEO_SUFFIXES = {".gif", ".mp4"}
 RenderFormat = Literal["gif", "mp4"]
 CallKind = Literal["action_batch", "action_rejected", "analysis", "evolution"]
@@ -74,13 +77,109 @@ JsonObject = dict[str, Any]
 Grid = Sequence[Sequence[int]]
 
 
+# --------------------------------------------------------------------------- #
+# Visual theme (dark "blog replay" look, modelled on the ARC Prize viewer).
+# --------------------------------------------------------------------------- #
+RGBA = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class Theme:
+    bg: RGBA = (18, 18, 20, 255)
+    panel_bg: RGBA = (24, 24, 27, 255)
+    grid_bg: RGBA = (30, 30, 34, 255)
+    card_bg: RGBA = (34, 34, 39, 255)
+    card_current_bg: RGBA = (45, 45, 53, 255)
+    card_border: RGBA = (62, 62, 70, 255)
+    divider: RGBA = (48, 48, 54, 255)
+    accent: RGBA = (255, 133, 27, 255)
+    accent_soft: RGBA = (120, 78, 28, 255)
+    text_primary: RGBA = (236, 237, 241, 255)
+    text_secondary: RGBA = (156, 160, 170, 255)
+    text_muted: RGBA = (112, 116, 126, 255)
+    chip_fg: RGBA = (24, 18, 10, 255)
+    tag_bg: RGBA = (52, 54, 62, 255)
+    tag_fg: RGBA = (180, 200, 240, 255)
+    grid_line: RGBA = (0, 0, 0, 48)
+    playhead: RGBA = (240, 240, 245, 255)
+    timeline_bg: RGBA = (42, 42, 48, 255)
+
+
+THEME = Theme()
+
+# Level segments cycle through warm tones so adjacent levels stay distinct.
+_LEVEL_COLORS: tuple[RGBA, ...] = (
+    (255, 133, 27, 255),
+    (255, 196, 60, 255),
+    (255, 220, 0, 255),
+    (245, 110, 40, 255),
+    (255, 165, 40, 255),
+)
+
+_FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "regular": (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ),
+    "bold": (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ),
+    "mono": (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class FontSet:
+    frame_big: ImageFont.FreeTypeFont
+    title: ImageFont.FreeTypeFont
+    header: ImageFont.FreeTypeFont
+    chip: ImageFont.FreeTypeFont
+    body: ImageFont.FreeTypeFont
+    small: ImageFont.FreeTypeFont
+    tiny: ImageFont.FreeTypeFont
+    level: ImageFont.FreeTypeFont
+    mono: ImageFont.FreeTypeFont
+
+
+def _load_font(kind: str, size: int) -> ImageFont.FreeTypeFont:
+    for candidate in _FONT_CANDIDATES.get(kind, ()):
+        if Path(candidate).exists():
+            try:
+                return ImageFont.truetype(candidate, size)
+            except OSError:
+                continue
+    # Pillow >= 10 returns a TrueType-backed default at the requested size.
+    return cast(ImageFont.FreeTypeFont, ImageFont.load_default(size=size))
+
+
+@lru_cache(maxsize=1)
+def _load_fonts() -> FontSet:
+    return FontSet(
+        frame_big=_load_font("bold", 19),
+        title=_load_font("bold", 15),
+        header=_load_font("bold", 13),
+        chip=_load_font("bold", 12),
+        body=_load_font("regular", 13),
+        small=_load_font("regular", 11),
+        tiny=_load_font("regular", 10),
+        level=_load_font("bold", 10),
+        mono=_load_font("mono", 11),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Dataclasses
+# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class RecordingFrame:
     index: int
     timestamp: str | None
     data: JsonObject
     action_label: str | None = None
-    reasoning_trace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,13 +212,7 @@ class PromptEvolutionEntry:
 
 @dataclass(frozen=True)
 class TraceEvent:
-    """One row from the trace JSONL, normalized for the renderer.
-
-    Each VLM call writes one event (orchestrator). Subagent inner rounds and
-    prompt-evolution attempts write their own events; both appear in file
-    order BEFORE the orchestrator event that triggered them, so file-order
-    iteration is sufficient for grouping.
-    """
+    """One row from the trace JSONL, normalized for the renderer."""
 
     file_index: int
     vlm_call: int | None
@@ -134,6 +227,9 @@ class TraceEvent:
     calls: tuple[CallEntry, ...]
     evolution: PromptEvolutionEntry | None
     subagent_info: JsonObject | None
+    usage: JsonObject | None = None
+    usage_cost: JsonObject | None = None
+    timestamp: str | None = None
 
     @property
     def total_actions(self) -> int:
@@ -149,16 +245,54 @@ class TraceEvent:
 
 @dataclass(frozen=True)
 class ActionPanel:
-    """The right-side panel that a contiguous batch of action frames shares.
-
-    `events` holds every TraceEvent that contributed to those frames in file
-    order — typically zero or more no-action / evolution / subagent events
-    followed by exactly one action-emitting orchestrator event.
-    """
+    """The frames a contiguous batch of action frames shares."""
 
     frame_start: int  # inclusive recording-frame index
-    frame_end: int    # inclusive recording-frame index
+    frame_end: int  # inclusive recording-frame index
     events: tuple[TraceEvent, ...]
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One reasoning step that produced one or more game actions.
+
+    The unit a Reasoning-Log card represents. Built from the CH trace
+    (`build_decisions_ch`) or straight from a Hermes recording's embedded
+    per-action reasoning (`build_decisions_hermes`).
+    """
+
+    index: int  # 0-based ordinal across the run
+    frame_start: int  # inclusive recording-frame index this decision covers
+    frame_end: int  # inclusive recording-frame index
+    level: int  # levels_completed at frame_end
+    action_chips: tuple[
+        str, ...
+    ]  # compact action labels, e.g. ("A2 ×3", "CLICK (4, 9)")
+    reasoning: str | None
+    tool_tags: tuple[str, ...]  # tool names that produced the action (CH only)
+    tokens: int | None = None
+    cost_usd: float | None = None
+    duration_s: float | None = None
+
+
+@dataclass(frozen=True)
+class LayoutSpec:
+    scale: int
+    canvas_w: int
+    canvas_h: int
+    grid_x: int
+    grid_y: int
+    grid_px_w: int
+    grid_px_h: int
+    left_w: int
+    right_x: int
+    right_w: int
+    header_h: int
+    timeline_y: int
+    timeline_h: int
+    total_frames: int
+    level_bounds: tuple[tuple[int, int, int], ...]  # (level, start_idx, end_idx)
+    reasoning: bool
 
 
 @dataclass(frozen=True)
@@ -167,18 +301,14 @@ class RenderSummary:
     output: Path
     frame_events: int
     grid_frames: int
-    actions_log: Path | None
-    action_label_count: int
     trace_log: Path | None
-    reasoning_trace_count: int
-    attached_reasoning_count: int
-    trajectory_log: Path | None = None
-    trajectory_step_count: int = 0
-    prompt_evolution_log: Path | None = None
-    prompt_evolution_count: int = 0
-    panel_count: int = 0
+    decision_count: int
+    style: str
 
 
+# --------------------------------------------------------------------------- #
+# Discovery & loading
+# --------------------------------------------------------------------------- #
 def discover_recording_paths(path: str | Path) -> list[Path]:
     """Return recording files from a single file or a run/recordings directory."""
     input_path = Path(path)
@@ -191,7 +321,9 @@ def discover_recording_paths(path: str | Path) -> list[Path]:
         return [input_path]
 
     if not input_path.is_dir():
-        raise FileNotFoundError(f"No such recording file or run directory: {input_path}")
+        raise FileNotFoundError(
+            f"No such recording file or run directory: {input_path}"
+        )
 
     recordings_dir = input_path / "recordings"
     search_dirs = [recordings_dir] if recordings_dir.is_dir() else [input_path]
@@ -206,7 +338,11 @@ def discover_recording_paths(path: str | Path) -> list[Path]:
         }
     )
     if not recordings:
-        detail = f"{recordings_dir} or {input_path}" if recordings_dir.is_dir() else input_path
+        detail = (
+            f"{recordings_dir} or {input_path}"
+            if recordings_dir.is_dir()
+            else input_path
+        )
         raise ValueError(
             f"No recording JSONL files found in {detail} "
             f"({RECORDING_SUFFIX} or Hermes *.jsonl)"
@@ -246,11 +382,7 @@ def load_recording_frames(path: str | Path) -> list[RecordingFrame]:
 
 
 def parse_action_log(path: str | Path) -> dict[int, str]:
-    """Parse action labels from a run log keyed by Agent action count.
-
-    Supports both the legacy `<game> - ACTION1: count N, ...` line format and
-    the continual-harness `[<game>] step=N ACTION1[(args)]? src=...` format.
-    """
+    """Parse action labels from a run log keyed by Agent action count."""
     log_path = Path(path)
     labels: dict[int, str] = {}
 
@@ -311,6 +443,12 @@ def find_trace_log(
     if artifact_trace is not None:
         return artifact_trace
 
+    run_dir = _run_dir_for_recording(recording)
+    if run_dir is not None:
+        sibling = run_dir / "trace.jsonl"
+        if sibling.exists():
+            return sibling
+
     if actions_log is not None:
         sibling_trace = Path(actions_log).with_suffix(TRACE_SUFFIX)
         if sibling_trace.exists():
@@ -334,26 +472,12 @@ def find_trace_log(
 
 
 def find_trajectory_log(recording_path: str | Path) -> Path | None:
-    """Find a VLM trajectory JSONL file alongside the recording's artifacts."""
+    """Find a trajectory JSONL file alongside the recording's artifacts."""
     return _artifact_companion_for_recording(Path(recording_path), TRAJECTORY_SUFFIX)
 
 
-def find_prompt_evolution_log(recording_path: str | Path) -> Path | None:
-    """Find prompt_evolution.jsonl in the recording's run directory."""
-    run_dir = _run_dir_for_recording(Path(recording_path))
-    if run_dir is None:
-        return None
-    candidate = run_dir / PROMPT_EVOLUTION_NAME
-    return candidate if candidate.exists() else None
-
-
 def parse_trace_events(path: str | Path) -> list[TraceEvent]:
-    """Parse all VLM trace events into a single ordered list.
-
-    File order is preserved because the continual-harness scaffold relies on it
-    for grouping: evolution / subagent rows always appear immediately before
-    the orchestrator row that triggered them.
-    """
+    """Parse all VLM trace events into a single ordered list (file order kept)."""
     trace_path = Path(path)
     events: list[TraceEvent] = []
 
@@ -370,15 +494,7 @@ def parse_trace_events(path: str | Path) -> list[TraceEvent]:
 
 
 def group_into_panels(events: Sequence[TraceEvent]) -> list[ActionPanel]:
-    """Bucket trace events into one panel per batch of action frames.
-
-    A panel closes when an orchestrator event has total_actions > 0 (direct
-    take_actions and/or run_skill inline actions). Every preceding event since
-    the last close (no-action orchestrator rows, prompt-evolution rows,
-    subagent rows) belongs to the same panel and renders ahead of the
-    action-emitting one. A trailing run of no-action events at end-of-file
-    has no frames to attach to and is dropped.
-    """
+    """Bucket trace events into one panel per batch of action frames."""
     panels: list[ActionPanel] = []
     buffer: list[TraceEvent] = []
     for event in events:
@@ -398,59 +514,6 @@ def group_into_panels(events: Sequence[TraceEvent]) -> list[ActionPanel]:
     return panels
 
 
-def parse_trajectory_log(path: str | Path) -> dict[int, list[JsonObject]]:
-    """Parse executed tool_calls per action_counter from a trajectory JSONL file."""
-    trajectory_path = Path(path)
-    by_step: dict[int, list[JsonObject]] = {}
-
-    with trajectory_path.open("r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            event = _load_json_object(stripped, trajectory_path, line_number)
-            action_counter = _int_or_none(event.get("action_counter"))
-            if action_counter is None:
-                continue
-
-            calls = event.get("tool_calls")
-            if not isinstance(calls, list):
-                continue
-            by_step[action_counter] = [
-                cast(JsonObject, call) for call in calls if isinstance(call, dict)
-            ]
-
-    return by_step
-
-
-def parse_prompt_evolution_log(path: str | Path) -> dict[int, PromptEvolutionEntry]:
-    """Parse prompt-evolution entries per action_counter."""
-    evolution_path = Path(path)
-    by_step: dict[int, PromptEvolutionEntry] = {}
-
-    with evolution_path.open("r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            event = _load_json_object(stripped, evolution_path, line_number)
-            action_counter = _int_or_none(event.get("action_counter"))
-            generation = _int_or_none(event.get("generation"))
-            if action_counter is None or generation is None:
-                continue
-
-            by_step[action_counter] = PromptEvolutionEntry(
-                generation=generation,
-                accepted=bool(event.get("accepted")),
-                reasoning=_clean_string(event.get("reasoning")),
-                validation_error=_clean_string(event.get("validation_error")),
-            )
-
-    return by_step
-
-
 def apply_action_labels(
     frames: Sequence[RecordingFrame],
     action_labels: dict[int, str],
@@ -463,23 +526,356 @@ def apply_action_labels(
     ]
 
 
-def apply_reasoning_traces(
+# --------------------------------------------------------------------------- #
+# Decision model
+# --------------------------------------------------------------------------- #
+def build_decisions(
     frames: Sequence[RecordingFrame],
-    reasoning_traces: dict[int, str],
-) -> list[RecordingFrame]:
-    """Attach parsed VLM reasoning traces to recording frames by action count."""
-    if not reasoning_traces:
-        return list(frames)
-    return [
-        replace(
-            frame,
-            reasoning_trace=reasoning_traces.get(frame.index)
-            or _action_input_reasoning(frame.data),
+    recording_path: str | Path | None,
+    trace_events: Sequence[TraceEvent] | None,
+) -> tuple[list[Decision], str]:
+    """Build decision cards and report the detected style ('continual'/'hermes')."""
+    if trace_events:
+        return build_decisions_ch(frames, trace_events), "continual"
+    trajectory = (
+        find_trajectory_log(recording_path) if recording_path is not None else None
+    )
+    tool_by_frame = _hermes_tool_by_frame(frames, trajectory) if trajectory else None
+    return build_decisions_hermes(frames, tool_by_frame), "hermes"
+
+
+def build_decisions_ch(
+    frames: Sequence[RecordingFrame],
+    trace_events: Sequence[TraceEvent],
+) -> list[Decision]:
+    """One Decision per action-emitting VLM panel from the CH trace."""
+    panels = group_into_panels(trace_events)
+    by_index = {frame.index: frame for frame in frames}
+    last_frame = max(by_index, default=-1)
+
+    decisions: list[Decision] = []
+    prev_ts: datetime | None = None
+    for index, panel in enumerate(panels):
+        start = max(0, panel.frame_start)
+        end = min(panel.frame_end, last_frame)
+        closing = panel.events[-1]
+
+        panel_frames = [by_index[i] for i in range(start, end + 1) if i in by_index]
+        chips = _chips_for_frames(panel_frames)
+        reasoning = _reasoning_for_panel(panel)
+        tool_tags = _tool_tags_for_panel(panel)
+        level = _frame_level(by_index.get(end))
+
+        tokens = _usage_output_tokens(closing)
+        cost = _usage_cost_usd(closing)
+        ts = _parse_ts(closing.timestamp)
+        duration = (ts - prev_ts).total_seconds() if ts and prev_ts else None
+        if ts is not None:
+            prev_ts = ts
+
+        decisions.append(
+            Decision(
+                index=index,
+                frame_start=start,
+                frame_end=end,
+                level=level,
+                action_chips=chips,
+                reasoning=reasoning,
+                tool_tags=tool_tags,
+                tokens=tokens,
+                cost_usd=cost,
+                duration_s=duration if duration and duration > 0 else None,
+            )
         )
-        for frame in frames
-    ]
+    return decisions
 
 
+def build_decisions_hermes(
+    frames: Sequence[RecordingFrame],
+    tool_by_frame: dict[int, str] | None = None,
+) -> list[Decision]:
+    """Group consecutive frames sharing (action, reasoning, tool) into one Decision.
+
+    Hermes recordings embed per-action reasoning in `action_input.reasoning`, so
+    no trace file is needed. `tool_by_frame` (recovered from `trajectory.jsonl`)
+    labels each frame as ``take_actions`` or ``execute_code`` — the game server
+    can't record this since both arrive via the same MCP endpoint.
+    """
+    tools = tool_by_frame or {}
+    decisions: list[Decision] = []
+    run_start = 0
+    prev_key: tuple[str, str | None, str | None] | None = None
+
+    def flush(start: int, end: int) -> None:
+        frame = frames[start]
+        chip = _action_chip(frame.data.get("action_input"))
+        count = end - start + 1
+        label = f"{chip} ×{count}" if count > 1 else chip
+        tool = tools.get(start)
+        decisions.append(
+            Decision(
+                index=len(decisions),
+                frame_start=start,
+                frame_end=end,
+                level=_frame_level(frames[end]),
+                action_chips=(label,),
+                reasoning=_embedded_reasoning(frame.data.get("action_input")),
+                tool_tags=(tool,) if tool else (),
+            )
+        )
+
+    for i, frame in enumerate(frames):
+        ai = frame.data.get("action_input")
+        key = (_action_chip(ai), _embedded_reasoning(ai), tools.get(i))
+        if prev_key is not None and key != prev_key:
+            flush(run_start, i - 1)
+            run_start = i
+        prev_key = key
+    if frames:
+        flush(run_start, len(frames) - 1)
+    return decisions
+
+
+def _hermes_take_action_specs(
+    trajectory_path: str | Path,
+) -> list[tuple[str, str | None]]:
+    """Ordered (action_name, reasoning) for every top-level take_actions action.
+
+    These are the actions Hermes issued by calling the MCP `take_actions` tool
+    directly (as opposed to from inside `execute_code`).
+    """
+    path = Path(trajectory_path)
+    specs: list[tuple[str, str | None]] = []
+    with path.open("r", encoding="utf-8") as file:
+        for line in file:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if (
+                not isinstance(event, dict)
+                or event.get("type") != "tool_use"
+                or event.get("name") != "take_actions"
+            ):
+                continue
+            args = event.get("arguments")
+            actions = args.get("actions") if isinstance(args, dict) else None
+            if not isinstance(actions, list):
+                continue
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                specs.append(
+                    (
+                        _normalize_action_name(action.get("name")),
+                        _clean_string(action.get("reasoning")),
+                    )
+                )
+    return specs
+
+
+def _hermes_tool_by_frame(
+    frames: Sequence[RecordingFrame],
+    trajectory_path: str | Path | None,
+) -> dict[int, str]:
+    """Label each Hermes action frame as ``take_actions`` or ``execute_code``.
+
+    Frames whose (action, reasoning) matches a top-level take_actions call are
+    tagged ``take_actions`` (consumed in recording order); every other action
+    frame came from inside `execute_code`. RESET frames get no tool tag.
+    """
+    if trajectory_path is None:
+        return {}
+    remaining: Counter[tuple[str, str | None]] = Counter(
+        _hermes_take_action_specs(trajectory_path)
+    )
+    tags: dict[int, str] = {}
+    for frame in frames:
+        action_input = frame.data.get("action_input")
+        if not isinstance(action_input, dict):
+            continue
+        name = _normalize_action_name(action_input.get("id"))
+        if name == "RESET":
+            continue
+        key = (name, _embedded_reasoning(action_input))
+        if remaining.get(key, 0) > 0:
+            remaining[key] -= 1
+            tags[frame.index] = "take_actions"
+        else:
+            tags[frame.index] = "execute_code"
+    return tags
+
+
+def frame_decision_index(
+    decisions: Sequence[Decision], total_frames: int
+) -> dict[int, int]:
+    """Map each recording-frame index to the Decision that covers it."""
+    mapping: dict[int, int] = {}
+    for decision in decisions:
+        for frame_index in range(decision.frame_start, decision.frame_end + 1):
+            if 0 <= frame_index < total_frames:
+                mapping[frame_index] = decision.index
+    return mapping
+
+
+def _chips_for_frames(frames: Sequence[RecordingFrame]) -> tuple[str, ...]:
+    """Run-length compress the action chips across a panel's frames."""
+    chips: list[str] = []
+    run_label: str | None = None
+    run_count = 0
+
+    def emit() -> None:
+        if run_label is None:
+            return
+        chips.append(f"{run_label} ×{run_count}" if run_count > 1 else run_label)
+
+    for frame in frames:
+        label = _action_chip(frame.data.get("action_input"))
+        if label == run_label:
+            run_count += 1
+        else:
+            emit()
+            run_label = label
+            run_count = 1
+    emit()
+
+    if not chips:
+        return ("(no action)",)
+    if len(chips) > 4:
+        extra = len(chips) - 3
+        return (*chips[:3], f"+{extra} more")
+    return tuple(chips)
+
+
+def _action_chip(action_input: Any) -> str:
+    """Render an `action_input` as a compact chip label."""
+    if not isinstance(action_input, dict):
+        return "—"
+    name = _normalize_action_name(action_input.get("id"))
+    data = action_input.get("data")
+    if name == "ACTION6" and isinstance(data, dict):
+        x, y = data.get("x"), data.get("y")
+        if x is not None and y is not None:
+            return f"CLICK ({x}, {y})"
+    if name == "RESET":
+        return "RESET"
+    if name.startswith("ACTION") and name[6:].isdigit():
+        return f"A{name[6:]}"
+    return name
+
+
+def _normalize_action_name(value: Any) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return _ACTION_NAMES.get(value, f"ACTION{value}")
+    if isinstance(value, str):
+        if value.isdecimal():
+            return _ACTION_NAMES.get(int(value), value)
+        return value
+    return "—"
+
+
+def _frame_level(frame: RecordingFrame | None) -> int:
+    if frame is None:
+        return 0
+    value = _int_or_none(frame.data.get("levels_completed"))
+    return value if value is not None else 0
+
+
+def _embedded_reasoning(action_input: Any) -> str | None:
+    """Pull Hermes' per-action reasoning out of `action_input.reasoning`."""
+    if not isinstance(action_input, dict):
+        return None
+    reasoning = action_input.get("reasoning")
+    if isinstance(reasoning, dict):
+        reasoning = reasoning.get("reasoning")
+    return _clean_string(reasoning)
+
+
+def _reasoning_for_panel(panel: ActionPanel) -> str | None:
+    """Pick the reasoning text that best explains a panel's action."""
+    closing = panel.events[-1]
+    for call in closing.calls:
+        if call.kind == "action_batch":
+            text = _clean_string(call.args.get("reasoning"))
+            if text:
+                return text
+        if call.name == "run_skill":
+            text = _clean_string(call.args.get("reasoning"))
+            if text:
+                return text
+    return _clean_string(closing.reasoning)
+
+
+def _tool_tags_for_panel(panel: ActionPanel) -> tuple[str, ...]:
+    """Names of the analysis/meta tools that contributed to the action."""
+    tags: list[str] = []
+    for event in panel.events:
+        if event.kind == "subagent":
+            info = event.subagent_info or {}
+            name = _clean_string(info.get("name"))
+            tag = f"subagent:{name}" if name else "subagent"
+            if tag not in tags:
+                tags.append(tag)
+        for call in event.calls:
+            if call.kind in {"action_batch", "action_rejected"}:
+                continue
+            label = _tool_tag_label(call)
+            if label and label not in tags:
+                tags.append(label)
+    return tuple(tags[:6])
+
+
+def _tool_tag_label(call: CallEntry) -> str | None:
+    if call.name == "run_skill":
+        skill = _clean_string((call.result or {}).get("name"))
+        return f"skill:{skill}" if skill else "run_skill"
+    if call.name == "process_skill":
+        op = _clean_string(call.args.get("operation")) or "edit"
+        return f"skill·{op}"
+    if call.name == "process_memory":
+        op = _clean_string(call.args.get("operation")) or "edit"
+        return f"memory·{op}"
+    if call.name == "process_subagent":
+        return "subagent·edit"
+    if call.name == "run_subagent":
+        return "run_subagent"
+    return _clean_string(call.name)
+
+
+def _usage_output_tokens(event: TraceEvent) -> int | None:
+    cost = event.usage_cost or {}
+    billable = _int_or_none(cost.get("billable_output_tokens"))
+    if billable is not None:
+        return billable
+    usage = event.usage or {}
+    return _int_or_none(usage.get("output"))
+
+
+def _usage_cost_usd(event: TraceEvent) -> float | None:
+    cost = event.usage_cost or {}
+    value = cost.get("current_usd")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Grid rendering
+# --------------------------------------------------------------------------- #
 def grid_to_image(grid: Grid, scale: int = 1) -> Image.Image:
     """Render a 2-D ARC grid to a crisp RGBA image."""
     if scale < 1:
@@ -503,39 +899,6 @@ def grid_to_image(grid: Grid, scale: int = 1) -> Image.Image:
     return image.resize((width * scale, height * scale), Image.Resampling.NEAREST)
 
 
-def render_recording_frame(
-    frame: RecordingFrame,
-    *,
-    scale: int = 8,
-    overlay: bool = True,
-    reasoning_panel: bool = False,
-) -> Image.Image:
-    """Render the first grid from one recording event."""
-    grid_frame = expand_recording_frames([frame])[0]
-    return render_recording_grid_frame(
-        grid_frame,
-        scale=scale,
-        overlay=overlay,
-        reasoning_panel=reasoning_panel,
-    )
-
-
-def render_recording_grid_frame(
-    grid_frame: RecordingGridFrame,
-    *,
-    scale: int = 8,
-    overlay: bool = True,
-    reasoning_panel: bool = False,
-) -> Image.Image:
-    """Render one grid. Multi-grid recording events become sequential GIF frames."""
-    image = grid_to_image(grid_frame.grid, scale=scale)
-    if overlay:
-        image = _add_overlay(image, grid_frame)
-    if reasoning_panel:
-        image = _add_reasoning_panel(image, grid_frame)
-    return image
-
-
 def expand_recording_frames(
     frames: Sequence[RecordingFrame],
 ) -> list[RecordingGridFrame]:
@@ -555,33 +918,612 @@ def expand_recording_frames(
     return grid_frames
 
 
+# --------------------------------------------------------------------------- #
+# Web-styled frame renderer
+# --------------------------------------------------------------------------- #
+def render_recording_frame(
+    frame: RecordingFrame,
+    *,
+    scale: int = 8,
+    overlay: bool = True,
+) -> Image.Image:
+    """Render the first grid from one recording event."""
+    grid_frame = expand_recording_frames([frame])[0]
+    return render_recording_grid_frame(grid_frame, scale=scale, overlay=overlay)
+
+
+def render_recording_grid_frame(
+    grid_frame: RecordingGridFrame,
+    *,
+    scale: int = 8,
+    overlay: bool = True,
+    layout: LayoutSpec | None = None,
+    decisions: Sequence[Decision] | None = None,
+    decision_index: int | None = None,
+) -> Image.Image:
+    """Render one grid, optionally inside the full blog-replay layout."""
+    grid_image = grid_to_image(grid_frame.grid, scale=scale)
+    if not overlay:
+        return grid_image
+
+    if layout is None:
+        layout = _compute_layout(
+            [grid_frame], [grid_frame.event], scale, reasoning=True
+        )
+    if decisions is None:
+        decisions = build_decisions_hermes([grid_frame.event])
+        decision_index = 0 if decisions else None
+    return _render_web_frame(grid_frame, grid_image, layout, decisions, decision_index)
+
+
 def render_recording_images(
     frames: Sequence[RecordingFrame],
     *,
     scale: int = 8,
     overlay: bool = True,
     reasoning: bool = True,
+    decisions: Sequence[Decision] | None = None,
+    total_frames: int | None = None,
 ) -> list[Image.Image]:
     """Render recording events to one image per grid frame."""
     if not frames:
         raise ValueError("At least one frame is required")
 
     grid_frames = expand_recording_frames(frames)
-    include_reasoning_panel = reasoning and any(
-        grid_frame.event.reasoning_trace for grid_frame in grid_frames
+
+    if not overlay:
+        images = [grid_to_image(gf.grid, scale=scale) for gf in grid_frames]
+        return _pad_to_common_size(images)
+
+    total = total_frames if total_frames is not None else len(frames)
+    if decisions is None:
+        decisions = build_decisions_hermes(frames)
+    dec_for_frame = frame_decision_index(decisions, total)
+    layout = _compute_layout(
+        grid_frames, frames, scale, reasoning=reasoning, total=total
     )
+
     images = [
-        render_recording_grid_frame(
-            grid_frame,
-            scale=scale,
-            overlay=overlay,
-            reasoning_panel=include_reasoning_panel,
+        _render_web_frame(
+            gf,
+            grid_to_image(gf.grid, scale=scale),
+            layout,
+            decisions,
+            dec_for_frame.get(gf.event.index),
         )
-        for grid_frame in grid_frames
+        for gf in grid_frames
     ]
     return _pad_to_common_size(images)
 
 
+def _compute_layout(
+    grid_frames: Sequence[RecordingGridFrame],
+    frames: Sequence[RecordingFrame],
+    scale: int,
+    *,
+    reasoning: bool,
+    total: int | None = None,
+) -> LayoutSpec:
+    max_w = max((len(row) for gf in grid_frames for row in gf.grid), default=1)
+    max_h = max((len(gf.grid) for gf in grid_frames), default=1)
+    grid_px_w = max_w * scale
+    grid_px_h = max_h * scale
+
+    pad = 24
+    header_h = 48
+    gap = 14
+    timeline_h = 52
+    grid_x = pad
+    grid_y = header_h
+    left_w = grid_x + grid_px_w + pad
+    timeline_y = grid_y + grid_px_h + gap
+    left_h = timeline_y + timeline_h + pad
+
+    right_w = 480 if reasoning else 0
+    canvas_w = left_w + right_w
+    canvas_h = max(left_h, 360 if reasoning else left_h)
+
+    total_frames = total if total is not None else len(frames)
+    return LayoutSpec(
+        scale=scale,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+        grid_x=grid_x,
+        grid_y=grid_y,
+        grid_px_w=grid_px_w,
+        grid_px_h=grid_px_h,
+        left_w=left_w,
+        right_x=left_w,
+        right_w=right_w,
+        header_h=header_h,
+        timeline_y=timeline_y,
+        timeline_h=timeline_h,
+        total_frames=max(1, total_frames),
+        level_bounds=_level_bounds(frames),
+        reasoning=reasoning,
+    )
+
+
+def _level_bounds(
+    frames: Sequence[RecordingFrame],
+) -> tuple[tuple[int, int, int], ...]:
+    bounds: list[tuple[int, int, int]] = []
+    for frame in frames:
+        level = _frame_level(frame)
+        if bounds and bounds[-1][0] == level:
+            prev_level, start, _ = bounds[-1]
+            bounds[-1] = (prev_level, start, frame.index)
+        else:
+            bounds.append((level, frame.index, frame.index))
+    return tuple(bounds)
+
+
+def _render_web_frame(
+    grid_frame: RecordingGridFrame,
+    grid_image: Image.Image,
+    layout: LayoutSpec,
+    decisions: Sequence[Decision],
+    decision_index: int | None,
+) -> Image.Image:
+    fonts = _load_fonts()
+    canvas = Image.new("RGBA", (layout.canvas_w, layout.canvas_h), THEME.bg)
+    draw = ImageDraw.Draw(canvas)
+
+    _draw_left_header(draw, layout, grid_frame, fonts)
+    _paste_grid(canvas, draw, grid_image, layout)
+    _draw_timeline(draw, layout, grid_frame, fonts)
+
+    if layout.reasoning:
+        _draw_right_column(draw, layout, decisions, decision_index, fonts)
+    return canvas
+
+
+def _draw_left_header(
+    draw: ImageDraw.ImageDraw,
+    layout: LayoutSpec,
+    grid_frame: RecordingGridFrame,
+    fonts: FontSet,
+) -> None:
+    cx = layout.grid_x + layout.grid_px_w // 2
+    draw.text(
+        (layout.grid_x, 16),
+        f"Step {grid_frame.event.index}",
+        font=fonts.title,
+        fill=THEME.text_secondary,
+    )
+    level = _frame_level(grid_frame.event) + 1
+    label = f"Level: {level}"
+    _draw_centered(draw, label, cx, 15, fonts.title, THEME.text_primary)
+
+    state = _clean_string(grid_frame.event.data.get("state"))
+    if state and state != "NOT_FINISHED":
+        right = layout.grid_x + layout.grid_px_w
+        color = THEME.accent if state == "WIN" else (240, 120, 120, 255)
+        _draw_right_aligned(draw, state, right, 16, fonts.small, color)
+
+
+def _paste_grid(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    grid_image: Image.Image,
+    layout: LayoutSpec,
+) -> None:
+    # Center a smaller grid inside the reserved area; backdrop + cell gridlines.
+    area = (
+        layout.grid_x,
+        layout.grid_y,
+        layout.grid_x + layout.grid_px_w,
+        layout.grid_y + layout.grid_px_h,
+    )
+    _rounded_rect(draw, area, 6, fill=THEME.grid_bg)
+    off_x = layout.grid_x + (layout.grid_px_w - grid_image.width) // 2
+    off_y = layout.grid_y + (layout.grid_px_h - grid_image.height) // 2
+    canvas.alpha_composite(_with_grid_lines(grid_image, layout.scale), (off_x, off_y))
+
+
+def _with_grid_lines(image: Image.Image, scale: int) -> Image.Image:
+    if scale < 4:
+        return image
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for x in range(0, image.width + 1, scale):
+        draw.line((x, 0, x, image.height), fill=THEME.grid_line, width=1)
+    for y in range(0, image.height + 1, scale):
+        draw.line((0, y, image.width, y), fill=THEME.grid_line, width=1)
+    return Image.alpha_composite(image, overlay)
+
+
+def _draw_timeline(
+    draw: ImageDraw.ImageDraw,
+    layout: LayoutSpec,
+    grid_frame: RecordingGridFrame,
+    fonts: FontSet,
+) -> None:
+    x0 = layout.grid_x
+    x1 = layout.grid_x + layout.grid_px_w
+    bar_top = layout.timeline_y
+    bar_h = 10
+    width = max(1, x1 - x0)
+    total = layout.total_frames
+    head_x = x0 + round((grid_frame.event.index + 1) / total * width)
+
+    _rounded_rect(draw, (x0, bar_top, x1, bar_top + bar_h), 5, fill=THEME.timeline_bg)
+
+    last_label_x = -100
+    for level, start, end in layout.level_bounds:
+        seg_x0 = x0 + round(start / total * width)
+        seg_x1 = max(x0 + round((end + 1) / total * width), seg_x0 + 1)
+        color = _LEVEL_COLORS[level % len(_LEVEL_COLORS)]
+        dim = _blend(color, THEME.timeline_bg, 0.6)
+        # Played part keeps the bright colour; the rest is dimmed in place.
+        if head_x > seg_x0:
+            draw.rectangle(
+                (seg_x0, bar_top, min(seg_x1, head_x), bar_top + bar_h), fill=color
+            )
+        if head_x < seg_x1:
+            draw.rectangle(
+                (max(seg_x0, head_x), bar_top, seg_x1, bar_top + bar_h), fill=dim
+            )
+        if start > 0:
+            draw.line(
+                (seg_x0, bar_top - 2, seg_x0, bar_top + bar_h + 2),
+                fill=THEME.bg,
+                width=2,
+            )
+            if seg_x0 - last_label_x >= 14:
+                draw.text(
+                    (seg_x0 + 2, bar_top + bar_h + 3),
+                    str(level + 1),
+                    font=fonts.level,
+                    fill=THEME.text_muted,
+                )
+                last_label_x = seg_x0
+
+    # Playhead marker.
+    draw.line(
+        (head_x, bar_top - 4, head_x, bar_top + bar_h + 4),
+        fill=THEME.playhead,
+        width=2,
+    )
+
+
+def _draw_right_column(
+    draw: ImageDraw.ImageDraw,
+    layout: LayoutSpec,
+    decisions: Sequence[Decision],
+    decision_index: int | None,
+    fonts: FontSet,
+) -> None:
+    rx = layout.right_x
+    draw.rectangle((rx, 0, layout.canvas_w, layout.canvas_h), fill=THEME.panel_bg)
+    draw.line((rx, 0, rx, layout.canvas_h), fill=THEME.divider, width=1)
+
+    pad = 18
+    inner_x = rx + pad
+    inner_w = layout.right_w - 2 * pad
+
+    draw.text(
+        (inner_x, 18), "REASONING LOG", font=fonts.header, fill=THEME.text_primary
+    )
+    _draw_pill(
+        draw,
+        inner_x + inner_w - 84,
+        16,
+        "Batches",
+        fonts.tiny,
+        THEME.text_secondary,
+        THEME.tag_bg,
+        width=84,
+    )
+
+    y = 48
+    bottom = layout.canvas_h - 14
+    if decision_index is None or not decisions:
+        draw.text(
+            (inner_x, y),
+            "No decision for this frame.",
+            font=fonts.body,
+            fill=THEME.text_muted,
+        )
+        return
+
+    y = _draw_expanded_card(
+        draw,
+        inner_x,
+        y,
+        inner_w,
+        decisions[decision_index],
+        fonts,
+        bottom,
+    )
+    for prev in range(decision_index - 1, -1, -1):
+        if y >= bottom - 36:
+            break
+        y = _draw_collapsed_card(draw, inner_x, y, inner_w, decisions[prev], fonts)
+
+
+def _draw_expanded_card(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    width: int,
+    decision: Decision,
+    fonts: FontSet,
+    bottom: int,
+) -> int:
+    pad = 12
+    body_lh = _font_line_height(fonts.body)
+    chip_row_h = _font_line_height(fonts.chip) + 8
+    tag_row_h = _font_line_height(fonts.tiny) + 8
+    text_w = width - 2 * pad
+    right = x + width - pad
+
+    label = f"Batch {decision.index + 1}"
+    label_h = _font_line_height(fonts.frame_big)
+    chip_first_x = x + pad + _text_width(label, fonts.frame_big) + 10
+    chip_rows = _pill_rows(
+        decision.action_chips,
+        first_x=chip_first_x,
+        wrap_x=x + pad,
+        max_right=right,
+        font=fonts.chip,
+    )
+    header_h = max(label_h, chip_rows * chip_row_h)
+
+    tag_rows = _pill_rows(
+        decision.tool_tags,
+        first_x=x + pad,
+        wrap_x=x + pad,
+        max_right=right,
+        font=fonts.tiny,
+    )
+    has_meta = decision.tokens is not None or decision.cost_usd is not None
+
+    reasoning = decision.reasoning or "(no reasoning recorded)"
+    lines = _wrap_text_to_width(reasoning, fonts.body, text_w)
+    reserved = pad + header_h + 8 + tag_rows * tag_row_h + (18 if has_meta else 0) + pad
+    max_lines = min(14, max(2, (bottom - y - reserved) // body_lh))
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = _fit_text_to_width(lines[-1], fonts.body, text_w, suffix=" …")
+
+    card_h = (
+        pad
+        + header_h
+        + len(lines) * body_lh
+        + 8
+        + tag_rows * tag_row_h
+        + (18 if has_meta else 0)
+        + pad
+    )
+    card_bottom = min(y + card_h, bottom)
+    _rounded_rect(
+        draw,
+        (x, y, x + width, card_bottom),
+        8,
+        fill=THEME.card_current_bg,
+        outline=THEME.accent_soft,
+    )
+
+    cy = y + pad
+    draw.text((x + pad, cy), label, font=fonts.frame_big, fill=THEME.text_primary)
+    _draw_pills(
+        draw,
+        decision.action_chips,
+        first_x=chip_first_x,
+        wrap_x=x + pad,
+        y=cy + (label_h - chip_row_h) // 2 + 2,
+        max_right=right,
+        row_h=chip_row_h,
+        font=fonts.chip,
+        fg=THEME.chip_fg,
+        bg=THEME.accent,
+    )
+    cy += header_h
+
+    for line in lines:
+        draw.text((x + pad, cy), line, font=fonts.body, fill=THEME.text_secondary)
+        cy += body_lh
+    cy += 8
+
+    if tag_rows:
+        _draw_pills(
+            draw,
+            decision.tool_tags,
+            first_x=x + pad,
+            wrap_x=x + pad,
+            y=cy,
+            max_right=right,
+            row_h=tag_row_h,
+            font=fonts.tiny,
+            fg=THEME.tag_fg,
+            bg=THEME.tag_bg,
+        )
+        cy += tag_rows * tag_row_h
+
+    if has_meta:
+        draw.text(
+            (x + pad, cy),
+            _format_meta(decision),
+            font=fonts.small,
+            fill=THEME.text_muted,
+        )
+
+    return card_bottom + 10
+
+
+def _draw_collapsed_card(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    width: int,
+    decision: Decision,
+    fonts: FontSet,
+) -> int:
+    height = 34
+    _rounded_rect(draw, (x, y, x + width, y + height), 7, fill=THEME.card_bg)
+    label = f"Batch {decision.index + 1}"
+    draw.text((x + 12, y + 9), label, font=fonts.title, fill=THEME.text_secondary)
+
+    chip_x = x + 12 + _text_width(label, fonts.title) + 10
+    right = x + width - 12
+    for chip in decision.action_chips:
+        if chip_x + _pill_width(chip, fonts.chip) > right:
+            draw.text((chip_x, y + 9), "…", font=fonts.title, fill=THEME.text_muted)
+            break
+        chip_x = _draw_chip(draw, chip_x, y + 7, chip, fonts.chip) + 6
+    return y + height + 8
+
+
+def _format_meta(decision: Decision) -> str:
+    bits: list[str] = []
+    if decision.tokens is not None:
+        bits.append(f"{decision.tokens:,} out tok")
+    if decision.cost_usd is not None:
+        bits.append(f"${decision.cost_usd:.4f}")
+    if decision.duration_s is not None:
+        bits.append(_format_duration(decision.duration_s))
+    return "   ".join(bits)
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds // 60}m {seconds % 60:02d}s"
+
+
+def _draw_chip(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+) -> int:
+    return _draw_pill(draw, x, y, text, font, THEME.chip_fg, THEME.accent)
+
+
+def _pill_width(text: str, font: ImageFont.FreeTypeFont) -> int:
+    return _text_width(text, font) + 16  # 8px horizontal padding each side
+
+
+def _pill_rows(
+    pills: Sequence[str],
+    *,
+    first_x: int,
+    wrap_x: int,
+    max_right: int,
+    font: ImageFont.FreeTypeFont,
+) -> int:
+    """Number of lines `pills` occupy when wrapped at `max_right`."""
+    if not pills:
+        return 0
+    x = first_x
+    rows = 1
+    for text in pills:
+        w = _pill_width(text, font)
+        if x + w > max_right and x > wrap_x:
+            rows += 1
+            x = wrap_x
+        x += w + 6
+    return rows
+
+
+def _draw_pills(
+    draw: ImageDraw.ImageDraw,
+    pills: Sequence[str],
+    *,
+    first_x: int,
+    wrap_x: int,
+    y: int,
+    max_right: int,
+    row_h: int,
+    font: ImageFont.FreeTypeFont,
+    fg: RGBA,
+    bg: RGBA,
+) -> None:
+    """Draw pills left-to-right, wrapping onto new rows so none overflow."""
+    x = first_x
+    cy = y
+    for text in pills:
+        w = _pill_width(text, font)
+        if x + w > max_right and x > wrap_x:
+            cy += row_h
+            x = wrap_x
+        _draw_pill(draw, x, cy, text, font, fg, bg, width=w)
+        x += w + 6
+
+
+def _draw_pill(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fg: RGBA,
+    bg: RGBA,
+    *,
+    width: int | None = None,
+) -> int:
+    pad_x = 8
+    text_w = _text_width(text, font)
+    box_w = width if width is not None else text_w + 2 * pad_x
+    line_h = _font_line_height(font)
+    box_h = line_h + 4
+    _rounded_rect(draw, (x, y, x + box_w, y + box_h), box_h // 2, fill=bg)
+    tx = x + (box_w - text_w) // 2 if width is not None else x + pad_x
+    draw.text((tx, y + 2), text, font=font, fill=fg)
+    return x + box_w
+
+
+def _rounded_rect(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    radius: int,
+    *,
+    fill: RGBA | None = None,
+    outline: RGBA | None = None,
+    width: int = 1,
+) -> None:
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 2 * radius or y1 - y0 < 2 * radius:
+        radius = max(0, min((x1 - x0) // 2, (y1 - y0) // 2))
+    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
+
+def _blend(color: RGBA, toward: RGBA, t: float) -> RGBA:
+    """Blend `color` toward `toward` by fraction t (0 = color, 1 = toward)."""
+    return cast(
+        RGBA,
+        tuple(round(a + (b - a) * t) for a, b in zip(color, toward)),
+    )
+
+
+def _draw_centered(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    cx: int,
+    y: int,
+    font: ImageFont.FreeTypeFont,
+    fill: RGBA,
+) -> None:
+    draw.text((cx - _text_width(text, font) // 2, y), text, font=font, fill=fill)
+
+
+def _draw_right_aligned(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    right: int,
+    y: int,
+    font: ImageFont.FreeTypeFont,
+    fill: RGBA,
+) -> None:
+    draw.text((right - _text_width(text, font), y), text, font=font, fill=fill)
+
+
+# --------------------------------------------------------------------------- #
+# Export
+# --------------------------------------------------------------------------- #
 def export_gif(
     frames: Sequence[RecordingFrame],
     output_path: str | Path,
@@ -590,6 +1532,8 @@ def export_gif(
     scale: int = 8,
     overlay: bool = True,
     reasoning: bool = True,
+    decisions: Sequence[Decision] | None = None,
+    total_frames: int | None = None,
 ) -> Path:
     """Export recording frames to an animated GIF."""
     if fps < 1:
@@ -603,6 +1547,8 @@ def export_gif(
         scale=scale,
         overlay=overlay,
         reasoning=reasoning,
+        decisions=decisions,
+        total_frames=total_frames,
     )
     gif_frames = [
         image.convert("P", palette=Image.Palette.ADAPTIVE) for image in images
@@ -631,6 +1577,8 @@ def export_mp4(
     scale: int = 8,
     overlay: bool = True,
     reasoning: bool = True,
+    decisions: Sequence[Decision] | None = None,
+    total_frames: int | None = None,
 ) -> Path:
     """Export recording frames to an MP4 via ffmpeg."""
     if fps < 1:
@@ -651,6 +1599,8 @@ def export_mp4(
             scale=scale,
             overlay=overlay,
             reasoning=reasoning,
+            decisions=decisions,
+            total_frames=total_frames,
         )
     )
     width, height = images[0].size
@@ -708,26 +1658,22 @@ def export_recording(
     scale: int = 8,
     overlay: bool = True,
     reasoning: bool = True,
+    decisions: Sequence[Decision] | None = None,
+    total_frames: int | None = None,
 ) -> Path:
     """Export recording frames to the requested video format."""
+    kwargs: dict[str, Any] = dict(
+        fps=fps,
+        scale=scale,
+        overlay=overlay,
+        reasoning=reasoning,
+        decisions=decisions,
+        total_frames=total_frames,
+    )
     if output_format == "gif":
-        return export_gif(
-            frames,
-            output_path,
-            fps=fps,
-            scale=scale,
-            overlay=overlay,
-            reasoning=reasoning,
-        )
+        return export_gif(frames, output_path, **kwargs)
     if output_format == "mp4":
-        return export_mp4(
-            frames,
-            output_path,
-            fps=fps,
-            scale=scale,
-            overlay=overlay,
-            reasoning=reasoning,
-        )
+        return export_mp4(frames, output_path, **kwargs)
     raise ValueError(f"Unsupported output format: {output_format}")
 
 
@@ -764,112 +1710,82 @@ def output_path_for_recording(
     return output / default_output_path(recording, output_format=output_format).name
 
 
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
 def render_recording_file(
     recording_path: str | Path,
     output_path: str | Path,
     *,
     output_format: RenderFormat = "gif",
-    fps: int = 5,
+    fps: int = 10,
     scale: int = 8,
     overlay: bool = True,
-    actions_log: str | Path | None = None,
     trace_log: str | Path | None = None,
-    trajectory_log: str | Path | None = None,
-    prompt_evolution_log: str | Path | None = None,
     reasoning: bool = True,
+    max_frames: int | None = None,
 ) -> RenderSummary:
     """Render one recording file and return metadata for CLI reporting."""
     recording = Path(recording_path)
     frames = load_recording_frames(recording)
-
-    resolved_actions_log = Path(actions_log) if actions_log is not None else None
-    resolved_actions_log = resolved_actions_log or find_actions_log(recording)
-    if resolved_actions_log is not None:
-        action_labels = parse_action_log(resolved_actions_log)
-        frames = apply_action_labels(frames, action_labels)
-    else:
-        action_labels = {}
+    total_frames = len(frames)
 
     resolved_trace_log: Path | None = None
-    resolved_trajectory_log: Path | None = None
-    resolved_prompt_evolution_log: Path | None = None
-    reasoning_traces: dict[int, str] = {}
-    trajectory_step_count = 0
-    prompt_evolution_count = 0
-    panel_count = 0
-
+    trace_events: list[TraceEvent] = []
     if reasoning:
         resolved_trace_log = Path(trace_log) if trace_log is not None else None
-        resolved_trace_log = resolved_trace_log or find_trace_log(
-            recording,
-            actions_log=resolved_actions_log,
-        )
-        resolved_trajectory_log = (
-            Path(trajectory_log) if trajectory_log is not None else None
-        )
-        resolved_trajectory_log = resolved_trajectory_log or find_trajectory_log(
-            recording
-        )
-        resolved_prompt_evolution_log = (
-            Path(prompt_evolution_log) if prompt_evolution_log is not None else None
-        )
-        resolved_prompt_evolution_log = (
-            resolved_prompt_evolution_log or find_prompt_evolution_log(recording)
-        )
+        resolved_trace_log = resolved_trace_log or find_trace_log(recording)
+        if resolved_trace_log is not None:
+            trace_events = parse_trace_events(resolved_trace_log)
 
-        events = (
-            parse_trace_events(resolved_trace_log)
-            if resolved_trace_log is not None
-            else []
-        )
-        panels = group_into_panels(events)
-        panel_count = len(panels)
-        reasoning_traces = build_panel_reasoning_traces(panels)
+    decisions, style = build_decisions(frames, recording, trace_events or None)
 
-        if resolved_trajectory_log is not None:
-            trajectory_step_count = len(parse_trajectory_log(resolved_trajectory_log))
-        if resolved_prompt_evolution_log is not None:
-            prompt_evolution_count = len(
-                parse_prompt_evolution_log(resolved_prompt_evolution_log)
-            )
-
-        frames = apply_reasoning_traces(frames, reasoning_traces)
-
-    attached_reasoning_count = sum(1 for frame in frames if frame.reasoning_trace)
-    grid_frame_count = len(expand_recording_frames(frames))
+    render_frames = _downsample(frames, max_frames)
     output = export_recording(
-        frames,
+        render_frames,
         output_path,
         output_format=output_format,
         fps=fps,
         scale=scale,
         overlay=overlay,
         reasoning=reasoning,
+        decisions=decisions,
+        total_frames=total_frames,
     )
+    grid_frame_count = len(expand_recording_frames(render_frames))
     return RenderSummary(
         recording=recording,
         output=output,
-        frame_events=len(frames),
+        frame_events=len(render_frames),
         grid_frames=grid_frame_count,
-        actions_log=resolved_actions_log,
-        action_label_count=len(action_labels),
         trace_log=resolved_trace_log,
-        reasoning_trace_count=len(reasoning_traces),
-        attached_reasoning_count=attached_reasoning_count,
-        trajectory_log=resolved_trajectory_log,
-        trajectory_step_count=trajectory_step_count,
-        prompt_evolution_log=resolved_prompt_evolution_log,
-        prompt_evolution_count=prompt_evolution_count,
-        panel_count=panel_count,
+        decision_count=len(decisions),
+        style=style,
     )
 
 
+def _downsample(
+    frames: Sequence[RecordingFrame], max_frames: int | None
+) -> list[RecordingFrame]:
+    if max_frames is None or max_frames <= 0 or len(frames) <= max_frames:
+        return list(frames)
+    stride = math.ceil(len(frames) / max_frames)
+    sampled = list(frames[::stride])
+    if sampled and sampled[-1].index != frames[-1].index:
+        sampled.append(frames[-1])
+    return sampled
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Render ARC-AGI recording JSONL files to GIF or MP4. "
-            "Input may be one .recording.jsonl/Hermes .jsonl file or a run "
-            "directory containing recordings/."
+            "Render ARC-AGI recordings to a blog-style MP4/GIF replay: game grid "
+            "+ level header on the left, a Reasoning Log of decision cards "
+            "(action + reasoning + tool use) on the right. Input may be one "
+            ".recording.jsonl/Hermes .jsonl file or a run directory."
         )
     )
     parser.add_argument(
@@ -886,30 +1802,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Output file path for one recording, or output directory for a run folder. "
-            "Defaults to writing each video beside its recording."
+            "Output file path for one recording, or output directory for a run "
+            "folder. Defaults to writing each video beside its recording."
         ),
     )
     parser.add_argument(
         "--format",
         choices=("gif", "mp4"),
-        default="gif",
-        help="Output video format. Defaults to gif.",
+        default="mp4",
+        help="Output video format. Defaults to mp4.",
     )
-    parser.add_argument("--fps", type=int, default=5, help="Playback frames per second")
+    parser.add_argument(
+        "--fps", type=int, default=10, help="Playback frames per second"
+    )
     parser.add_argument("--scale", type=int, default=8, help="Pixel-art scale factor")
     parser.add_argument(
-        "--no-overlay",
-        action="store_true",
-        help="Disable metadata overlay text.",
-    )
-    parser.add_argument(
-        "--actions-log",
-        type=Path,
+        "--max-frames",
+        type=int,
         default=None,
         help=(
-            "Optional run log to use for action overlay labels. "
-            "Defaults to auto-discovery in logs/."
+            "Stride-downsample to at most N rendered frames (useful for previewing "
+            "very long Hermes runs). Default: render every frame."
         ),
     )
     parser.add_argument(
@@ -917,33 +1830,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Optional .trace.jsonl file to render as a right-side reasoning panel. "
-            "Defaults to auto-discovery in logs/."
+            "Optional .trace.jsonl file for Continual-Harness reasoning + tool use. "
+            "Defaults to auto-discovery beside the recording."
         ),
     )
     parser.add_argument(
-        "--trajectory-log",
-        type=Path,
-        default=None,
-        help=(
-            "Optional .trajectory.jsonl file used to enrich the panel with the "
-            "results of executed analysis tools. Defaults to the sibling "
-            "artifacts/*.trajectory.jsonl or Hermes logs/trajectory.jsonl."
-        ),
-    )
-    parser.add_argument(
-        "--prompt-evolution-log",
-        type=Path,
-        default=None,
-        help=(
-            "Optional prompt_evolution.jsonl file used to annotate evolution "
-            "steps. Defaults to the run directory's prompt_evolution.jsonl."
-        ),
-    )
-    parser.add_argument(
-        "--no-reasoning",
+        "--no-panel",
         action="store_true",
-        help="Disable the right-side VLM reasoning panel.",
+        help="Render only the game grid, with no header/timeline/reasoning chrome.",
+    )
+    # Back-compat: older invocations passed these; accept and map onto --no-panel.
+    parser.add_argument("--no-overlay", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-reasoning", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--actions-log", type=Path, default=None, help=argparse.SUPPRESS
     )
     return parser
 
@@ -957,12 +1857,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_format = cast(RenderFormat, args.format)
     fps = cast(int, args.fps)
     scale = cast(int, args.scale)
-    overlay = not cast(bool, args.no_overlay)
-    actions_log_arg = cast(Path | None, args.actions_log)
+    max_frames = cast("int | None", args.max_frames)
     trace_log_arg = cast(Path | None, args.trace_log)
-    trajectory_log_arg = cast(Path | None, args.trajectory_log)
-    prompt_evolution_log_arg = cast(Path | None, args.prompt_evolution_log)
-    reasoning = not cast(bool, args.no_reasoning)
+    overlay = not (cast(bool, args.no_panel) or cast(bool, args.no_overlay))
+    reasoning = overlay and not cast(bool, args.no_reasoning)
 
     recordings = discover_recording_paths(input_path)
     summaries: list[RenderSummary] = []
@@ -980,47 +1878,181 @@ def main(argv: Sequence[str] | None = None) -> int:
             fps=fps,
             scale=scale,
             overlay=overlay,
-            actions_log=actions_log_arg,
             trace_log=trace_log_arg,
-            trajectory_log=trajectory_log_arg,
-            prompt_evolution_log=prompt_evolution_log_arg,
             reasoning=reasoning,
+            max_frames=max_frames,
         )
         summaries.append(summary)
         print(
             f"Wrote {summary.output} from {summary.frame_events} frame events "
             f"({summary.grid_frames} rendered video frames)"
         )
-        if summary.actions_log is not None and summary.action_label_count:
-            print(
-                f"Loaded {summary.action_label_count} action labels "
-                f"from {summary.actions_log}"
+        if overlay and summary.decision_count:
+            source = (
+                summary.trace_log
+                if summary.trace_log is not None
+                else "recording (embedded reasoning)"
             )
-        if summary.trace_log is not None and summary.reasoning_trace_count:
             print(
-                f"Loaded {summary.reasoning_trace_count} reasoning traces "
-                f"({summary.panel_count} batched VLM panels) "
-                f"from {summary.trace_log} "
-                f"({summary.attached_reasoning_count} attached to recording frames)"
-            )
-        if summary.trajectory_log is not None and summary.trajectory_step_count:
-            print(
-                f"Found {summary.trajectory_step_count} trajectory steps "
-                f"in {summary.trajectory_log}"
-            )
-        if (
-            summary.prompt_evolution_log is not None
-            and summary.prompt_evolution_count
-        ):
-            print(
-                f"Annotated {summary.prompt_evolution_count} prompt-evolution "
-                f"steps from {summary.prompt_evolution_log}"
+                f"  {summary.decision_count} decision cards "
+                f"[{summary.style}] from {source}"
             )
     if len(summaries) > 1:
         print(f"Rendered {len(summaries)} recordings from {input_path}")
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Trace parsing internals
+# --------------------------------------------------------------------------- #
+def _build_trace_event(raw: JsonObject, *, file_index: int) -> TraceEvent | None:
+    action_counter = _int_or_none(raw.get("action_counter"))
+    if action_counter is None:
+        return None
+
+    tools_exposed = _clean_string(raw.get("tools_exposed"))
+    kind: EventKind
+    if tools_exposed == "evolution":
+        kind = "evolution"
+    elif tools_exposed == "subagent":
+        kind = "subagent"
+    else:
+        kind = "orchestrator"
+
+    reasoning = _clean_string(raw.get("reasoning"))
+    error = _clean_string(raw.get("error"))
+    actions_executed = _int_or_none(raw.get("actions_executed"))
+    force = bool(raw.get("force_take_actions"))
+
+    emitted = _output_function_calls(raw)
+    executed_records = _executed_tool_call_records(raw)
+    tc_index = 0
+    calls: list[CallEntry] = []
+    for fc in emitted:
+        name = _clean_string(fc.get("name"))
+        if name is None:
+            continue
+        args = fc.get("args") if isinstance(fc.get("args"), dict) else {}
+        if name == "take_actions":
+            calls.append(
+                CallEntry(
+                    name=name,
+                    kind="action_batch",
+                    args=cast(JsonObject, args),
+                    executed=(actions_executed or 0) > 0,
+                    actions_committed=actions_executed,
+                )
+            )
+            continue
+        if _is_action_name(name):
+            calls.append(
+                CallEntry(
+                    name=name,
+                    kind="action_rejected",
+                    args=cast(JsonObject, args),
+                    executed=False,
+                )
+            )
+            continue
+        if name == "evolve_system_prompt":
+            calls.append(
+                CallEntry(
+                    name=name,
+                    kind="evolution",
+                    args=cast(JsonObject, args),
+                    executed=True,
+                )
+            )
+            continue
+
+        record = (
+            executed_records[tc_index] if tc_index < len(executed_records) else None
+        )
+        tc_index += 1
+        result_value = record.get("result") if isinstance(record, dict) else None
+        record_error = (
+            _clean_string(record.get("error")) if isinstance(record, dict) else None
+        )
+        actions_inline = None
+        if isinstance(record, dict):
+            actions_inline = _int_or_none(record.get("actions_taken_inline"))
+            if not actions_inline and isinstance(result_value, dict):
+                actions_inline = _int_or_none(result_value.get("actions_taken_inline"))
+        calls.append(
+            CallEntry(
+                name=name,
+                kind="analysis",
+                args=cast(JsonObject, args),
+                executed=record is not None,
+                result=cast(JsonObject, result_value)
+                if isinstance(result_value, dict)
+                else None,
+                error=record_error,
+                actions_taken_inline=actions_inline,
+            )
+        )
+
+    evolution_entry: PromptEvolutionEntry | None = None
+    evolution_raw = raw.get("evolution")
+    if kind == "evolution" and isinstance(evolution_raw, dict):
+        generation = _int_or_none(evolution_raw.get("generation")) or 0
+        evolution_entry = PromptEvolutionEntry(
+            generation=generation,
+            accepted=bool(evolution_raw.get("accepted")),
+            reasoning=reasoning,
+            validation_error=_clean_string(evolution_raw.get("validation_error")),
+        )
+
+    subagent_info: JsonObject | None = None
+    subagent_raw = raw.get("subagent")
+    if kind == "subagent" and isinstance(subagent_raw, dict):
+        subagent_info = cast(JsonObject, subagent_raw)
+
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else None
+    usage_cost = (
+        raw.get("usage_cost") if isinstance(raw.get("usage_cost"), dict) else None
+    )
+
+    return TraceEvent(
+        file_index=file_index,
+        vlm_call=_int_or_none(raw.get("vlm_call")),
+        round=_int_or_none(raw.get("round")),
+        action_counter=action_counter,
+        tools_exposed=tools_exposed,
+        kind=kind,
+        actions_executed=actions_executed,
+        force_take_actions=force,
+        reasoning=reasoning,
+        error=error,
+        calls=tuple(calls),
+        evolution=evolution_entry,
+        subagent_info=subagent_info,
+        usage=cast("JsonObject | None", usage),
+        usage_cost=cast("JsonObject | None", usage_cost),
+        timestamp=_clean_string(raw.get("timestamp")),
+    )
+
+
+def _output_function_calls(event: JsonObject) -> list[JsonObject]:
+    output = event.get("output")
+    if not isinstance(output, dict):
+        return []
+    function_calls = output.get("function_calls")
+    if not isinstance(function_calls, list):
+        return []
+    return [cast(JsonObject, call) for call in function_calls if isinstance(call, dict)]
+
+
+def _executed_tool_call_records(event: JsonObject) -> list[JsonObject]:
+    records = event.get("tool_calls")
+    if not isinstance(records, list):
+        return []
+    return [cast(JsonObject, r) for r in records if isinstance(r, dict)]
+
+
+# --------------------------------------------------------------------------- #
+# Low-level helpers
+# --------------------------------------------------------------------------- #
 def _load_json_object(line: str, path: Path, line_number: int) -> JsonObject:
     try:
         value = json.loads(line)
@@ -1083,7 +2115,8 @@ def _is_recording_jsonl(path: Path) -> bool:
         name.endswith(TRACE_SUFFIX)
         or name.endswith(TRAJECTORY_SUFFIX)
         or name == TRAJECTORY_SUFFIX.removeprefix(".")
-        or name == PROMPT_EVOLUTION_NAME
+        or name == "prompt_evolution.jsonl"
+        or name == "observations.jsonl"
     ):
         return False
     return True
@@ -1123,9 +2156,7 @@ def _run_log_for_recording(recording_path: Path) -> Path | None:
     return None
 
 
-def _artifact_companion_for_recording(
-    recording_path: Path, suffix: str
-) -> Path | None:
+def _artifact_companion_for_recording(recording_path: Path, suffix: str) -> Path | None:
     run_dir = _run_dir_for_recording(recording_path)
     if run_dir is None:
         return None
@@ -1133,8 +2164,11 @@ def _artifact_companion_for_recording(
     if stem.endswith(RECORDING_SUFFIX):
         stem = stem[: -len(RECORDING_SUFFIX)]
     candidates = [run_dir / "artifacts" / f"{stem}{suffix}"]
+    if suffix == TRACE_SUFFIX:
+        candidates.append(run_dir / "trace.jsonl")
     if suffix == TRAJECTORY_SUFFIX:
         candidates.append(run_dir / "logs" / "trajectory.jsonl")
+        candidates.append(run_dir / "trajectory.jsonl")
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -1160,655 +2194,6 @@ def _trace_mentions_agent(trace_path: Path, agent_hint: str) -> bool:
     except OSError:
         return False
     return False
-
-
-def _build_trace_event(raw: JsonObject, *, file_index: int) -> TraceEvent | None:
-    action_counter = _int_or_none(raw.get("action_counter"))
-    if action_counter is None:
-        return None
-
-    tools_exposed = _clean_string(raw.get("tools_exposed"))
-    kind: EventKind
-    if tools_exposed == "evolution":
-        kind = "evolution"
-    elif tools_exposed == "subagent":
-        kind = "subagent"
-    else:
-        kind = "orchestrator"
-
-    reasoning = _clean_string(raw.get("reasoning"))
-    error = _clean_string(raw.get("error"))
-    actions_executed = _int_or_none(raw.get("actions_executed"))
-    force = bool(raw.get("force_take_actions"))
-
-    # output.function_calls is the raw list the model emitted (in order). The
-    # trace's own `tool_calls` field holds executed analysis results in the
-    # same order, skipping take_actions (which never produces an analysis
-    # record). Walk them in parallel so each analysis call carries its result.
-    emitted = _output_function_calls(raw)
-    executed_records = _executed_tool_call_records(raw)
-    tc_index = 0
-    calls: list[CallEntry] = []
-    for fc in emitted:
-        name = _clean_string(fc.get("name"))
-        if name is None:
-            continue
-        args = fc.get("args") if isinstance(fc.get("args"), dict) else {}
-        if name == "take_actions":
-            calls.append(
-                CallEntry(
-                    name=name,
-                    kind="action_batch",
-                    args=cast(JsonObject, args),
-                    executed=(actions_executed or 0) > 0,
-                    actions_committed=actions_executed,
-                )
-            )
-            continue
-        if _is_action_name(name):
-            calls.append(
-                CallEntry(
-                    name=name,
-                    kind="action_rejected",
-                    args=cast(JsonObject, args),
-                    executed=False,
-                )
-            )
-            continue
-        if name == "evolve_system_prompt":
-            calls.append(
-                CallEntry(
-                    name=name,
-                    kind="evolution",
-                    args=cast(JsonObject, args),
-                    executed=True,
-                )
-            )
-            continue
-
-        record = executed_records[tc_index] if tc_index < len(executed_records) else None
-        tc_index += 1
-        result_value = record.get("result") if isinstance(record, dict) else None
-        record_error = (
-            _clean_string(record.get("error")) if isinstance(record, dict) else None
-        )
-        actions_inline = None
-        if isinstance(record, dict):
-            actions_inline = _int_or_none(record.get("actions_taken_inline"))
-            if not actions_inline and isinstance(result_value, dict):
-                actions_inline = _int_or_none(result_value.get("actions_taken_inline"))
-        calls.append(
-            CallEntry(
-                name=name,
-                kind="analysis",
-                args=cast(JsonObject, args),
-                executed=record is not None,
-                result=cast(JsonObject, result_value)
-                if isinstance(result_value, dict)
-                else None,
-                error=record_error,
-                actions_taken_inline=actions_inline,
-            )
-        )
-
-    # Rejected per-action tools also land in the trace's tool_calls list. Pull
-    # any leftover records (with an error) so the panel surfaces them too.
-    while tc_index < len(executed_records):
-        record = executed_records[tc_index]
-        tc_index += 1
-        rec_name = _clean_string(record.get("name"))
-        if rec_name is None:
-            continue
-        if any(c.name == rec_name and c.kind == "action_rejected" for c in calls):
-            continue
-        calls.append(
-            CallEntry(
-                name=rec_name,
-                kind="analysis",
-                args=cast(JsonObject, record.get("args") or {}),
-                executed=True,
-                error=_clean_string(record.get("error")),
-            )
-        )
-
-    evolution_entry: PromptEvolutionEntry | None = None
-    evolution_raw = raw.get("evolution")
-    if kind == "evolution" and isinstance(evolution_raw, dict):
-        generation = _int_or_none(evolution_raw.get("generation")) or 0
-        evolution_entry = PromptEvolutionEntry(
-            generation=generation,
-            accepted=bool(evolution_raw.get("accepted")),
-            reasoning=reasoning,
-            validation_error=_clean_string(evolution_raw.get("validation_error")),
-        )
-
-    subagent_info: JsonObject | None = None
-    subagent_raw = raw.get("subagent")
-    if kind == "subagent" and isinstance(subagent_raw, dict):
-        subagent_info = cast(JsonObject, subagent_raw)
-
-    return TraceEvent(
-        file_index=file_index,
-        vlm_call=_int_or_none(raw.get("vlm_call")),
-        round=_int_or_none(raw.get("round")),
-        action_counter=action_counter,
-        tools_exposed=tools_exposed,
-        kind=kind,
-        actions_executed=actions_executed,
-        force_take_actions=force,
-        reasoning=reasoning,
-        error=error,
-        calls=tuple(calls),
-        evolution=evolution_entry,
-        subagent_info=subagent_info,
-    )
-
-
-def _output_function_calls(event: JsonObject) -> list[JsonObject]:
-    output = event.get("output")
-    if not isinstance(output, dict):
-        return []
-    function_calls = output.get("function_calls")
-    if not isinstance(function_calls, list):
-        return []
-    return [
-        cast(JsonObject, call) for call in function_calls if isinstance(call, dict)
-    ]
-
-
-def _executed_tool_call_records(event: JsonObject) -> list[JsonObject]:
-    records = event.get("tool_calls")
-    if not isinstance(records, list):
-        return []
-    return [cast(JsonObject, r) for r in records if isinstance(r, dict)]
-
-
-def build_panel_reasoning_traces(panels: Sequence[ActionPanel]) -> dict[int, str]:
-    """Map every frame index covered by a panel to that panel's rendered text."""
-    output: dict[int, str] = {}
-    for panel in panels:
-        text = _format_action_panel(panel)
-        if text is None:
-            continue
-        for frame_index in range(panel.frame_start, panel.frame_end + 1):
-            output[frame_index] = text
-    return output
-
-
-def _format_action_panel(panel: ActionPanel) -> str | None:
-    if not panel.events:
-        return None
-
-    closing = panel.events[-1]
-    actions = closing.actions_executed or 0
-    vlm_calls = sum(1 for e in panel.events if e.kind == "orchestrator")
-    if panel.frame_start == panel.frame_end:
-        frames_label = f"frame={panel.frame_start:03d}"
-    else:
-        frames_label = f"frames={panel.frame_start:03d}-{panel.frame_end:03d}"
-
-    header = [frames_label, f"vlm_calls={vlm_calls}", f"actions={actions}"]
-    if closing.force_take_actions:
-        header.append("(force)")
-
-    lines: list[str] = ["VLM reasoning", " ".join(header)]
-    for event in panel.events:
-        lines.extend(_format_trace_event(event))
-    return "\n".join(lines)
-
-
-def _format_trace_event(event: TraceEvent) -> list[str]:
-    if event.kind == "evolution":
-        return _format_evolution_event(event)
-    if event.kind == "subagent":
-        return _format_subagent_event(event)
-    return _format_orchestrator_event(event)
-
-
-def _format_orchestrator_event(event: TraceEvent) -> list[str]:
-    call_label = event.tools_exposed or "vlm"
-    direct = event.actions_executed or 0
-    total = event.total_actions
-    inline = total - direct
-    suffix_bits: list[str] = []
-    if total > 0:
-        if inline > 0 and direct > 0:
-            suffix_bits.append(f"{total} actions ({direct} direct, {inline} skill)")
-        elif inline > 0:
-            suffix_bits.append(f"{inline} actions (skill)")
-        else:
-            suffix_bits.append(f"{direct} actions")
-    elif event.actions_executed is not None:
-        suffix_bits.append("no actions")
-    if event.force_take_actions:
-        suffix_bits.append("force")
-    suffix = f" [{', '.join(suffix_bits)}]" if suffix_bits else ""
-
-    vlm_label = f"V{event.vlm_call}" if event.vlm_call is not None else "V?"
-    lines: list[str] = ["", f"{vlm_label} ({call_label}){suffix}"]
-    if event.reasoning:
-        lines.append(_compact_whitespace(event.reasoning))
-    if event.error:
-        lines.append("error: " + _truncate(_compact_whitespace(event.error), 220))
-    for call in event.calls:
-        lines.extend(_format_call_lines(call))
-    return lines
-
-
-def _format_evolution_event(event: TraceEvent) -> list[str]:
-    entry = event.evolution
-    if entry is None:
-        return ["", "Prompt evolution"]
-    accepted = "accepted" if entry.accepted else "rejected"
-    lines = ["", f"Prompt evolution gen={entry.generation} [{accepted}]"]
-    if entry.reasoning:
-        lines.append(_compact_whitespace(entry.reasoning))
-    if entry.validation_error is not None:
-        lines.append(
-            "validation_error: "
-            + _truncate(_compact_whitespace(entry.validation_error), 220)
-        )
-    return lines
-
-
-def _format_subagent_event(event: TraceEvent) -> list[str]:
-    info = event.subagent_info or {}
-    name = _clean_string(info.get("name")) or "?"
-    inner_round = _int_or_none(info.get("inner_round"))
-    inner_max = _int_or_none(info.get("max_inner_rounds"))
-    round_label = ""
-    if inner_round is not None and inner_max is not None:
-        round_label = f" round {inner_round}/{inner_max}"
-    elif inner_round is not None:
-        round_label = f" round {inner_round}"
-
-    lines = ["", f"subagent {name}{round_label}"]
-    if event.error:
-        lines.append("error: " + _truncate(_compact_whitespace(event.error), 220))
-    for call in event.calls:
-        lines.extend(_format_call_lines(call))
-    return lines
-
-
-def _format_call_lines(call: CallEntry) -> list[str]:
-    if call.kind == "action_batch":
-        return _format_take_actions(call)
-    if call.kind == "action_rejected":
-        suffix = f" [rejected: {call.error}]" if call.error else " [rejected]"
-        return [f"> {call.name}{suffix}"]
-
-    formatter = _CALL_FORMATTERS.get(call.name, _format_generic_call)
-    return formatter(call)
-
-
-def _format_take_actions(call: CallEntry) -> list[str]:
-    actions_label = _format_action_specs(call.args.get("actions"))
-    committed = call.actions_committed
-    head = f"> take_actions {actions_label}"
-    if committed is not None:
-        head += f" = {committed}"
-    if call.error:
-        head += " [error]"
-    lines = [head]
-    _append_detail(lines, "reasoning", call.args.get("reasoning"))
-    if call.error:
-        _append_detail(lines, "error", call.error)
-    return lines
-
-
-def _format_action_specs(specs: Any) -> str:
-    """Render a take_actions `actions` arg as a compact [A1,A6(12,30),...] label."""
-    if not isinstance(specs, list):
-        return "[?]"
-    parts: list[str] = []
-    for item in specs:
-        if not isinstance(item, dict):
-            parts.append("?")
-            continue
-        name = str(item.get("name") or "?")
-        short = name
-        if name.startswith("ACTION") and name[6:].isdigit():
-            short = f"A{name[6:]}"
-        if "x" in item and "y" in item:
-            parts.append(f"{short}({item['x']},{item['y']})")
-        else:
-            parts.append(short)
-    return "[" + ",".join(parts) + "]"
-
-
-def _status_suffix(call: CallEntry) -> str:
-    if not call.executed:
-        return " [skipped]"
-    if call.error:
-        return " [error]"
-    return ""
-
-
-_DETAIL_LIMITS: dict[str, int] = {
-    "reasoning": 400,
-    "description": 400,
-    "body": 600,
-    "instructions": 600,
-    "code": 600,
-    "task": 400,
-    "answer": 400,
-    "query": 200,
-    "args": 200,
-    "context": 200,
-    "stdout": 400,
-    "stderr": 400,
-    "result": 400,
-}
-
-
-def _append_detail(lines: list[str], label: str, value: Any) -> None:
-    text = _stringify_detail_value(value)
-    if text is None:
-        return
-    limit = _DETAIL_LIMITS.get(label, 300)
-    lines.append(f"    {label}: " + _truncate(text, limit))
-
-
-def _stringify_detail_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return _compact_whitespace(value).strip() or None
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        return ", ".join(str(item) for item in value)
-    if isinstance(value, dict):
-        if not value:
-            return None
-        try:
-            return json.dumps(value, sort_keys=True, separators=(",", ":"))
-        except TypeError:
-            return str(value)
-    return _compact_whitespace(str(value))
-
-
-def _tag_suffix(args: JsonObject, result: JsonObject) -> str:
-    tags = args.get("tags") if isinstance(args.get("tags"), list) else result.get("tags")
-    if not isinstance(tags, list) or not tags:
-        return ""
-    return " [" + ",".join(str(tag) for tag in tags) + "]"
-
-
-def _format_process_skill(call: CallEntry) -> list[str]:
-    args, result = call.args, call.result or {}
-    op = _clean_string(args.get("operation")) or "?"
-    skill_name = _clean_string(args.get("name")) or _clean_string(result.get("name"))
-    skill_id = _clean_string(result.get("id")) or _clean_string(args.get("id")) or "?"
-    head = f"- process_skill {op} {skill_id}"
-    if skill_name:
-        head += f' "{skill_name}"'
-    head += _tag_suffix(args, result) + _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", args.get("reasoning"))
-    if op in {"add", "edit"}:
-        _append_detail(lines, "description", args.get("description"))
-    if op == "search":
-        _append_detail(lines, "query", args.get("query"))
-    _append_detail(lines, "error", call.error)
-    return lines
-
-
-def _format_run_skill(call: CallEntry) -> list[str]:
-    args, result = call.args, call.result or {}
-    skill_id = _clean_string(args.get("id")) or _clean_string(result.get("id")) or "?"
-    skill_name = _clean_string(result.get("name"))
-    head = f"- run_skill {skill_id}"
-    if skill_name:
-        head += f" ({skill_name})"
-    if call.actions_taken_inline is not None and call.actions_taken_inline > 0:
-        head += f" [{call.actions_taken_inline} actions]"
-    head += _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "error", call.error or result.get("error"))
-    return lines
-
-
-def _format_process_memory(call: CallEntry) -> list[str]:
-    args, result = call.args, call.result or {}
-    op = _clean_string(args.get("operation")) or "?"
-    mem_id = _clean_string(result.get("id")) or _clean_string(args.get("id")) or "?"
-    title = _clean_string(args.get("title")) or _clean_string(result.get("title"))
-    head = f"- process_memory {op} {mem_id}"
-    if title:
-        head += f' "{title}"'
-    head += _tag_suffix(args, result) + _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", args.get("reasoning"))
-    if op in {"add", "edit"}:
-        _append_detail(lines, "body", args.get("body"))
-    if op == "search":
-        _append_detail(lines, "query", args.get("query"))
-    _append_detail(lines, "error", call.error)
-    return lines
-
-
-def _format_process_subagent(call: CallEntry) -> list[str]:
-    args, result = call.args, call.result or {}
-    op = _clean_string(args.get("operation")) or "?"
-    sub_name = _clean_string(args.get("name")) or _clean_string(result.get("name"))
-    sub_id = _clean_string(result.get("id")) or _clean_string(args.get("id")) or "?"
-    head = f"- process_subagent {op} {sub_id}"
-    if sub_name:
-        head += f' "{sub_name}"'
-    head += _tag_suffix(args, result) + _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", args.get("reasoning"))
-    if op in {"add", "edit"}:
-        _append_detail(lines, "description", args.get("description"))
-        _append_detail(lines, "instructions", args.get("instructions"))
-        _append_detail(lines, "allowed_tools", args.get("allowed_tools"))
-    if op == "search":
-        _append_detail(lines, "query", args.get("query"))
-    _append_detail(lines, "error", call.error)
-    return lines
-
-
-def _format_run_subagent(call: CallEntry) -> list[str]:
-    args, result = call.args, call.result or {}
-    sub_id = _clean_string(args.get("id")) or _clean_string(result.get("id")) or "?"
-    sub_name = _clean_string(result.get("name"))
-    head = f"- run_subagent {sub_id}"
-    if sub_name:
-        head += f" ({sub_name})"
-    rounds_used = result.get("rounds_used")
-    if rounds_used is not None:
-        head += f" rounds={rounds_used}"
-    head += _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "task", args.get("task"))
-    _append_detail(lines, "context", args.get("context"))
-    _append_detail(lines, "result", result.get("result"))
-    _append_detail(lines, "warning", result.get("warning"))
-    _append_detail(lines, "error", call.error or result.get("error"))
-    return lines
-
-
-def _format_get_recent_trajectory(call: CallEntry) -> list[str]:
-    args, result = call.args, call.result or {}
-    limit = args.get("limit")
-    count = result.get("count")
-    head = "- get_recent_trajectory"
-    if limit is not None:
-        head += f"(limit={limit})"
-    if count is not None:
-        head += f" -> {count} steps"
-    head += _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "error", call.error)
-    return lines
-
-
-def _format_run_code(call: CallEntry) -> list[str]:
-    args, result = call.args, call.result or {}
-    head = "- run_code" + _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", args.get("reasoning"))
-    _append_detail(lines, "error", call.error or result.get("error"))
-    return lines
-
-
-def _format_evolve_system_prompt(call: CallEntry) -> list[str]:
-    return ["- evolve_system_prompt" + _status_suffix(call)]
-
-
-def _format_generic_call(call: CallEntry) -> list[str]:
-    op = _clean_string(call.args.get("operation"))
-    head = f"- {call.name}"
-    if op is not None:
-        head += f" {op}"
-    head += _status_suffix(call)
-    lines = [head]
-    _append_detail(lines, "reasoning", call.args.get("reasoning"))
-    _append_detail(lines, "error", call.error)
-    return lines
-
-
-_CALL_FORMATTERS: dict[str, Any] = {
-    "process_skill": _format_process_skill,
-    "run_skill": _format_run_skill,
-    "process_memory": _format_process_memory,
-    "process_subagent": _format_process_subagent,
-    "run_subagent": _format_run_subagent,
-    "get_recent_trajectory": _format_get_recent_trajectory,
-    "run_code": _format_run_code,
-    "evolve_system_prompt": _format_evolve_system_prompt,
-    "take_actions": _format_take_actions,
-}
-
-
-def _action_input_reasoning(data: JsonObject) -> str | None:
-    action_input = data.get("action_input")
-    if not isinstance(action_input, dict):
-        return None
-
-    reasoning = _clean_string(action_input.get("reasoning"))
-    if reasoning is not None:
-        return reasoning
-
-    action_data = action_input.get("data")
-    if isinstance(action_data, dict):
-        return _clean_string(action_data.get("reasoning"))
-    return None
-
-
-def _int_or_none(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _clean_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _is_action_name(name: str) -> bool:
-    return name == "RESET" or name in _ACTION_NAMES.values()
-
-
-def _add_reasoning_panel(
-    image: Image.Image,
-    grid_frame: RecordingGridFrame,
-) -> Image.Image:
-    panel_width = image.width
-    output = Image.new(
-        "RGBA",
-        (image.width + panel_width, image.height),
-        (15, 18, 22, 255),
-    )
-    output.paste(image, (0, 0))
-
-    panel_left = image.width
-    draw = ImageDraw.Draw(output)
-    draw.rectangle(
-        (panel_left, 0, output.width, output.height),
-        fill=(15, 18, 22, 255),
-    )
-    draw.line(
-        (panel_left, 0, panel_left, output.height),
-        fill=(72, 78, 88, 255),
-        width=1,
-    )
-
-    text = (
-        grid_frame.event.reasoning_trace
-        or f"VLM reasoning\nstep={grid_frame.event.index:03d}\n\nNo trace for this step."
-    )
-    _draw_panel_text(
-        draw,
-        text,
-        x=panel_left + 8,
-        y=8,
-        width=panel_width - 16,
-        height=image.height - 16,
-    )
-    return output
-
-
-def _draw_panel_text(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    *,
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-) -> None:
-    font = ImageFont.load_default()
-    line_height = _font_line_height(font)
-    lines = _wrap_text_to_width(text, font, width)
-    max_lines = max(1, height // line_height)
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = _fit_text_to_width(lines[-1], font, width, suffix="...")
-
-    for line_index, line in enumerate(lines):
-        fill = _panel_line_color(line_index, line)
-        draw.text((x, y + line_index * line_height), line, fill=fill, font=font)
-
-
-_VLM_HEADER_RE = re.compile(r"^V[\d?]+ \([^()]+\)(?: \[[^\]]+\])?$")
-_SUBAGENT_HEADER_RE = re.compile(r"^subagent ")
-
-
-def _panel_line_color(line_index: int, line: str) -> tuple[int, int, int, int]:
-    if line_index == 0 and line == "VLM reasoning":
-        return (255, 255, 255, 255)
-    if (
-        line.startswith("step=")
-        or line.startswith("frame=")
-        or line.startswith("frames=")
-        or line.startswith("Prompt evolution")
-    ):
-        return (188, 207, 255, 255)
-    if _VLM_HEADER_RE.match(line) or _SUBAGENT_HEADER_RE.match(line):
-        return (148, 199, 247, 255)
-    if line.startswith("> "):
-        return (255, 196, 138, 255)
-    if "[skipped]" in line or "[no actions]" in line:
-        return (140, 144, 152, 255)
-    if (
-        "[error]" in line
-        or "[rejected" in line
-        or line.startswith("error:")
-        or line.startswith("validation_error:")
-    ):
-        return (240, 130, 130, 255)
-    return (226, 232, 240, 255)
 
 
 def _wrap_text_to_width(text: str, font: Any, max_width: int) -> list[str]:
@@ -1839,11 +2224,7 @@ def _wrap_text_to_width(text: str, font: Any, max_width: int) -> list[str]:
     return wrapped
 
 
-def _break_word_to_width(
-    word: str,
-    font: Any,
-    max_width: int,
-) -> list[str]:
+def _break_word_to_width(word: str, font: Any, max_width: int) -> list[str]:
     pieces: list[str] = []
     current = ""
     for character in word:
@@ -1858,13 +2239,7 @@ def _break_word_to_width(
     return pieces
 
 
-def _fit_text_to_width(
-    text: str,
-    font: Any,
-    max_width: int,
-    *,
-    suffix: str,
-) -> str:
+def _fit_text_to_width(text: str, font: Any, max_width: int, *, suffix: str) -> str:
     suffix_width = _text_width(suffix, font)
     if _text_width(text, font) + suffix_width <= max_width:
         return f"{text}{suffix}"
@@ -1882,7 +2257,7 @@ def _font_line_height(font: Any) -> int:
         bbox = font.getbbox("Ag")
     except AttributeError:
         return 14
-    return int(max(12, bbox[3] - bbox[1] + 4))
+    return int(max(12, bbox[3] - bbox[1] + 6))
 
 
 def _text_width(text: str, font: Any) -> int:
@@ -1893,65 +2268,24 @@ def _text_width(text: str, font: Any) -> int:
         return int(bbox[2] - bbox[0])
 
 
-def _compact_whitespace(text: str) -> str:
-    return " ".join(text.split())
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _add_overlay(image: Image.Image, grid_frame: RecordingGridFrame) -> Image.Image:
-    overlay_height = 40
-    output = Image.new(
-        "RGBA",
-        (image.width, image.height + overlay_height),
-        ARC_PALETTE[0],
-    )
-    draw = ImageDraw.Draw(output)
-    draw.rectangle((0, 0, image.width, overlay_height), fill=(20, 20, 20, 255))
-
-    font = ImageFont.load_default()
-    line_1, line_2 = _metadata_lines(grid_frame)
-    draw.text((4, 4), line_1, fill=(255, 255, 255, 255), font=font)
-    draw.text((4, 20), line_2, fill=(255, 255, 255, 255), font=font)
-    output.paste(image, (0, overlay_height))
-    return output
+def _clean_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
-def _metadata_lines(grid_frame: RecordingGridFrame) -> tuple[str, str]:
-    data = grid_frame.event.data
-    game_id = str(data.get("game_id", "?"))
-    state = str(data.get("state", "?"))
-    levels = f"{data.get('levels_completed', '?')}/{data.get('win_levels', '?')}"
-    subframe = ""
-    if grid_frame.grid_count > 1:
-        subframe = f" grid={grid_frame.grid_index + 1}/{grid_frame.grid_count}"
-    line_1 = (
-        f"step={grid_frame.event.index:03d}{subframe} "
-        f"game={game_id} state={state} levels={levels}"
-    )
-
-    action = grid_frame.event.action_label or _format_action(data.get("action_input"))
-    available = _compact_json(data.get("available_actions", []), limit=48)
-    line_2 = f"action={action} available={available}"
-    return _truncate(line_1, 120), _truncate(line_2, 120)
-
-
-def _format_action(value: Any) -> str:
-    if not isinstance(value, dict):
-        return "?"
-
-    action_id = value.get("id", "?")
-    action_name = _format_action_id(action_id)
-    action_data = _compact_json(value.get("data", {}), limit=40)
-    return f"{action_name} data={action_data}"
-
-
-def _format_action_id(value: Any) -> str:
-    if isinstance(value, int):
-        return _ACTION_NAMES.get(value, str(value))
-    if isinstance(value, str):
-        if value.isdecimal():
-            return _ACTION_NAMES.get(int(value), value)
-        return value
-    return str(value)
+def _is_action_name(name: str) -> bool:
+    return name == "RESET" or name in _ACTION_NAMES.values()
 
 
 def _path_mtime(path: Path) -> float:
@@ -1959,20 +2293,6 @@ def _path_mtime(path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return 0.0
-
-
-def _compact_json(value: Any, *, limit: int) -> str:
-    try:
-        text = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    except TypeError:
-        text = str(value)
-    return _truncate(text, limit)
-
-
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[: max(0, limit - 3)]}..."
 
 
 def _pad_to_common_size(images: Sequence[Image.Image]) -> list[Image.Image]:
@@ -1986,7 +2306,7 @@ def _pad_to_common_size(images: Sequence[Image.Image]) -> list[Image.Image]:
         if image.size == (width, height):
             padded.append(image)
             continue
-        canvas = Image.new("RGBA", (width, height), (20, 20, 20, 255))
+        canvas = Image.new("RGBA", (width, height), THEME.bg)
         canvas.paste(image, (0, 0))
         padded.append(canvas)
     return padded
@@ -2005,7 +2325,7 @@ def _pad_to_even_size(images: Sequence[Image.Image]) -> list[Image.Image]:
 
     padded: list[Image.Image] = []
     for image in images:
-        canvas = Image.new("RGBA", (even_width, even_height), (20, 20, 20, 255))
+        canvas = Image.new("RGBA", (even_width, even_height), THEME.bg)
         canvas.paste(image, (0, 0))
         padded.append(canvas)
     return padded

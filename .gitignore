@@ -32,9 +32,23 @@ tests/recordings/not-a-recording.txt
 # Long-term memory
 memory.db
 
+tests/
 environment_files/
 agents/templates/utils/vlm_backends_ref.py
 agents/templates/PokeAgent_ref.py
 
+# Upstream template agents (not part of the Continual Harness release)
+agents/templates/README.md
+agents/templates/random_agent.py
+agents/templates/multimodal.py
+agents/templates/simple_vlm_agent.py
+agents/templates/reasoning_agent.py
+agents/templates/llm_agents.py
+agents/templates/smolagents.py
+agents/templates/langgraph_random_agent.py
+agents/templates/langgraph_functional_agent.py
+agents/templates/langgraph_thinking/
+
 run.sh
 */*.zip
+*.zip
