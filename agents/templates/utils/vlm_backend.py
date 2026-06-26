@@ -706,6 +706,10 @@ class _VLLMModelSpec:
 
 
 _VLLM_MODEL_REGISTRY: dict[str, _VLLMModelSpec] = {
+    "glm-4.6v-fp8": _VLLMModelSpec(
+        path=None, vision=True, tool_parser="glm45",
+        reasoning_parser="glm45", max_model_len=128_000,
+    ),
     "glm-4.7-flash": _VLLMModelSpec(
         path=None, vision=False, tool_parser="glm47",
         reasoning_parser="glm45", max_model_len=128_000,
