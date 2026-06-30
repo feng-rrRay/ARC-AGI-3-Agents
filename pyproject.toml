@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arc-agi-3-agents"
+version = "0.1.0"
+description = "ARC-AGI-3-Agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "arc-agi>=0.9.8",
+    "dotenv>=0.9.9",
+    "google-genai>=1.0.0",
+    "langchain[openai]>=0.3.27",
+    "langgraph>=0.6.3",
+    "langgraph-checkpoint-sqlite>=2.0.11",
+    "numpy>=2.3.2",
+    "openai==1.72.0",
+    "pillow>=11.2.1",
+    "pydantic>=2.11.7",
+    "requests>=2.32.4",
+    "smolagents>=1.20.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15.0",
+    "pre-commit>=4.2.0",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+    "requests-mock>=1.12.1",
+    "ruff>=0.11.4",
+]
+
+[project.optional-dependencies]
+agentops = [
+    "agentops>=0.4.18",
+]
+hermes-eval = [
+    "mcp>=1.26.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "starlette>=1.0",
+]
+blog-viz = [
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "pandas>=2.2",
+]
+
+[tool.setuptools.packages.find]
+# Only the real Python packages; excludes data dirs (logs/, recordings/,
+# environment_files/) that would otherwise break flat-layout auto-discovery.
+include = ["agents*", "cli_agents*"]
+
+[tool.mypy]
+strict = true
+disallow_untyped_defs = true
+exclude = [
+    "tests",
+]
+plugins = []
+
+[tool.ruff.lint]
+extend-select = ["I"]

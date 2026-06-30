@@ -1,0 +1,322 @@
+"""CLI agent backend abstraction for the ARC-AGI-3 Hermes evaluation.
+
+Mirrors utils/agent_infrastructure/cli_agent_backends.py from pokeagent-speedrun,
+adapted for ARC. Only HermesCliBackend is implemented.
+"""
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# 429 / rate-limit signatures used to recognise a transient throttle when the
+# structured failure_reason isn't propagated (e.g. an uncaught provider error
+# surfaced via an "error" event). "quota" is intentionally excluded so a hard
+# billing/credit exhaustion is not mistaken for a transient per-minute throttle.
+_RATE_LIMIT_PATTERNS = (
+    "429", "resource_exhausted", "rate limit", "rate-limit",
+    "ratelimit", "too many requests",
+)
+
+
+def _looks_rate_limited(text: str) -> bool:
+    t = (text or "").lower()
+    return any(p in t for p in _RATE_LIMIT_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Session metrics (thin container; extended in phase-2 parity pass)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CliSessionMetrics:
+    total_cost_usd: float = 0.0
+    total_turns: int = 0
+    auth_fatal_error: bool = False
+    is_error: bool = False
+    last_error: str = ""
+    session_id: str = ""          # Hermes session id (for resume across relaunches)
+    tool_count: int = 0           # number of MCP tools the agent loaded
+    rate_limited: bool = False    # last session ended on a transient 429 / rate limit
+    last_failure_reason: str = "" # classified failure_reason from the result event
+
+
+@dataclass
+class CliSession:
+    process: subprocess.Popen
+    stop_event: threading.Event
+    stream_thread: threading.Thread
+    metrics: CliSessionMetrics = field(default_factory=CliSessionMetrics)
+
+
+# ---------------------------------------------------------------------------
+# HermesCliBackend
+# ---------------------------------------------------------------------------
+
+class HermesCliBackend:
+    """Builds and monitors the Hermes Docker container for one ARC game."""
+
+    # Paths inside the container
+    AGENT_MEMORY_PATH = "/home/hermes-agent/.hermes"
+    WORKSPACE_PATH = "/workspace"
+    PROJECT_ROOT_PATH = "/opt/arc-src"
+
+    # Docker image name (built from .devcontainer/hermes-agent/)
+    container_image = "arc-hermes-agent"
+    devcontainer_build_context = ".devcontainer/hermes-agent"
+
+    # Config file markers — same begin/end convention as pokeagent
+    CONFIG_MARKER_BEGIN = "# BEGIN ARC HERMES MCP"
+    CONFIG_MARKER_END   = "# END ARC HERMES MCP"
+
+    # ---------------------------------------------------------------------------
+    # Docker image build
+    # ---------------------------------------------------------------------------
+
+    def build_image(
+        self,
+        project_root: str | Path,
+        *,
+        hermes_commit: str = "",
+        user_uid: int | None = None,
+        user_gid: int | None = None,
+    ) -> None:
+        """Build the Docker image from .devcontainer/hermes-agent/Dockerfile."""
+        root = Path(project_root)
+        uid = user_uid or os.getuid()
+        gid = user_gid or os.getgid()
+        build_args: list[str] = [
+            "--build-arg", f"USER_UID={uid}",
+            "--build-arg", f"USER_GID={gid}",
+        ]
+        if hermes_commit:
+            build_args += ["--build-arg", f"HERMES_COMMIT={hermes_commit}"]
+        cmd = [
+            "docker", "build",
+            "-t", self.container_image,
+            *build_args,
+            "-f", str(root / self.devcontainer_build_context / "Dockerfile"),
+            str(root / self.devcontainer_build_context),
+        ]
+        logger.info("Building Docker image: %s", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+        logger.info("Docker image %s built successfully", self.container_image)
+
+    # ---------------------------------------------------------------------------
+    # MCP config injection
+    # ---------------------------------------------------------------------------
+
+    def _build_mcp_config_block(self, mcp_port: int) -> str:
+        return (
+            f"{self.CONFIG_MARKER_BEGIN}\n"
+            "mcp_servers:\n"
+            "  arc-agi-3:\n"
+            f'    url: "http://host.docker.internal:{mcp_port}/mcp"\n'
+            "    tools:\n"
+            "      prompts: false\n"
+            "      resources: false\n"
+            f"{self.CONFIG_MARKER_END}\n"
+        )
+
+    def inject_mcp_config(self, hermes_memory_dir: Path, mcp_port: int) -> None:
+        """Write or update the ARC MCP block in Hermes config.yaml."""
+        hermes_memory_dir.mkdir(parents=True, exist_ok=True)
+        config_path = hermes_memory_dir / "config.yaml"
+        block = self._build_mcp_config_block(mcp_port)
+
+        if config_path.exists():
+            text = config_path.read_text()
+            # Remove any existing ARC MCP block
+            text = re.sub(
+                rf"{re.escape(self.CONFIG_MARKER_BEGIN)}.*?{re.escape(self.CONFIG_MARKER_END)}\n?",
+                "",
+                text,
+                flags=re.DOTALL,
+            )
+        else:
+            text = ""
+        config_path.write_text(text.rstrip("\n") + "\n" + block)
+        logger.debug("Injected MCP config into %s (port=%d)", config_path, mcp_port)
+
+    # ---------------------------------------------------------------------------
+    # Docker run command
+    # ---------------------------------------------------------------------------
+
+    def build_launch_cmd(
+        self,
+        directive_path: str | Path,
+        game_id: str,
+        hermes_memory_dir: Path,
+        scratch_dir: Path,
+        project_root: Path,
+        run_id: str,
+        mcp_port: int,
+        game_port: int,
+        model: str = "gemini-3.1-pro-preview",
+        provider: str = "gemini",
+        api_key_env: str = "GEMINI_API_KEY",
+        max_turns: int = 5000,
+        resume_session_id: str = "",
+        toolset: str = "min",
+    ) -> list[str]:
+        """Return the full `docker run` command list."""
+        wrapper_cmd = [
+            "python3",
+            f"{self.PROJECT_ROOT_PATH}/cli_agents/agent_infrastructure/hermes_wrapper.py",
+            "--directive-path", f"{self.WORKSPACE_PATH}/.agent_directive.txt",
+            "--working-dir",    self.WORKSPACE_PATH,
+            "--server-url",     f"http://host.docker.internal:{game_port}",
+            "--hermes-home",    self.AGENT_MEMORY_PATH,
+            "--model",          model,
+            "--provider",       provider,
+            "--api-key-env",    api_key_env,
+            "--max-turns",      str(max_turns),
+            "--toolset",        toolset,
+        ]
+        if resume_session_id:
+            wrapper_cmd += ["--resume-session-id", resume_session_id]
+
+        # Docker bind-mount sources MUST be absolute paths; a relative source is
+        # interpreted as a (invalid) named volume. Resolve all three.
+        mem_src     = Path(hermes_memory_dir).resolve()
+        scratch_src = Path(scratch_dir).resolve()
+        proj_src    = Path(project_root).resolve()
+
+        docker_cmd = [
+            "docker", "run", "--rm",
+            "--name", f"arc-hermes-{run_id}-{game_id}",
+            "--cap-add=NET_ADMIN",
+            "--security-opt=seccomp=unconfined",
+            "--network=bridge",
+            "--add-host=host.docker.internal:host-gateway",
+            "-v", f"{mem_src}:{self.AGENT_MEMORY_PATH}",
+            "-v", f"{scratch_src}:{self.WORKSPACE_PATH}",
+            "-v", f"{proj_src}:{self.PROJECT_ROOT_PATH}:ro",
+            "-w", self.WORKSPACE_PATH,
+            "-e", f"MCP_PORT={mcp_port}",
+            "-e", f"GAME_SERVER_PORT={game_port}",
+            "-e", f"RUN_DATA_ID={run_id}",
+            "-e", f"HERMES_HOME={self.AGENT_MEMORY_PATH}",
+            "-e", f"PYTHONPATH={self.PROJECT_ROOT_PATH}",
+            "-e", f"HERMES_MODEL={model}",
+            "-e", f"HERMES_PROVIDER={provider}",
+            "-e", f"HERMES_API_KEY_ENV={api_key_env}",
+            "-e", f"HERMES_MAX_TURNS={max_turns}",
+            "-e", f"HERMES_TOOLSET={toolset}",
+            "-e", "PYTHONUNBUFFERED=1",
+        ]
+
+        # Pass through Gemini / Google API keys (never ARC keys)
+        passthrough = [
+            "GEMINI_API_KEY", "GOOGLE_API_KEY",
+            "HERMES_BASE_URL", "HERMES_DISABLE_MULTIMODAL",
+            "HERMES_API_TIMEOUT", "HERMES_VISION_TIMEOUT",
+        ]
+        for var in passthrough:
+            val = os.environ.get(var)
+            if val:
+                docker_cmd += ["-e", f"{var}={val}"]
+
+        docker_cmd.append(self.container_image)
+        docker_cmd.extend(wrapper_cmd)
+        return docker_cmd
+
+    # ---------------------------------------------------------------------------
+    # Stream reader — phase-1: tee to log; phase-2 adds JSONL event parsing
+    # ---------------------------------------------------------------------------
+
+    # JSONL event types worth persisting to the trajectory file. ("observation"
+    # is handled separately and routed to observations.jsonl.)
+    _TRAJECTORY_EVENT_TYPES = {
+        "system", "thinking", "tool_use", "tool_result", "action_result",
+        "result", "error",
+    }
+
+    def run_stream_reader(
+        self,
+        stdout_pipe: io.RawIOBase,
+        stop_event: threading.Event,
+        log_file: io.TextIOWrapper | None,
+        metrics: CliSessionMetrics | None,
+        server_url: str | None = None,
+        trajectory_file: io.TextIOWrapper | None = None,
+        observations_file: io.TextIOWrapper | None = None,
+    ) -> None:
+        """Read container stdout; tee raw lines to log_file; parse JSONL events,
+        update metrics, append structured events to trajectory_file, and route the
+        full per-step `observation` events (get_game_state) to observations_file."""
+        try:
+            buffered = io.BufferedReader(stdout_pipe)  # type: ignore[arg-type]
+            for raw_line in buffered:
+                line = raw_line.decode("utf-8", errors="replace")
+                if log_file:
+                    log_file.write(line)
+                    log_file.flush()
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                self._handle_stream_event(event, metrics)
+                etype = event.get("type") if isinstance(event, dict) else None
+                # Untruncated observation records go to their own JSONL so the
+                # compact trajectory.jsonl stays small.
+                if observations_file is not None and etype == "observation":
+                    observations_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    observations_file.flush()
+                elif (
+                    trajectory_file is not None
+                    and etype in self._TRAJECTORY_EVENT_TYPES
+                ):
+                    trajectory_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    trajectory_file.flush()
+        except Exception as exc:
+            logger.debug("stream reader exited: %s", exc)
+
+    def _handle_stream_event(
+        self, event: dict[str, Any], metrics: CliSessionMetrics | None
+    ) -> None:
+        etype = event.get("type", "")
+        if etype == "system" and metrics:
+            sid = event.get("session_id")
+            if sid:
+                metrics.session_id = str(sid)
+            metrics.tool_count = len(event.get("tools") or [])
+        elif etype == "result" and metrics:
+            sid = event.get("session_id")
+            if sid:
+                metrics.session_id = str(sid)
+            metrics.total_cost_usd += float(event.get("total_cost_usd") or 0)
+            metrics.total_turns    += int(event.get("num_turns") or 0)
+            metrics.is_error        = bool(event.get("is_error"))
+            metrics.last_error      = str(event.get("error") or "")
+            # A 429 / tokens-per-minute throttle surfaces as failure_reason=
+            # "rate_limit" (Hermes classifies it before giving up). It is
+            # transient, not fatal: the orchestrator resumes the session rather
+            # than counting it as a hard failure. Fall back to text matching for
+            # the rare case the reason isn't propagated.
+            reason = str(event.get("failure_reason") or "")
+            metrics.last_failure_reason = reason
+            if reason == "rate_limit" or _looks_rate_limited(metrics.last_error):
+                metrics.rate_limited = True
+        elif etype == "error" and metrics:
+            msg = str(event.get("message") or "")
+            err = str(event.get("error") or "")
+            if "auth" in msg.lower() or "unauthorized" in msg.lower():
+                metrics.auth_fatal_error = True
+            if _looks_rate_limited(msg) or _looks_rate_limited(err):
+                metrics.rate_limited = True
+            metrics.last_error = msg or err
+        # Phase-2: thinking / tool_use events forwarded to the game server

@@ -1,0 +1,39 @@
+{
+  "name": "Hermes Agent — ARC-AGI-3",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--security-opt=seccomp=unconfined",
+    "--network=bridge",
+    "--add-host=host.docker.internal:host-gateway"
+  ],
+  "mounts": [
+    "source=${localWorkspaceFolder}/logs/${localEnv:RUN_DATA_ID}/${localEnv:GAME_ID}/hermes_memory,target=/home/hermes-agent/.hermes,type=bind",
+    "source=${localWorkspaceFolder}/logs/${localEnv:RUN_DATA_ID}/${localEnv:GAME_ID}/scratch,target=/workspace,type=bind",
+    "source=${localWorkspaceFolder},target=/opt/arc-src,type=bind,readonly"
+  ],
+  "containerEnv": {
+    "MCP_PORT":          "${localEnv:MCP_PORT}",
+    "GAME_SERVER_PORT":  "${localEnv:GAME_SERVER_PORT}",
+    "RUN_DATA_ID":       "${localEnv:RUN_DATA_ID}",
+    "GAME_ID":           "${localEnv:GAME_ID}",
+    "HERMES_HOME":       "/home/hermes-agent/.hermes",
+    "PYTHONPATH":        "/opt/arc-src",
+    "HERMES_MODEL":      "gemini-3.1-pro-preview",
+    "HERMES_PROVIDER":   "gemini",
+    "HERMES_API_KEY_ENV":"GEMINI_API_KEY"
+  },
+  "remoteUser": "hermes-agent",
+  "postCreateCommand": "echo '✅ Hermes ARC container ready'",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "features": {}
+}
