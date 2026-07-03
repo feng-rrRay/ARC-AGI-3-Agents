@@ -11,14 +11,25 @@ from ...run_artifacts import RUN_DIR_ENV, RUN_LOG_PATH_ENV, game_artifacts
 
 
 class TraceWriter:
-    """Append-only thread-safe JSONL writer for per-VLM-call records."""
+    """Append-only thread-safe JSONL writer for per-VLM-call records.
+
+    Set CONTINUAL_HARNESS_DISABLE_TRACE=1 to make every write a no-op —
+    trace.jsonl is purely diagnostic (full VLM I/O) and can grow multi-GB on
+    disk-capped hosts like Kaggle's /kaggle/working.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._disabled = os.getenv(
+            "CONTINUAL_HARNESS_DISABLE_TRACE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not self._disabled:
+            path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
     def write(self, record: dict[str, Any]) -> None:
+        if self._disabled:
+            return
         record.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
         line = json.dumps(record, default=str)
         with self._lock, self.path.open("a") as f:

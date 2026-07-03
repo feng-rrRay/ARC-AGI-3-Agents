@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from threading import Thread
-from typing import TYPE_CHECKING, Optional, Type
+from threading import Semaphore, Thread
+from typing import TYPE_CHECKING, Callable, Optional, Type
 
 from arc_agi import Arcade, OperationMode
 from arc_agi.scorecard import EnvironmentScorecard
@@ -13,6 +13,28 @@ if TYPE_CHECKING:
     from .agent import Agent
 
 logger = logging.getLogger()
+
+
+def _concurrency_semaphore() -> Optional[Semaphore]:
+    """Semaphore for SWARM_MAX_CONCURRENT_GAMES; None means unlimited."""
+    raw = os.getenv("SWARM_MAX_CONCURRENT_GAMES", "").strip()
+    try:
+        limit = int(raw) if raw else 0
+    except ValueError:
+        logger.warning("Ignoring non-integer SWARM_MAX_CONCURRENT_GAMES=%r", raw)
+        return None
+    if limit <= 0:
+        return None
+    logger.info("Capping concurrent games at %d (SWARM_MAX_CONCURRENT_GAMES)", limit)
+    return Semaphore(limit)
+
+
+def _gated_main(semaphore: Semaphore, agent: "Agent") -> Callable[[], None]:
+    def run() -> None:
+        with semaphore:
+            agent.main()
+
+    return run
 
 
 class Swarm:
@@ -86,9 +108,14 @@ class Swarm:
             )
             self.agents.append(a)
 
-        # create all the threads
+        # create all the threads; SWARM_MAX_CONCURRENT_GAMES (0/unset =
+        # unlimited) gates how many agent bodies run at once — agents and
+        # threads are still created eagerly, which is harmless because the
+        # engine only acts once a thread's main() runs.
+        semaphore = _concurrency_semaphore()
         for a in self.agents:
-            self.threads.append(Thread(target=a.main, daemon=True))
+            target = a.main if semaphore is None else _gated_main(semaphore, a)
+            self.threads.append(Thread(target=target, daemon=True))
 
         # start all the threads
         for t in self.threads:

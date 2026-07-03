@@ -249,3 +249,24 @@ def test_speculative_config_qwen() -> None:
 
 def test_speculative_config_absent_when_unset() -> None:
     assert "--speculative-config" not in _build_cmd()
+
+
+def test_moe_backend_emitted_when_set() -> None:
+    cmd = _build_cmd(moe_backend="triton")
+    assert _flag_value(cmd, "--moe-backend") == "triton"
+
+
+def test_moe_backend_absent_when_unset() -> None:
+    assert "--moe-backend" not in _build_cmd()
+
+
+def test_extra_args_after_moe_backend_so_user_can_override() -> None:
+    # extra_args land last so a user-supplied flag wins (argparse last value).
+    cmd = _build_cmd(moe_backend="triton", extra_args=("--moe-backend", "cutlass"))
+    assert cmd.index("cutlass") > cmd.index("triton")
+
+
+def test_glm_46v_fp8_pins_triton_moe_backend() -> None:
+    from agents.templates.utils.vlm_backend import _VLLM_MODEL_REGISTRY
+
+    assert _VLLM_MODEL_REGISTRY["glm-4.6v-fp8"].moe_backend == "triton"

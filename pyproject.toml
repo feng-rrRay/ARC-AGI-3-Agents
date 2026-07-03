@@ -71,6 +71,9 @@ strict = true
 disallow_untyped_defs = true
 exclude = [
     "tests",
+    # kaggle/ holds repo snapshots (duplicate "agents" module) + generated
+    # notebook artifacts; it is gitignored and not part of the typed codebase.
+    "kaggle",
 ]
 plugins = []
 

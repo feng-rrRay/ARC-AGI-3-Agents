@@ -40,3 +40,4 @@ agents/templates/PokeAgent_ref.py
 run.sh
 */*.zip
 *.zip
+kaggle/

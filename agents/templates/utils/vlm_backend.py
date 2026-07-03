@@ -703,12 +703,22 @@ class _VLLMModelSpec:
     # models without an MTP head (e.g. gpt-oss).
     speculative_method: str | None = None
     num_speculative_tokens: int | None = None
+    # vLLM `--moe-backend`. A property of the model's MoE quant scheme, not the
+    # deployment, so it lives here. None = let vLLM auto-select. Override per-run
+    # with VLLM_MOE_BACKEND. See the glm-4.6v-fp8 entry for why this is pinned.
+    moe_backend: str | None = None
 
 
 _VLLM_MODEL_REGISTRY: dict[str, _VLLMModelSpec] = {
+    # GLM-4.6V-FP8 is a 128-expert, per-channel/per-token FP8 MoE (not block-
+    # quantized). vLLM's FP8-MoE oracle auto-selects the VLLM_CUTLASS kernel for
+    # this config, which crashes in run_cutlass_moe_fp8 -> moe_permute with an
+    # illegal CUDA memory access. FlashInfer/DeepGEMM require block quant so they
+    # are skipped; Triton handles this config correctly. Pin it.
     "glm-4.6v-fp8": _VLLMModelSpec(
         path=None, vision=True, tool_parser="glm45",
         reasoning_parser="glm45", max_model_len=128_000,
+        moe_backend="triton",
     ),
     "glm-4.7-flash": _VLLMModelSpec(
         path=None, vision=False, tool_parser="glm47",
@@ -787,6 +797,7 @@ def _build_vllm_command(
     extra_args: Sequence[str],
     speculative_method: str | None = None,
     num_speculative_tokens: int | None = None,
+    moe_backend: str | None = None,
 ) -> list[str]:
     args = [
         "--served-model-name",
@@ -816,8 +827,12 @@ def _build_vllm_command(
         if num_speculative_tokens is not None:
             spec_cfg["num_speculative_tokens"] = num_speculative_tokens
         args.extend(["--speculative-config", json.dumps(spec_cfg)])
+    if moe_backend:
+        args.extend(["--moe-backend", moe_backend])
     if enforce_eager:
         args.append("--enforce-eager")
+    # extra_args last so a user-supplied VLLM_EXTRA_ARGS can override the above
+    # (argparse keeps the last value for a repeated flag).
     args.extend(extra_args)
 
     # vLLM is installed in this same venv via the `open-vlm` extra, so the
@@ -853,6 +868,7 @@ def start_vllm_server(
     extra_args: Sequence[str] = (),
     speculative_method: str | None = None,
     num_speculative_tokens: int | None = None,
+    moe_backend: str | None = None,
     timeout_s: int = 1800,
     poll_interval_s: float = 5.0,
 ) -> None:
@@ -886,6 +902,7 @@ def start_vllm_server(
                 extra_args=extra_args,
                 speculative_method=speculative_method,
                 num_speculative_tokens=num_speculative_tokens,
+                moe_backend=moe_backend,
             )
             logger.info("Starting vLLM server: %s", " ".join(cmd))
             env = os.environ.copy()
@@ -975,6 +992,8 @@ class VLLMBackend(VLMBackend):
         self.reasoning_parser = spec.reasoning_parser
         self.speculative_method = spec.speculative_method
         self.num_speculative_tokens = spec.num_speculative_tokens
+        # MoE kernel backend: registry default, overridable per-run via env.
+        self.moe_backend = os.getenv("VLLM_MOE_BACKEND") or spec.moe_backend
         # Deployment knobs may be overridden per-run via env.
         self.base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
         self.host = os.getenv("VLLM_HOST", "127.0.0.1")
@@ -1005,6 +1024,7 @@ class VLLMBackend(VLMBackend):
                 extra_args=extra,
                 speculative_method=self.speculative_method,
                 num_speculative_tokens=self.num_speculative_tokens,
+                moe_backend=self.moe_backend,
                 timeout_s=self._timeout_s,
             )
 
